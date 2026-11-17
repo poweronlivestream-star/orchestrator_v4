@@ -85,11 +85,15 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
     payload = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "audio/mp3", "data": a_b64}}, {"inlineData": {"mimeType": "video/mp4", "data": v_b64}}, {"text": prompt}]}], "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}}
     if schema: payload["generationConfig"]["responseSchema"] = schema
     attempts = []
+    
+    # Strictly respect Flash Only mode
     if strategy in ["flash_only", "hybrid"]:
         with STATE_LOCK: avail = [k for k in fk_list if k not in exh_free]
         for k in avail: attempts.append((k, "gemini-2.5-flash", False))
+        
     if strategy in ["hybrid", "pro_only"] and pk:
         attempts.append((pk, "gemini-2.5-pro" if strategy == "pro_only" else "gemini-2.5-flash", True))
+        
     last_err = ""
     for key, model, is_paid in attempts:
         try:
@@ -106,6 +110,7 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
             if not is_paid:
                 with STATE_LOCK: exh_free.add(key)
             last_err = str(e)
+            
     raise RuntimeError(f"All failed. {last_err}")
 
 def build_daily_html(results, cost):
@@ -169,6 +174,7 @@ def main():
         
         pr = (system_prompt + "\n\n" + EVAL_CHUNK_PROMPT) if mode == "eval" else (system_prompt + "\n\nشرح دقيق جداً لكل ما يحدث.")
         
+        # If force paid is requested, push to pro. Otherwise stick to strategy (which could be flash_only)
         data, c, m, l = call_gemini(ap, vp, pr, None if mode == "eval" else DAILY_SCHEMA, fk_list, pk, "pro_only" if f_paid else strat, exh_free)
         for p in (ap, vp): 
             if os.path.exists(p): os.remove(p)
@@ -182,7 +188,10 @@ def main():
             except Exception as e: failed.append(i); print(f"⚠️ {i+1} Failed: {e}")
 
     for i in failed:
-        try: d, c = process_chunk(i, True); results[i] = {"data": d}; act_cost += c; print(f"🚑 {i+1} Rescued.")
+        try: 
+            # If strategy is strictly flash_only, do not force paid in rescue, try again with flash.
+            d, c = process_chunk(i, True if strat != "flash_only" else False)
+            results[i] = {"data": d}; act_cost += c; print(f"🚑 {i+1} Rescued.")
         except: results[i] = {"data": {"programs": [{"category": "Error", "title": "مقطع مفقود", "summary": "فشل التحليل."}]}}
 
     out_files = []
