@@ -1,0 +1,38 @@
+name: V5 Orchestrator Pipeline
+on:
+  workflow_dispatch:
+    inputs:
+      folder_id:
+        required: true
+      drive_token:
+        required: true
+jobs:
+  analyze_v5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Dependencies
+        run: pip install requests
+      - name: Install FFmpeg (Static)
+        run: |
+          curl -L https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz
+          sudo cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/
+          sudo cp ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/
+      - name: Run Master V5 Engine
+        env:
+          FOLDER_ID: ${{ inputs.folder_id }}
+          DRIVE_TOKEN: ${{ inputs.drive_token }}
+          GEMINI_FREE_API_KEYS: ${{ secrets.GEMINI_FREE_API_KEYS }}
+          GEMINI_PAID_API_KEY: ${{ secrets.GEMINI_PAID_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python -u orchestrator_v5.py
