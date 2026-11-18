@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5 - ULTIMATE FIX
-- Reverted to official google-generativeai SDK for robust file handling.
-- Uses File API to properly upload video/audio (Fixes 400 errors).
-- Uses gemini-1.5-flash and gemini-1.5-pro correctly.
-- DLQ and empty report prevention intact.
+Master Orchestrator V5 - HYBRID DOWNLOAD EDITION
+- For daily broadcasts (long files): Uses robust FFmpeg streaming with DLQ and 503 backoffs.
+- For eval mode (short files): Downloads the full video to the local runner first, 
+  extracts all chunks locally without dropped connections, and deletes the local file to save space.
+- Uses official google-generativeai SDK for proper large file handling (Fixes REST API 400s).
+- Bulletproof Fallback: Guarantees fallback to Paid Pro key if free keys fail.
 """
 import os, sys, json, time, math, subprocess, requests, threading, smtplib, random
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -93,59 +94,88 @@ def get_model(api_key, model_name, is_json, schema=None):
     return genai.GenerativeModel(model_name=model_name, generation_config=cfg, safety_settings=safe)
 
 def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free):
-    attempts = []
+    free_attempts = []
     if strategy in ["flash_only", "hybrid"]:
-        with STATE_LOCK: avail = [k for k in fk_list if k not in exh_free]
-        for k in avail: attempts.append((k, "gemini-1.5-flash", False))
-    if strategy in ["hybrid", "pro_only"] and pk:
-        attempts.append((pk, "gemini-1.5-pro", True))
-        
+        with STATE_LOCK: 
+            avail = [k for k in fk_list if k not in exh_free]
+        for k in avail: 
+            free_attempts.append((k, "gemini-1.5-flash"))
+
     last_err = ""
-    for key, model_name, is_paid in attempts:
+    
+    # 1. ATTEMPT FREE KEYS
+    for key, model_name in free_attempts:
+        if not key: continue
         uploaded_files = []
         try:
             genai.configure(api_key=key)
-            # Upload files properly using the SDK
             audio_file = genai.upload_file(path=a_path)
             video_file = genai.upload_file(path=v_path)
             uploaded_files.extend([audio_file, video_file])
             
-            # Wait for video processing
             while video_file.state.name == "PROCESSING":
                 time.sleep(2)
                 video_file = genai.get_file(video_file.name)
-            if video_file.state.name == "FAILED": raise ValueError("Video processing failed on Google servers.")
+            if video_file.state.name == "FAILED": raise ValueError("Video processing failed.")
 
             model = get_model(key, model_name, True, schema)
             res = model.generate_content([audio_file, video_file, prompt])
             
-            in_t, out_t = res.usage_metadata.prompt_token_count, res.usage_metadata.candidates_token_count
-            t = "pro" if "pro" in model_name else "flash"
-            cost = ((in_t/1e6)*PRICING[t]["in"] + (out_t/1e6)*PRICING[t]["out"]) if is_paid else 0.0
-            
             data = json.loads(res.text)
-            
-            # Cleanup files on success
             for uf in uploaded_files:
                 try: uf.delete()
                 except: pass
-                
-            return data, cost, model_name, "PAID" if is_paid else "FREE"
+            
+            return data, 0.0, model_name, "FREE"
             
         except Exception as e:
             err_str = str(e).lower()
-            print(f"SDK Error with key... model {model_name}: {err_str}")
-            if "429" in err_str or "503" in err_str or "quota" in err_str:
-                if not is_paid:
-                    with STATE_LOCK: exh_free.add(key)
-                if "503" in err_str: time.sleep(random.uniform(3, 7))
+            print(f"Free SDK Error: {err_str}")
+            if "api_key_invalid" in err_str or "400" in err_str or "429" in err_str or "503" in err_str:
+                with STATE_LOCK: exh_free.add(key)
+            if "503" in err_str or "429" in err_str: 
+                time.sleep(random.uniform(2, 5))
             
             for uf in uploaded_files:
                 try: uf.delete()
                 except: pass
             last_err = str(e)
             
-    raise RuntimeError(f"All SDK attempts failed. Last Error: {last_err}")
+    # 2. GUARANTEED FALLBACK TO PAID KEY
+    if strategy in ["hybrid", "pro_only"] and pk:
+        print("⚠️ All free keys exhausted or invalid. Rescuing with Paid PRO Key.")
+        uploaded_files = []
+        try:
+            genai.configure(api_key=pk)
+            audio_file = genai.upload_file(path=a_path)
+            video_file = genai.upload_file(path=v_path)
+            uploaded_files.extend([audio_file, video_file])
+            
+            while video_file.state.name == "PROCESSING":
+                time.sleep(2)
+                video_file = genai.get_file(video_file.name)
+            if video_file.state.name == "FAILED": raise ValueError("Video processing failed.")
+
+            model = get_model(pk, "gemini-1.5-pro", True, schema)
+            res = model.generate_content([audio_file, video_file, prompt])
+            
+            in_t, out_t = res.usage_metadata.prompt_token_count, res.usage_metadata.candidates_token_count
+            cost = ((in_t/1e6)*PRICING["pro"]["in"] + (out_t/1e6)*PRICING["pro"]["out"])
+            
+            data = json.loads(res.text)
+            for uf in uploaded_files:
+                try: uf.delete()
+                except: pass
+            
+            return data, cost, "gemini-1.5-pro", "PAID"
+            
+        except Exception as e:
+            for uf in uploaded_files:
+                try: uf.delete()
+                except: pass
+            last_err = str(e)
+            
+    raise RuntimeError(f"All attempts (Free and Paid) failed. Last Error: {last_err}")
 
 def build_daily_html(results, cost):
     rows = "".join(f"<tr><td>{p.get('start','')}-{p.get('end','')}</td><td>{p.get('category','')}</td><td>{p.get('title','')}</td><td>{p.get('summary','')}</td></tr>" for r in results if r and "data" in r for p in r.get("data", {}).get("programs", []))
@@ -197,20 +227,50 @@ def main():
         sys.exit(1)
         
     results, act_cost, exh_free, failed = [None] * tot, 0.0, set(), []
-    send_tg(f"🚀 بدء العمالة V5 | المسار: {mode} | المقاطع: {tot} | التوازي: {workers}x", tg_bot, tg_chat)
+    
+    # --- HYBRID DOWNLOAD LOGIC ---
+    # If mode is eval, we download the file locally to avoid network drops during extraction.
+    local_dvr_path = src_url
+    if mode == "eval":
+        send_tg("📥 جاري تحميل الحلقة محلياً لضمان عدم انقطاع التقطيع...", tg_bot, tg_chat)
+        local_dvr_path = "/tmp/local_eval_video.mp4"
+        try:
+            # Download file using requests to handle streams smoothly
+            with requests.get(src_url, stream=True) as r:
+                r.raise_for_status()
+                with open(local_dvr_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+            send_tg(f"✅ تم التحميل محلياً. بدء التقطيع المتوازي: {workers}x", tg_bot, tg_chat)
+        except Exception as e:
+            send_tg(f"⚠️ فشل التحميل المحلي، سيتم العودة للبث المباشر. الخطأ: {e}", tg_bot, tg_chat)
+            local_dvr_path = src_url # Fallback to live stream url if download fails
+    else:
+        send_tg(f"🚀 بدء العمالة V5 المباشرة (Streaming) | المسار: {mode} | المقاطع: {tot} | التوازي: {workers}x", tg_bot, tg_chat)
 
     def process_chunk(idx, f_paid=False):
         time.sleep(random.uniform(0.5, 3.0) * (idx % workers))
         
         st = idx * chunk_sec; d = min(chunk_sec, dur - st)
         ap, vp = f"/tmp/a_{idx}.mp3", f"/tmp/v_{idx}.mp4"
-        with FFMPEG_SEM:
-            res_a = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "16k", ap])
-            res_v = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-an", "-vf", f"fps={fps},scale=640:360", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", vp])
-            if res_a.returncode != 0 or res_v.returncode != 0:
-                print(f"Error extracting chunk {idx}.")
-                if not os.path.exists(vp): open(vp, 'w').close() 
-                if not os.path.exists(ap): open(ap, 'w').close()
+        
+        # 🔴 ROBUST FFMPEG RETRY LOGIC FOR DROPPED STREAMS
+        extracted = False
+        for attempt in range(3):
+            with FFMPEG_SEM:
+                subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", local_dvr_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "16k", ap], stderr=subprocess.DEVNULL)
+                subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", local_dvr_path, "-an", "-vf", f"fps={fps},scale=640:360", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", vp], stderr=subprocess.DEVNULL)
+            
+            if os.path.exists(vp) and os.path.getsize(vp) > 1024 and os.path.exists(ap) and os.path.getsize(ap) > 1024:
+                extracted = True
+                break
+            else:
+                print(f"FFmpeg returned empty/corrupted file for chunk {idx}. Retrying...")
+                time.sleep(2)
+                
+        if not extracted:
+            print(f"FAILED to extract chunk {idx} after 3 attempts.")
+            return {"programs": [{"start": "N/A", "end": "N/A", "category": "Error", "theme": "فصل تقني", "title": "مقطع مفقود", "summary": "انقطع البث أثناء التحميل"}]}, 0.0
         
         pr = (system_prompt + "\n\n" + EVAL_CHUNK_PROMPT) if mode == "eval" else (system_prompt + "\n\nشرح دقيق جداً لكل ما يحدث.")
         
@@ -226,6 +286,11 @@ def main():
             try: d, c = f.result(); results[i] = {"data": d}; STATE_LOCK.acquire(); act_cost += c; STATE_LOCK.release(); print(f"✅ {i+1} done.")
             except Exception as e: failed.append(i); print(f"⚠️ {i+1} Failed: {e}")
 
+    # Clean up local file if we downloaded it
+    if mode == "eval" and local_dvr_path != src_url and os.path.exists(local_dvr_path):
+        try: os.remove(local_dvr_path)
+        except: pass
+
     if failed:
         print(f"Entering Dead-Letter Queue (DLQ) for {len(failed)} chunks...")
         time.sleep(15) 
@@ -239,10 +304,10 @@ def main():
             results[i] = None 
             time.sleep(5) 
 
-    valid_chunks = [r for r in results if r is not None and "data" in r and r["data"]]
+    valid_chunks = [r for r in results if r is not None and "data" in r and r["data"] and not (isinstance(r["data"], dict) and r["data"].get("programs", [{}])[0].get("category") == "Error")]
     
     if len(valid_chunks) == 0:
-        send_tg("❌ فشلت العملية بالكامل. (تأكد من المفاتيح أو خفف سرعة التوازي).", tg_bot, tg_chat)
+        send_tg("❌ فشلت العملية بالكامل. (انقطاع البث أو أخطاء مفاتيح). تم استرداد الرصيد.", tg_bot, tg_chat)
         if cfg.get("webhook_url"):
             try: requests.post(cfg.get("webhook_url"), json={"action": "finalize_cost", "estimated_cost": cfg.get("pre_authorized_cost", 0), "actual_cost": 0.0}, timeout=10)
             except: pass
