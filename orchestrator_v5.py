@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5 - BLACKBOX EDITION (FINAL PATCH)
-- Fixes Error 400 (Base64 file size / format issues) by using File API or reducing payload size.
-- Implements strict failure checks to prevent generating empty reports.
-- Includes verbose FFmpeg error logging.
-- UPDATED MODELS: Uses gemini-3.8-flash for free tier, and gemini-exp-1114 / gemini-2.5-pro for paid.
+Master Orchestrator V5 - BLACKBOX EDITION (FINAL PROD)
+- Fixed 404 by migrating from gemini-2.5-flash to gemini-3.8-flash.
+- Fixed 503 by adding a Backoff & Retry Delay in the Dead-Letter Queue (DLQ).
+- Aborts safely without spamming empty reports if all API calls fail.
+- Specifically ignores completely empty responses to prevent $0.000 reports from being sent.
 """
 import os, sys, json, time, math, base64, subprocess, requests, threading, smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -89,7 +89,6 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
     if schema: payload["generationConfig"]["responseSchema"] = schema
     attempts = []
     
-    # 🔴 UPDATED MODELS: Google replaced 2.5-flash with 3.8-flash for new users.
     if strategy in ["flash_only", "hybrid"]:
         with STATE_LOCK: avail = [k for k in fk_list if k not in exh_free]
         for k in avail: attempts.append((k, "gemini-3.8-flash", False))
@@ -100,7 +99,7 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
     last_err = ""
     for key, model, is_paid in attempts:
         try:
-            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}", json=payload, timeout=90)
+            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}", json=payload, timeout=120)
             if r.status_code == 200:
                 d = r.json()
                 in_t, out_t = int(d["usageMetadata"]["promptTokenCount"]), int(d["usageMetadata"]["candidatesTokenCount"])
@@ -181,7 +180,6 @@ def main():
         with FFMPEG_SEM:
             res_a = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "16k", ap])
             res_v = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-an", "-vf", f"fps={fps},scale=640:360", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", vp])
-            
             if res_a.returncode != 0 or res_v.returncode != 0:
                 print(f"Error extracting chunk {idx}.")
                 if not os.path.exists(vp): open(vp, 'w').close() 
@@ -201,15 +199,31 @@ def main():
             try: d, c = f.result(); results[i] = {"data": d}; STATE_LOCK.acquire(); act_cost += c; STATE_LOCK.release(); print(f"✅ {i+1} done.")
             except Exception as e: failed.append(i); print(f"⚠️ {i+1} Failed: {e}")
 
+    # Backoff for DLQ
+    if failed:
+        print(f"Entering Dead-Letter Queue (DLQ) for {len(failed)} chunks...")
+        time.sleep(15) 
+        
     for i in failed:
-        try: 
+        try:
             d, c = process_chunk(i, True if strat != "flash_only" else False)
             results[i] = {"data": d}; act_cost += c; print(f"🚑 {i+1} Rescued.")
-        except: results[i] = {"data": {"programs": [{"category": "Error", "title": "مقطع مفقود", "summary": "فشل التحليل."}]}}
+        except Exception as ex: 
+            print(f"DLQ Rescue Failed for chunk {i+1}: {ex}")
+            results[i] = None # Explicitly set to None to avoid empty programs array
+            time.sleep(5) 
 
-    valid_chunks = [r for r in results if r and "data" in r and r["data"] and not (isinstance(r["data"], dict) and r["data"].get("programs", [{}])[0].get("category") == "Error")]
+    # 🔴 FIX: Stricter validation. If ALL chunks are None, we MUST ABORT.
+    valid_chunks = [r for r in results if r is not None and "data" in r and r["data"]]
+    
     if len(valid_chunks) == 0:
-        send_tg("❌ فشلت العملية بالكامل. (رمز 400 أو 404). لن يتم إنشاء تقارير فارغة.", tg_bot, tg_chat)
+        send_tg("❌ فشلت العملية بالكامل. (ضغط سيرفرات أو أخطاء مصادر). لن يتم إنشاء تقارير فارغة.", tg_bot, tg_chat)
+        
+        # Refund before aborting
+        if cfg.get("webhook_url"):
+            try: requests.post(cfg.get("webhook_url"), json={"action": "finalize_cost", "estimated_cost": cfg.get("pre_authorized_cost", 0), "actual_cost": 0.0}, timeout=10)
+            except: pass
+            
         sys.exit(1)
 
     out_files = []
@@ -217,10 +231,9 @@ def main():
     
     if mode == "eval":
         synth_key = pk if pk else (fk_list[0] if fk_list else None)
-        # UPDATED: Use gemini-2.5-pro for paid, fallback to gemini-3.8-flash for free synthesis
         synth_model = "gemini-2.5-pro" if pk else "gemini-3.8-flash"
         try: 
-            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{synth_model}:generateContent?key={synth_key}", json={"contents":[{"role":"user","parts":[{"text": EVAL_SYNTHESIS_PROMPT.format(editorial=cfg.get("editorial_mode")) + json.dumps(results, ensure_ascii=False)}]}]}).json()
+            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{synth_model}:generateContent?key={synth_key}", json={"contents":[{"role":"user","parts":[{"text": EVAL_SYNTHESIS_PROMPT.format(editorial=cfg.get("editorial_mode")) + json.dumps(valid_chunks, ensure_ascii=False)}]}]}).json()
             final_data = json.loads(r["candidates"][0]["content"]["parts"][0]["text"])
         except: final_data = {"total_score": 0, "percentage": 0}
         
@@ -229,7 +242,7 @@ def main():
         out_files.append(h_path)
     else:
         h_path = "/tmp/Daily_Report.html"
-        with open(h_path, "w", encoding="utf-8") as f: f.write(build_daily_html(results, act_cost))
+        with open(h_path, "w", encoding="utf-8") as f: f.write(build_daily_html(valid_chunks, act_cost))
         out_files.append(h_path)
 
     # Generate BLACKBOX .md File
@@ -238,7 +251,7 @@ def main():
         "mode": mode,
         "system_prompt": system_prompt
     }
-    blackbox_md = generate_blackbox_md(mode, results, final_data, meta_info)
+    blackbox_md = generate_blackbox_md(mode, valid_chunks, final_data, meta_info)
     bb_path = f"/tmp/Blackbox_{mode}.md"
     with open(bb_path, "w", encoding="utf-8") as f: f.write(blackbox_md)
     out_files.append(bb_path)
