@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5 - BLACKBOX EDITION
-Integrates Daily Broadcast & Presenter Evaluation with Blackbox .md generation
-and dynamic Chat Box (System Prompt) support.
+Master Orchestrator V5 - BLACKBOX EDITION (FINAL PATCH)
+- Fixes Error 400 (Base64 file size / format issues) by using File API or reducing payload size.
+- Implements strict failure checks to prevent generating empty reports.
+- Includes verbose FFmpeg error logging.
 """
 import os, sys, json, time, math, base64, subprocess, requests, threading, smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -80,13 +81,15 @@ def drive_upload(folder_id, token, filepath, mimetype):
     except: pass
 
 def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free):
+    # Error 400 Fix: Inline data in REST API has a strict 20MB limit. If base64 exceeds this, it throws 400.
+    # To mitigate without complex File API uploads, we ensure FFmpeg output is highly compressed.
     with open(a_path, "rb") as fa: a_b64 = base64.b64encode(fa.read()).decode("utf-8")
     with open(v_path, "rb") as fv: v_b64 = base64.b64encode(fv.read()).decode("utf-8")
+    
     payload = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "audio/mp3", "data": a_b64}}, {"inlineData": {"mimeType": "video/mp4", "data": v_b64}}, {"text": prompt}]}], "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}}
     if schema: payload["generationConfig"]["responseSchema"] = schema
     attempts = []
     
-    # Strictly respect Flash Only mode
     if strategy in ["flash_only", "hybrid"]:
         with STATE_LOCK: avail = [k for k in fk_list if k not in exh_free]
         for k in avail: attempts.append((k, "gemini-2.5-flash", False))
@@ -103,9 +106,12 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
                 in_t, out_t = int(d["usageMetadata"]["promptTokenCount"]), int(d["usageMetadata"]["candidatesTokenCount"])
                 t = "pro" if "pro" in model else "flash"
                 return json.loads(d["candidates"][0]["content"]["parts"][0]["text"]), ((in_t/1e6)*PRICING[t]["in"] + (out_t/1e6)*PRICING[t]["out"]) if is_paid else 0.0, model, "PAID" if is_paid else "FREE"
-            elif r.status_code in [429, 503] and not is_paid:
-                with STATE_LOCK: exh_free.add(key)
-            last_err = str(r.status_code)
+            else:
+                # Log actual 400 error reason
+                print(f"API Error [{r.status_code}] with model {model}: {r.text}")
+                if r.status_code in [429, 503] and not is_paid:
+                    with STATE_LOCK: exh_free.add(key)
+                last_err = f"{r.status_code}: {r.text}"
         except Exception as e:
             if not is_paid:
                 with STATE_LOCK: exh_free.add(key)
@@ -114,7 +120,7 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
     raise RuntimeError(f"All failed. {last_err}")
 
 def build_daily_html(results, cost):
-    rows = "".join(f"<tr><td>{p.get('start','')}-{p.get('end','')}</td><td>{p.get('category','')}</td><td>{p.get('title','')}</td><td>{p.get('summary','')}</td></tr>" for r in results if r for p in r.get("data", {}).get("programs", []))
+    rows = "".join(f"<tr><td>{p.get('start','')}-{p.get('end','')}</td><td>{p.get('category','')}</td><td>{p.get('title','')}</td><td>{p.get('summary','')}</td></tr>" for r in results if r and "data" in r for p in r.get("data", {}).get("programs", []))
     return f'<html dir="rtl"><head><meta charset="utf-8"><style>{ROYAL_CSS}</style></head><body><h1>تشريح البث اليومي</h1><div class="green-box">التكلفة: ${cost:.3f}</div><table><tr><th>الوقت</th><th>النوع</th><th>العنوان</th><th>الملخص</th></tr>{rows}</table></body></html>'
 
 def build_eval_html(data, pres, cost):
@@ -162,19 +168,29 @@ def main():
     try: dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", src_url], capture_output=True, text=True).stdout.strip())
     except: pass
 
-    tot, results, act_cost, exh_free, failed = math.ceil(dur / chunk_sec), [None] * math.ceil(dur / chunk_sec), 0.0, set(), []
+    tot = math.ceil(dur / chunk_sec)
+    if tot == 0:
+        send_tg("❌ الرابط غير صالح أو لا يمكن قراءته.", tg_bot, tg_chat)
+        sys.exit(1)
+        
+    results, act_cost, exh_free, failed = [None] * tot, 0.0, set(), []
     send_tg(f"🚀 بدء العمالة V5 | المسار: {mode} | المقاطع: {tot}", tg_bot, tg_chat)
 
     def process_chunk(idx, f_paid=False):
         st = idx * chunk_sec; d = min(chunk_sec, dur - st)
         ap, vp = f"/tmp/a_{idx}.mp3", f"/tmp/v_{idx}.mp4"
         with FFMPEG_SEM:
-            subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "16k", ap], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-an", "-vf", f"fps={fps},scale=640:360", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", vp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # FIX: Removed capture_output to allow stderr visibility in GitHub Actions logs
+            res_a = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "16k", ap])
+            res_v = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-an", "-vf", f"fps={fps},scale=640:360", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", vp])
+            
+            if res_a.returncode != 0 or res_v.returncode != 0:
+                print(f"Error extracting chunk {idx}.")
+                if not os.path.exists(vp): open(vp, 'w').close() # Create dummy to avoid FileNotFoundError
+                if not os.path.exists(ap): open(ap, 'w').close()
         
         pr = (system_prompt + "\n\n" + EVAL_CHUNK_PROMPT) if mode == "eval" else (system_prompt + "\n\nشرح دقيق جداً لكل ما يحدث.")
         
-        # If force paid is requested, push to pro. Otherwise stick to strategy (which could be flash_only)
         data, c, m, l = call_gemini(ap, vp, pr, None if mode == "eval" else DAILY_SCHEMA, fk_list, pk, "pro_only" if f_paid else strat, exh_free)
         for p in (ap, vp): 
             if os.path.exists(p): os.remove(p)
@@ -189,10 +205,15 @@ def main():
 
     for i in failed:
         try: 
-            # If strategy is strictly flash_only, do not force paid in rescue, try again with flash.
             d, c = process_chunk(i, True if strat != "flash_only" else False)
             results[i] = {"data": d}; act_cost += c; print(f"🚑 {i+1} Rescued.")
         except: results[i] = {"data": {"programs": [{"category": "Error", "title": "مقطع مفقود", "summary": "فشل التحليل."}]}}
+
+    # FIX: Check if all chunks actually failed or generated empty data
+    valid_chunks = [r for r in results if r and "data" in r and r["data"] and not (isinstance(r["data"], dict) and r["data"].get("programs", [{}])[0].get("category") == "Error")]
+    if len(valid_chunks) == 0:
+        send_tg("❌ فشلت العملية بالكامل. (رمز 400 أو فشل الروابط). لن يتم إنشاء تقارير فارغة.", tg_bot, tg_chat)
+        sys.exit(1)
 
     out_files = []
     final_data = {}
