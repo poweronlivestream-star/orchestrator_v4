@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5 - BLACKBOX EDITION (FINAL PROD)
-- Uses gemini-1.5-flash-latest and gemini-1.5-pro-latest.
+Master Orchestrator V5 - BLACKBOX EDITION (FINAL FALLBACK PROD)
+- Specifically uses gemini-1.5-flash and gemini-1.5-pro, handling 404s dynamically.
 - Includes Backoff & Retry Delay in the DLQ to prevent 503 errors.
 - Aborts safely without spamming empty reports if all API calls fail.
 """
@@ -88,12 +88,15 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
     if schema: payload["generationConfig"]["responseSchema"] = schema
     attempts = []
     
+    # 🔴 Reverted to the absolute original working models that do not return 404
     if strategy in ["flash_only", "hybrid"]:
         with STATE_LOCK: avail = [k for k in fk_list if k not in exh_free]
-        for k in avail: attempts.append((k, "gemini-1.5-flash-latest", False))
+        for k in avail: 
+            attempts.append((k, "gemini-1.5-flash", False))
+            attempts.append((k, "gemini-1.5-flash-8b", False)) # Fallback if standard flash is down
         
     if strategy in ["hybrid", "pro_only"] and pk:
-        attempts.append((pk, "gemini-1.5-pro-latest", True))
+        attempts.append((pk, "gemini-1.5-pro", True))
         
     last_err = ""
     for key, model, is_paid in attempts:
@@ -106,6 +109,7 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
                 return json.loads(d["candidates"][0]["content"]["parts"][0]["text"]), ((in_t/1e6)*PRICING[t]["in"] + (out_t/1e6)*PRICING[t]["out"]) if is_paid else 0.0, model, "PAID" if is_paid else "FREE"
             else:
                 print(f"API Error [{r.status_code}] with model {model}: {r.text}")
+                # Treat 400 (Invalid Key) and 429/503 as exhausted for THIS key
                 if r.status_code in [400, 429, 503, 404] and not is_paid:
                     with STATE_LOCK: exh_free.add(key)
                 last_err = f"{r.status_code}: {r.text}"
@@ -229,7 +233,7 @@ def main():
     
     if mode == "eval":
         synth_key = pk if pk else (fk_list[0] if fk_list else None)
-        synth_model = "gemini-1.5-pro-latest" if pk else "gemini-1.5-flash-latest"
+        synth_model = "gemini-1.5-pro" if pk else "gemini-1.5-flash"
         try: 
             r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{synth_model}:generateContent?key={synth_key}", json={"contents":[{"role":"user","parts":[{"text": EVAL_SYNTHESIS_PROMPT.format(editorial=cfg.get("editorial_mode")) + json.dumps(valid_chunks, ensure_ascii=False)}]}]}).json()
             final_data = json.loads(r["candidates"][0]["content"]["parts"][0]["text"])
