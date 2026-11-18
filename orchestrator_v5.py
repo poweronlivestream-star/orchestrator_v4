@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5 - SOLID FIX EDITION
-- Fixes Model Names: Uses official gemini-1.5-flash and gemini-1.5-pro.
-- Mitigates 503: Adds jitter/stagger to API calls to prevent busting free tier limits.
-- Strict 400 handling.
+Master Orchestrator V5 - BLACKBOX EDITION (FINAL PROD)
+- Uses gemini-1.5-flash-latest and gemini-1.5-pro-latest.
+- Includes Backoff & Retry Delay in the DLQ to prevent 503 errors.
+- Aborts safely without spamming empty reports if all API calls fail.
 """
 import os, sys, json, time, math, base64, subprocess, requests, threading, smtplib, random
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -88,13 +88,12 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
     if schema: payload["generationConfig"]["responseSchema"] = schema
     attempts = []
     
-    # 🔴 OFFICIAL MODELS ONLY (Fixes 404/400 hallucinated model names)
     if strategy in ["flash_only", "hybrid"]:
         with STATE_LOCK: avail = [k for k in fk_list if k not in exh_free]
-        for k in avail: attempts.append((k, "gemini-1.5-flash", False))
+        for k in avail: attempts.append((k, "gemini-1.5-flash-latest", False))
         
     if strategy in ["hybrid", "pro_only"] and pk:
-        attempts.append((pk, "gemini-1.5-pro", True))
+        attempts.append((pk, "gemini-1.5-pro-latest", True))
         
     last_err = ""
     for key, model, is_paid in attempts:
@@ -107,12 +106,10 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
                 return json.loads(d["candidates"][0]["content"]["parts"][0]["text"]), ((in_t/1e6)*PRICING[t]["in"] + (out_t/1e6)*PRICING[t]["out"]) if is_paid else 0.0, model, "PAID" if is_paid else "FREE"
             else:
                 print(f"API Error [{r.status_code}] with model {model}: {r.text}")
-                # Treat 400 (Invalid Key) and 429/503 as exhausted for THIS key
-                if r.status_code in [400, 429, 503] and not is_paid:
+                if r.status_code in [400, 429, 503, 404] and not is_paid:
                     with STATE_LOCK: exh_free.add(key)
                 last_err = f"{r.status_code}: {r.text}"
                 
-                # Jitter delay if 503 hits to cool down server
                 if r.status_code == 503:
                     time.sleep(random.uniform(3, 7))
         except Exception as e:
@@ -131,7 +128,6 @@ def build_eval_html(data, pres, cost):
     for sub in data.get("sub_criteria", []): html += f"<tr><td>{sub.get('name')}</td><td class='score-cell'>{sub.get('score')}/{sub.get('max')}</td><td>{sub.get('note')}</td></tr>"
     return html + "</table></body></html>"
 
-# --- Blackbox Generator ---
 def generate_blackbox_md(mode, raw_data, final_data, meta):
     md = f"# BLACKBOX DATA - {meta['name']} ({meta['mode']})\n"
     md += f"**Date:** {datetime.now(BEIRUT_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -180,7 +176,6 @@ def main():
     send_tg(f"🚀 بدء العمالة V5 | المسار: {mode} | المقاطع: {tot} | التوازي: {workers}x", tg_bot, tg_chat)
 
     def process_chunk(idx, f_paid=False):
-        # 🔴 Jitter: Stagger thread starts to prevent instant 503 bursts
         time.sleep(random.uniform(0.5, 3.0) * (idx % workers))
         
         st = idx * chunk_sec; d = min(chunk_sec, dur - st)
@@ -209,7 +204,7 @@ def main():
 
     if failed:
         print(f"Entering Dead-Letter Queue (DLQ) for {len(failed)} chunks...")
-        time.sleep(15) # Cooldown before hammering API again
+        time.sleep(15) 
         
     for i in failed:
         try:
@@ -234,7 +229,7 @@ def main():
     
     if mode == "eval":
         synth_key = pk if pk else (fk_list[0] if fk_list else None)
-        synth_model = "gemini-1.5-pro" if pk else "gemini-1.5-flash"
+        synth_model = "gemini-1.5-pro-latest" if pk else "gemini-1.5-flash-latest"
         try: 
             r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{synth_model}:generateContent?key={synth_key}", json={"contents":[{"role":"user","parts":[{"text": EVAL_SYNTHESIS_PROMPT.format(editorial=cfg.get("editorial_mode")) + json.dumps(valid_chunks, ensure_ascii=False)}]}]}).json()
             final_data = json.loads(r["candidates"][0]["content"]["parts"][0]["text"])
@@ -248,7 +243,6 @@ def main():
         with open(h_path, "w", encoding="utf-8") as f: f.write(build_daily_html(valid_chunks, act_cost))
         out_files.append(h_path)
 
-    # Generate BLACKBOX .md File
     meta_info = {
         "name": cfg.get('presenter_name', 'Broadcast') if mode == 'eval' else 'Daily_Broadcast',
         "mode": mode,
@@ -259,7 +253,6 @@ def main():
     with open(bb_path, "w", encoding="utf-8") as f: f.write(blackbox_md)
     out_files.append(bb_path)
 
-    # Deliveries
     for f in out_files: 
         send_tg(f"ملف التقرير/الصندوق الأسود | الكلفة: ${act_cost:.3f}", tg_bot, tg_chat, f)
         mime = "text/markdown" if f.endswith(".md") else "text/html"
