@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5 - BLACKBOX EDITION (FINAL PROD)
-- Fixed 404 by migrating from gemini-2.5-flash to gemini-3.8-flash.
-- Fixed 503 by adding a Backoff & Retry Delay in the Dead-Letter Queue (DLQ).
-- Aborts safely without spamming empty reports if all API calls fail.
-- Specifically ignores completely empty responses to prevent $0.000 reports from being sent.
+Master Orchestrator V5 - SOLID FIX EDITION
+- Fixes Model Names: Uses official gemini-1.5-flash and gemini-1.5-pro.
+- Mitigates 503: Adds jitter/stagger to API calls to prevent busting free tier limits.
+- Strict 400 handling.
 """
-import os, sys, json, time, math, base64, subprocess, requests, threading, smtplib
+import os, sys, json, time, math, base64, subprocess, requests, threading, smtplib, random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
@@ -89,12 +88,13 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
     if schema: payload["generationConfig"]["responseSchema"] = schema
     attempts = []
     
+    # 🔴 OFFICIAL MODELS ONLY (Fixes 404/400 hallucinated model names)
     if strategy in ["flash_only", "hybrid"]:
         with STATE_LOCK: avail = [k for k in fk_list if k not in exh_free]
-        for k in avail: attempts.append((k, "gemini-3.8-flash", False))
+        for k in avail: attempts.append((k, "gemini-1.5-flash", False))
         
     if strategy in ["hybrid", "pro_only"] and pk:
-        attempts.append((pk, "gemini-2.5-pro" if strategy == "pro_only" else "gemini-3.8-flash", True))
+        attempts.append((pk, "gemini-1.5-pro", True))
         
     last_err = ""
     for key, model, is_paid in attempts:
@@ -107,15 +107,20 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
                 return json.loads(d["candidates"][0]["content"]["parts"][0]["text"]), ((in_t/1e6)*PRICING[t]["in"] + (out_t/1e6)*PRICING[t]["out"]) if is_paid else 0.0, model, "PAID" if is_paid else "FREE"
             else:
                 print(f"API Error [{r.status_code}] with model {model}: {r.text}")
-                if r.status_code in [429, 503, 404] and not is_paid:
+                # Treat 400 (Invalid Key) and 429/503 as exhausted for THIS key
+                if r.status_code in [400, 429, 503] and not is_paid:
                     with STATE_LOCK: exh_free.add(key)
                 last_err = f"{r.status_code}: {r.text}"
+                
+                # Jitter delay if 503 hits to cool down server
+                if r.status_code == 503:
+                    time.sleep(random.uniform(3, 7))
         except Exception as e:
             if not is_paid:
                 with STATE_LOCK: exh_free.add(key)
             last_err = str(e)
             
-    raise RuntimeError(f"All failed. {last_err}")
+    raise RuntimeError(f"All failed. Last Error: {last_err}")
 
 def build_daily_html(results, cost):
     rows = "".join(f"<tr><td>{p.get('start','')}-{p.get('end','')}</td><td>{p.get('category','')}</td><td>{p.get('title','')}</td><td>{p.get('summary','')}</td></tr>" for r in results if r and "data" in r for p in r.get("data", {}).get("programs", []))
@@ -172,9 +177,12 @@ def main():
         sys.exit(1)
         
     results, act_cost, exh_free, failed = [None] * tot, 0.0, set(), []
-    send_tg(f"🚀 بدء العمالة V5 | المسار: {mode} | المقاطع: {tot}", tg_bot, tg_chat)
+    send_tg(f"🚀 بدء العمالة V5 | المسار: {mode} | المقاطع: {tot} | التوازي: {workers}x", tg_bot, tg_chat)
 
     def process_chunk(idx, f_paid=False):
+        # 🔴 Jitter: Stagger thread starts to prevent instant 503 bursts
+        time.sleep(random.uniform(0.5, 3.0) * (idx % workers))
+        
         st = idx * chunk_sec; d = min(chunk_sec, dur - st)
         ap, vp = f"/tmp/a_{idx}.mp3", f"/tmp/v_{idx}.mp4"
         with FFMPEG_SEM:
@@ -199,10 +207,9 @@ def main():
             try: d, c = f.result(); results[i] = {"data": d}; STATE_LOCK.acquire(); act_cost += c; STATE_LOCK.release(); print(f"✅ {i+1} done.")
             except Exception as e: failed.append(i); print(f"⚠️ {i+1} Failed: {e}")
 
-    # Backoff for DLQ
     if failed:
         print(f"Entering Dead-Letter Queue (DLQ) for {len(failed)} chunks...")
-        time.sleep(15) 
+        time.sleep(15) # Cooldown before hammering API again
         
     for i in failed:
         try:
@@ -210,20 +217,16 @@ def main():
             results[i] = {"data": d}; act_cost += c; print(f"🚑 {i+1} Rescued.")
         except Exception as ex: 
             print(f"DLQ Rescue Failed for chunk {i+1}: {ex}")
-            results[i] = None # Explicitly set to None to avoid empty programs array
+            results[i] = None 
             time.sleep(5) 
 
-    # 🔴 FIX: Stricter validation. If ALL chunks are None, we MUST ABORT.
     valid_chunks = [r for r in results if r is not None and "data" in r and r["data"]]
     
     if len(valid_chunks) == 0:
-        send_tg("❌ فشلت العملية بالكامل. (ضغط سيرفرات أو أخطاء مصادر). لن يتم إنشاء تقارير فارغة.", tg_bot, tg_chat)
-        
-        # Refund before aborting
+        send_tg("❌ فشلت العملية بالكامل. (تأكد من المفاتيح أو خفف سرعة التوازي).", tg_bot, tg_chat)
         if cfg.get("webhook_url"):
             try: requests.post(cfg.get("webhook_url"), json={"action": "finalize_cost", "estimated_cost": cfg.get("pre_authorized_cost", 0), "actual_cost": 0.0}, timeout=10)
             except: pass
-            
         sys.exit(1)
 
     out_files = []
@@ -231,7 +234,7 @@ def main():
     
     if mode == "eval":
         synth_key = pk if pk else (fk_list[0] if fk_list else None)
-        synth_model = "gemini-2.5-pro" if pk else "gemini-3.8-flash"
+        synth_model = "gemini-1.5-pro" if pk else "gemini-1.5-flash"
         try: 
             r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{synth_model}:generateContent?key={synth_key}", json={"contents":[{"role":"user","parts":[{"text": EVAL_SYNTHESIS_PROMPT.format(editorial=cfg.get("editorial_mode")) + json.dumps(valid_chunks, ensure_ascii=False)}]}]}).json()
             final_data = json.loads(r["candidates"][0]["content"]["parts"][0]["text"])
@@ -267,7 +270,6 @@ def main():
     try: requests.patch(f"https://www.googleapis.com/drive/v3/files/{fid}", headers={"Authorization": f"Bearer {d_tok}"}, json={"name": f"PROCESSED_{mode}_{act_cost:.2f}$"})
     except: pass
     
-    # Webhook Refund
     if cfg.get("webhook_url"):
         try: requests.post(cfg.get("webhook_url"), json={"action": "finalize_cost", "estimated_cost": cfg.get("pre_authorized_cost", 0), "actual_cost": act_cost}, timeout=10)
         except: pass
