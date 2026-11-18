@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5 - BLACKBOX EDITION (FINAL FALLBACK PROD)
-- Specifically uses gemini-1.5-flash and gemini-1.5-pro, handling 404s dynamically.
-- Includes Backoff & Retry Delay in the DLQ to prevent 503 errors.
-- Aborts safely without spamming empty reports if all API calls fail.
+Master Orchestrator V5 - FFmpeg Fix Edition
+- Adds HTTP reconnect flags to prevent "partial file" demuxing errors from weak servers.
+- Prevents sending 0-byte files to Gemini to avoid empty request failures.
+- Uses latest model fallback and jitter delay.
 """
 import os, sys, json, time, math, base64, subprocess, requests, threading, smtplib, random
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,6 +81,10 @@ def drive_upload(folder_id, token, filepath, mimetype):
     except: pass
 
 def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free):
+    # Safe check for file size to avoid sending empty (0 byte) corrupted files
+    if os.path.getsize(a_path) < 100 or os.path.getsize(v_path) < 100:
+        raise RuntimeError("FFmpeg generated empty or corrupted files (Partial DL issue).")
+
     with open(a_path, "rb") as fa: a_b64 = base64.b64encode(fa.read()).decode("utf-8")
     with open(v_path, "rb") as fv: v_b64 = base64.b64encode(fv.read()).decode("utf-8")
     
@@ -88,15 +92,12 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
     if schema: payload["generationConfig"]["responseSchema"] = schema
     attempts = []
     
-    # 🔴 Reverted to the absolute original working models that do not return 404
     if strategy in ["flash_only", "hybrid"]:
         with STATE_LOCK: avail = [k for k in fk_list if k not in exh_free]
-        for k in avail: 
-            attempts.append((k, "gemini-1.5-flash", False))
-            attempts.append((k, "gemini-1.5-flash-8b", False)) # Fallback if standard flash is down
+        for k in avail: attempts.append((k, "gemini-1.5-flash-latest", False))
         
     if strategy in ["hybrid", "pro_only"] and pk:
-        attempts.append((pk, "gemini-1.5-pro", True))
+        attempts.append((pk, "gemini-1.5-pro-latest", True))
         
     last_err = ""
     for key, model, is_paid in attempts:
@@ -109,7 +110,6 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
                 return json.loads(d["candidates"][0]["content"]["parts"][0]["text"]), ((in_t/1e6)*PRICING[t]["in"] + (out_t/1e6)*PRICING[t]["out"]) if is_paid else 0.0, model, "PAID" if is_paid else "FREE"
             else:
                 print(f"API Error [{r.status_code}] with model {model}: {r.text}")
-                # Treat 400 (Invalid Key) and 429/503 as exhausted for THIS key
                 if r.status_code in [400, 429, 503, 404] and not is_paid:
                     with STATE_LOCK: exh_free.add(key)
                 last_err = f"{r.status_code}: {r.text}"
@@ -184,13 +184,15 @@ def main():
         
         st = idx * chunk_sec; d = min(chunk_sec, dur - st)
         ap, vp = f"/tmp/a_{idx}.mp3", f"/tmp/v_{idx}.mp4"
+        
+        # FIX: Added http reconnection flags to ffmpeg to prevent partial file dropouts
+        ffmpeg_base_args = ["-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5", "-y", "-ss", str(st), "-t", str(d), "-i", src_url]
+        
         with FFMPEG_SEM:
-            res_a = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "16k", ap])
-            res_v = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-an", "-vf", f"fps={fps},scale=640:360", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", vp])
+            res_a = subprocess.run(["ffmpeg"] + ffmpeg_base_args + ["-vn", "-ac", "1", "-ar", "16000", "-b:a", "16k", ap])
+            res_v = subprocess.run(["ffmpeg"] + ffmpeg_base_args + ["-an", "-vf", f"fps={fps},scale=640:360", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", vp])
             if res_a.returncode != 0 or res_v.returncode != 0:
                 print(f"Error extracting chunk {idx}.")
-                if not os.path.exists(vp): open(vp, 'w').close() 
-                if not os.path.exists(ap): open(ap, 'w').close()
         
         pr = (system_prompt + "\n\n" + EVAL_CHUNK_PROMPT) if mode == "eval" else (system_prompt + "\n\nشرح دقيق جداً لكل ما يحدث.")
         
@@ -222,7 +224,7 @@ def main():
     valid_chunks = [r for r in results if r is not None and "data" in r and r["data"]]
     
     if len(valid_chunks) == 0:
-        send_tg("❌ فشلت العملية بالكامل. (تأكد من المفاتيح أو خفف سرعة التوازي).", tg_bot, tg_chat)
+        send_tg("❌ فشلت العملية بالكامل. (انقطاع الاتصال بالسيرفر المصدر أو أخطاء التقطيع). لن يتم إرسال تقارير فارغة.", tg_bot, tg_chat)
         if cfg.get("webhook_url"):
             try: requests.post(cfg.get("webhook_url"), json={"action": "finalize_cost", "estimated_cost": cfg.get("pre_authorized_cost", 0), "actual_cost": 0.0}, timeout=10)
             except: pass
@@ -233,7 +235,7 @@ def main():
     
     if mode == "eval":
         synth_key = pk if pk else (fk_list[0] if fk_list else None)
-        synth_model = "gemini-1.5-pro" if pk else "gemini-1.5-flash"
+        synth_model = "gemini-1.5-pro-latest" if pk else "gemini-1.5-flash-latest"
         try: 
             r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{synth_model}:generateContent?key={synth_key}", json={"contents":[{"role":"user","parts":[{"text": EVAL_SYNTHESIS_PROMPT.format(editorial=cfg.get("editorial_mode")) + json.dumps(valid_chunks, ensure_ascii=False)}]}]}).json()
             final_data = json.loads(r["candidates"][0]["content"]["parts"][0]["text"])
