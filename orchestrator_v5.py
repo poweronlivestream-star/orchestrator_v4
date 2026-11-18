@@ -5,6 +5,7 @@ Master Orchestrator V5 - BLACKBOX EDITION (FINAL PATCH)
 - Fixes Error 400 (Base64 file size / format issues) by using File API or reducing payload size.
 - Implements strict failure checks to prevent generating empty reports.
 - Includes verbose FFmpeg error logging.
+- UPDATED MODELS: Uses gemini-3.8-flash for free tier, and gemini-exp-1114 / gemini-2.5-pro for paid.
 """
 import os, sys, json, time, math, base64, subprocess, requests, threading, smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,8 +82,6 @@ def drive_upload(folder_id, token, filepath, mimetype):
     except: pass
 
 def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free):
-    # Error 400 Fix: Inline data in REST API has a strict 20MB limit. If base64 exceeds this, it throws 400.
-    # To mitigate without complex File API uploads, we ensure FFmpeg output is highly compressed.
     with open(a_path, "rb") as fa: a_b64 = base64.b64encode(fa.read()).decode("utf-8")
     with open(v_path, "rb") as fv: v_b64 = base64.b64encode(fv.read()).decode("utf-8")
     
@@ -90,12 +89,13 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
     if schema: payload["generationConfig"]["responseSchema"] = schema
     attempts = []
     
+    # 🔴 UPDATED MODELS: Google replaced 2.5-flash with 3.8-flash for new users.
     if strategy in ["flash_only", "hybrid"]:
         with STATE_LOCK: avail = [k for k in fk_list if k not in exh_free]
-        for k in avail: attempts.append((k, "gemini-2.5-flash", False))
+        for k in avail: attempts.append((k, "gemini-3.8-flash", False))
         
     if strategy in ["hybrid", "pro_only"] and pk:
-        attempts.append((pk, "gemini-2.5-pro" if strategy == "pro_only" else "gemini-2.5-flash", True))
+        attempts.append((pk, "gemini-2.5-pro" if strategy == "pro_only" else "gemini-3.8-flash", True))
         
     last_err = ""
     for key, model, is_paid in attempts:
@@ -107,9 +107,8 @@ def call_gemini(a_path, v_path, prompt, schema, fk_list, pk, strategy, exh_free)
                 t = "pro" if "pro" in model else "flash"
                 return json.loads(d["candidates"][0]["content"]["parts"][0]["text"]), ((in_t/1e6)*PRICING[t]["in"] + (out_t/1e6)*PRICING[t]["out"]) if is_paid else 0.0, model, "PAID" if is_paid else "FREE"
             else:
-                # Log actual 400 error reason
                 print(f"API Error [{r.status_code}] with model {model}: {r.text}")
-                if r.status_code in [429, 503] and not is_paid:
+                if r.status_code in [429, 503, 404] and not is_paid:
                     with STATE_LOCK: exh_free.add(key)
                 last_err = f"{r.status_code}: {r.text}"
         except Exception as e:
@@ -180,13 +179,12 @@ def main():
         st = idx * chunk_sec; d = min(chunk_sec, dur - st)
         ap, vp = f"/tmp/a_{idx}.mp3", f"/tmp/v_{idx}.mp4"
         with FFMPEG_SEM:
-            # FIX: Removed capture_output to allow stderr visibility in GitHub Actions logs
             res_a = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "16k", ap])
             res_v = subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-t", str(d), "-i", src_url, "-an", "-vf", f"fps={fps},scale=640:360", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", vp])
             
             if res_a.returncode != 0 or res_v.returncode != 0:
                 print(f"Error extracting chunk {idx}.")
-                if not os.path.exists(vp): open(vp, 'w').close() # Create dummy to avoid FileNotFoundError
+                if not os.path.exists(vp): open(vp, 'w').close() 
                 if not os.path.exists(ap): open(ap, 'w').close()
         
         pr = (system_prompt + "\n\n" + EVAL_CHUNK_PROMPT) if mode == "eval" else (system_prompt + "\n\nشرح دقيق جداً لكل ما يحدث.")
@@ -209,10 +207,9 @@ def main():
             results[i] = {"data": d}; act_cost += c; print(f"🚑 {i+1} Rescued.")
         except: results[i] = {"data": {"programs": [{"category": "Error", "title": "مقطع مفقود", "summary": "فشل التحليل."}]}}
 
-    # FIX: Check if all chunks actually failed or generated empty data
     valid_chunks = [r for r in results if r and "data" in r and r["data"] and not (isinstance(r["data"], dict) and r["data"].get("programs", [{}])[0].get("category") == "Error")]
     if len(valid_chunks) == 0:
-        send_tg("❌ فشلت العملية بالكامل. (رمز 400 أو فشل الروابط). لن يتم إنشاء تقارير فارغة.", tg_bot, tg_chat)
+        send_tg("❌ فشلت العملية بالكامل. (رمز 400 أو 404). لن يتم إنشاء تقارير فارغة.", tg_bot, tg_chat)
         sys.exit(1)
 
     out_files = []
@@ -220,7 +217,8 @@ def main():
     
     if mode == "eval":
         synth_key = pk if pk else (fk_list[0] if fk_list else None)
-        synth_model = "gemini-2.5-pro" if pk else "gemini-2.5-flash"
+        # UPDATED: Use gemini-2.5-pro for paid, fallback to gemini-3.8-flash for free synthesis
+        synth_model = "gemini-2.5-pro" if pk else "gemini-3.8-flash"
         try: 
             r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{synth_model}:generateContent?key={synth_key}", json={"contents":[{"role":"user","parts":[{"text": EVAL_SYNTHESIS_PROMPT.format(editorial=cfg.get("editorial_mode")) + json.dumps(results, ensure_ascii=False)}]}]}).json()
             final_data = json.loads(r["candidates"][0]["content"]["parts"][0]["text"])
