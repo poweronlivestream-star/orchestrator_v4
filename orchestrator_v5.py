@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5.6 - COMPLETE PRODUCTION ENGINE
+Master Orchestrator V5.7 - COMPLETE PRODUCTION ENGINE
 Upgrades & Fixes:
 1. Restores full evaluate.py 90-point rubric (6 core + 23 sub-criteria), Directed & Neutral
    editorial modes, Lebanese dialect rule, monologue >3m rule, verbatim last_spoken_words,
@@ -39,8 +39,14 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types
+except ModuleNotFoundError:
+    print("⚙️ google-genai not found — installing automatically...", flush=True)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "google-genai"])
+    from google import genai
+    from google.genai import types
 
 BEIRUT_TZ = timezone(timedelta(hours=3))
 STATE_LOCK = threading.Lock()
@@ -863,10 +869,70 @@ def update_drive_folder_meta(folder_id, cfg, new_name, description_text=""):
         return False
 
 
-def push_status(cfg, folder_id, run_id, status, phase, completed, total, act_cost, started_at, eta_sec=None, message=""):
-    webhook = cfg.get("webhook_url")
-    if not webhook:
+STATUS_FILE_DRIVE_ID = None
+
+
+def write_drive_status_and_check_cancel(folder_id, cfg, payload):
+    global STATUS_FILE_DRIVE_ID
+    if not folder_id:
         return False
+    try:
+        chk = drive_request(
+            "GET",
+            "https://www.googleapis.com/drive/v3/files",
+            cfg,
+            params={"q": f"'{folder_id}' in parents and name='_cancel.flag' and trashed=false", "fields": "files(id)"},
+            timeout=10,
+        )
+        if chk.status_code == 200 and chk.json().get("files"):
+            CANCEL_EVENT.set()
+            return True
+
+        raw_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if not STATUS_FILE_DRIVE_ID:
+            r = drive_request(
+                "GET",
+                "https://www.googleapis.com/drive/v3/files",
+                cfg,
+                params={"q": f"'{folder_id}' in parents and name='_status.json' and trashed=false", "fields": "files(id)"},
+                timeout=10,
+            )
+            files_found = r.json().get("files", []) if r.status_code == 200 else []
+            if files_found:
+                STATUS_FILE_DRIVE_ID = files_found[0]["id"]
+
+        if STATUS_FILE_DRIVE_ID:
+            drive_request(
+                "PATCH",
+                f"https://www.googleapis.com/upload/drive/v3/files/{STATUS_FILE_DRIVE_ID}?uploadType=media",
+                cfg,
+                headers={"Content-Type": "application/json; charset=UTF-8"},
+                data=raw_bytes,
+                timeout=15,
+            )
+        else:
+            bound = "===BNDRY_ST==="
+            meta = json.dumps({"name": "_status.json", "parents": [folder_id]})
+            body = (
+                f"--{bound}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n"
+                f"--{bound}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+            ).encode("utf-8") + raw_bytes + f"\r\n--{bound}--\r\n".encode("utf-8")
+            up = drive_request(
+                "POST",
+                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id",
+                cfg,
+                headers={"Content-Type": f"multipart/related; boundary={bound}"},
+                data=body,
+                timeout=15,
+            )
+            if up.status_code in (200, 201):
+                STATUS_FILE_DRIVE_ID = up.json().get("id")
+    except Exception as e:
+        print(f"[Drive Status Warning] {e}", flush=True)
+    return CANCEL_EVENT.is_set()
+
+
+def push_status(cfg, folder_id, run_id, status, phase, completed, total, act_cost, started_at, eta_sec=None, message=""):
     elapsed = int(time.time() - started_at)
     if eta_sec is None:
         if completed > 0 and total > completed:
@@ -887,18 +953,36 @@ def push_status(cfg, folder_id, run_id, status, phase, completed, total, act_cos
         "eta_sec": max(0, int(eta_sec)),
         "actual_cost": round(float(act_cost), 4),
         "message": message,
+        "updated_at_epoch": int(time.time()),
     }
-    try:
-        r = requests.post(webhook, json=payload, timeout=10)
-        if r.status_code == 200 and r.json().get("cancel_requested"):
-            CANCEL_EVENT.set()
-            return True
-    except Exception as e:
-        print(f"[Status Webhook Warning] {e}", flush=True)
+    # 1. Always write _status.json to Drive (works even if Web App access is "Only myself")
+    write_drive_status_and_check_cancel(folder_id, cfg, payload)
+
+    # 2. Also push via Apps Script webhook if reachable
+    webhook = cfg.get("webhook_url")
+    if webhook:
+        try:
+            r = requests.post(webhook, json=payload, timeout=10)
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if r.status_code == 200 and "json" in ctype and r.json().get("cancel_requested"):
+                CANCEL_EVENT.set()
+                return True
+        except Exception as e:
+            print(f"[Status Webhook Warning] {e}", flush=True)
     return CANCEL_EVENT.is_set()
 
 
 def finalize_cost_webhook(cfg, folder_id, actual_cost: float, final_status="completed", message="", trigger_gas_email=False, email_subject=""):
+    write_drive_status_and_check_cancel(folder_id, cfg, {
+        "job_id": folder_id,
+        "run_id": str(os.environ.get("GITHUB_RUN_ID", "")),
+        "status": final_status,
+        "phase": message or final_status,
+        "eta_sec": 0,
+        "actual_cost": round(float(actual_cost), 4),
+        "message": message,
+        "updated_at_epoch": int(time.time()),
+    })
     webhook = cfg.get("webhook_url")
     if not webhook:
         return
@@ -1403,7 +1487,7 @@ def main():
         finalize_cost_webhook(cfg, fid, 0.0, "cancelled", "تم الإلغاء")
         sys.exit(0)
 
-    send_tg(f"🚀 بدء التحليل V5.6 | {clean_name} | المدة: {exact_duration} | المقاطع: {tot} | المسار: {strat}", tg_bot, tg_chat)
+    send_tg(f"🚀 بدء التحليل V5.7 | {clean_name} | المدة: {exact_duration} | المقاطع: {tot} | المسار: {strat}", tg_bot, tg_chat)
 
     results = [None] * tot
     act_cost = 0.0
@@ -1588,7 +1672,7 @@ def main():
                 break
 
     banner_html = (
-        f'<div class="thinking-note">المنظومة: V5.6 ({editorial_label if mode == "eval" else "تحليل البث اليومي"}) '
+        f'<div class="thinking-note">المنظومة: V5.7 ({editorial_label if mode == "eval" else "تحليل البث اليومي"}) '
         f'| المقاطع: {len(valid_chunks)}/{tot} | التجميع: {synth_used_label or "Auto"} | التكلفة: ${act_cost:.4f}</div>'
     )
 
@@ -1669,7 +1753,7 @@ def main():
         send_tg(f"📄 <b>{os.path.basename(fpath)}</b>\n• المدة: {exact_duration} | المقاطع: {len(valid_chunks)}/{tot} | الكلفة: ${act_cost:.4f}", tg_bot, tg_chat, fpath)
     drive_upload(fid, cfg, js_path, "application/json")
 
-    email_subj = f"✅ اكتمل تقرير V5.6 ({clean_name}) | الكلفة: ${act_cost:.4f}"
+    email_subj = f"✅ اكتمل تقرير V5.7 ({clean_name}) | الكلفة: ${act_cost:.4f}"
     smtp_ok = send_smtp_resilient(email_subj, sum_html, out_files, cfg.get("alert_emails", ""), gm_u, gm_p)
 
     # Rename Drive folder PRESERVING presenter/episode name + full rich description!
@@ -1708,7 +1792,7 @@ def main():
         trigger_gas_email=(not smtp_ok),
         email_subject=email_subj,
     )
-    print(f"🎉 Pipeline V5.6 completed! Folder: {final_folder_name} | Chunks: {len(valid_chunks)}/{tot} | Cost: ${act_cost:.4f}", flush=True)
+    print(f"🎉 Pipeline V5.7 completed! Folder: {final_folder_name} | Chunks: {len(valid_chunks)}/{tot} | Cost: ${act_cost:.4f}", flush=True)
 
 
 if __name__ == "__main__":
