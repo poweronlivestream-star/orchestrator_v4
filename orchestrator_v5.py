@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5 - VERIFIED PRODUCTION EDITION
-Fixes all observed root causes:
-1. Pre-Flight Key & Model Validator: Tests every Free & Paid API key up front
-   against active Gemini 3/4 models before downloading/slicing video.
-2. Uses active models (Nov 2026):
-   - Free & Fast chain: gemini-3.8-flash -> gemini-3.6-flash -> gemini-3.5-flash-lite
-   - Paid rescue / deep synthesis: gemini-3.8-flash / gemini-3.6-flash / gemini-4-argon
-   (Replaces retired gemini-1.5-* and restricted gemini-2.5-flash)
-3. Uses official `google-genai` SDK (supports both AIza* and new AQ.* auth keys).
-4. Smart Error Classification:
-   - 400 API_KEY_INVALID / 401 / 403 -> drops bad key permanently
-   - 429 RESOURCE_EXHAUSTED -> marks only that (key, model) pair exhausted, rotates model/key
-   - 503 UNAVAILABLE (high demand) -> does NOT ban the key; falls back to next model / backs off
-5. Single-pass FFmpeg muxed MP4 chunks (audio+video in 1 file) + local download for eval
-   + strict >5KB file validation + retries (prevents 0-byte 400 INVALID_ARGUMENT errors).
+Master Orchestrator V5 - FAST PRE-FLIGHT & DYNAMIC MODEL EDITION
+- Pre-flight validates all Free & Paid keys in parallel via /v1beta/models (2-4 seconds total, hard 8s timeout).
+- Dynamically discovers active generateContent-capable models per key (eliminates 404s & retired model IDs).
+- Uses official `google-genai` SDK with single-pass muxed MP4 chunks + local download for eval/short runs.
+- Smart error separation: 400/401/403 bans bad key; 429 rotates (key, model); 503 switches model without banning key.
 """
 import os
+import re
 import sys
 import json
 import time
@@ -41,29 +32,33 @@ BEIRUT_TZ = timezone(timedelta(hours=3))
 STATE_LOCK = threading.Lock()
 FFMPEG_SEM = threading.Semaphore(3)
 
-# Active models as of Nov 2026 (ordered by preference)
-FREE_MODELS = [
+# Preferred model priority (fallback only if dynamic discovery returns empty)
+PREFERRED_FLASH_ORDER = [
     "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.0-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
 ]
-PAID_CHUNK_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-]
-PAID_SYNTH_MODELS = [
+
+PREFERRED_SYNTH_ORDER = [
     "gemini-3.8-flash",
     "gemini-4-argon",
     "gemini-3.6-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
 ]
 
-# Official per-1M-token pricing (Nov 2026)
 PRICING = {
     "gemini-3.8-flash":      {"in": 0.75, "out": 3.75},
     "gemini-3.6-flash":      {"in": 0.50, "out": 2.50},
     "gemini-3.5-flash-lite": {"in": 0.30, "out": 2.50},
     "gemini-4-argon":        {"in": 2.00, "out": 10.00},
+    "gemini-2.5-pro":        {"in": 1.25, "out": 10.00},
+    "gemini-2.5-flash":      {"in": 0.30, "out": 2.50},
+    "gemini-2.5-flash-lite": {"in": 0.10, "out": 0.40},
 }
 
 DAILY_SCHEMA = {
@@ -163,7 +158,7 @@ def send_tg(msg, token, chat, file_path=None):
                 timeout=15,
             )
     except Exception as e:
-        print(f"[TG Warning] {e}")
+        print(f"[TG Warning] {e}", flush=True)
 
 
 def send_smtp(subject, body, files, emails, user, pwd):
@@ -192,7 +187,7 @@ def send_smtp(subject, body, files, emails, user, pwd):
                 s.sendmail(user, recips, msg.as_string())
             return True
         except Exception as e:
-            print(f"[SMTP Retry] {e}")
+            print(f"[SMTP Retry] {e}", flush=True)
             time.sleep(2)
     return False
 
@@ -228,123 +223,133 @@ def drive_upload(folder_id, token, filepath, mimetype):
                 timeout=60,
             )
     except Exception as e:
-        print(f"[Drive Upload Warning] {e}")
+        print(f"[Drive Upload Warning] {e}", flush=True)
 
 
-def validate_single_key(key: str, label: str, test_models: list) -> tuple:
+def rank_discovered_models(available_models: list, preferred_order: list, allow_pro: bool = False) -> list:
     """
-    Tests an API key up front using a minimal live generate_content call
-    against active models. Returns (is_valid: bool, working_models: list, detail: str).
+    Orders available generateContent-capable models: preferred models first,
+    then any other active flash (and optionally pro/argon) models sorted newest-first.
+    Excludes image/tts/embedding/audio-only/thinking-only/legacy 1.0-1.5 models.
+    """
+    skip_tokens = ("tts", "image", "imagen", "veo", "embedding", "aqa", "bison", "gecko", "1.0", "1.5", "robotics", "computer-use", "live")
+    avail_set = set(available_models)
+    ordered = [m for m in preferred_order if m in avail_set]
+
+    extras = []
+    for m in available_models:
+        low = m.lower()
+        if m in ordered or not low.startswith("gemini-"):
+            continue
+        if any(tok in low for tok in skip_tokens):
+            continue
+        if "flash" in low or (allow_pro and ("pro" in low or "argon" in low)):
+            extras.append(m)
+
+    def version_key(name: str):
+        nums = [int(x) for x in re.findall(r"\d+", name)]
+        is_preview = 0 if ("preview" in name or "exp" in name) else 1
+        return (nums[:2] if nums else [0, 0], is_preview, name)
+
+    extras.sort(key=version_key, reverse=True)
+    ordered.extend(extras)
+    return ordered[:6]
+
+
+def validate_single_key(key: str, preferred_models: list, allow_pro: bool = False) -> tuple:
+    """
+    Fast validation (~0.5-1.5s): checks key auth and lists active generateContent models
+    via REST with a strict (5s connect, 8s read) timeout. No slow generate_content ping.
     """
     key = key.strip().strip('"').strip("'")
     if not key:
         return False, [], "empty"
-
-    working = []
-    last_reason = "no models tested"
-
-    # Quick models.list auth check first via REST with x-goog-api-key header (supports AQ.* & AIza*)
     try:
         r = requests.get(
-            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=5",
+            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
             headers={"x-goog-api-key": key},
-            timeout=15,
+            timeout=(5, 8),
         )
-        if r.status_code in (400, 401, 403):
-            return False, [], f"AUTH FAILED ({r.status_code}): {r.text[:180]}"
+        if r.status_code != 200:
+            return False, [], f"AUTH FAILED ({r.status_code}): {r.text[:140]}"
+
+        raw_models = r.json().get("models", [])
+        gen_models = [
+            m.get("name", "").replace("models/", "")
+            for m in raw_models
+            if "generateContent" in m.get("supportedGenerationMethods", [])
+        ]
+        working = rank_discovered_models(gen_models, preferred_models, allow_pro=allow_pro)
+        if not working:
+            working = list(preferred_models[:3])
+        return True, working, f"OK ({', '.join(working[:3])})"
     except Exception as e:
         return False, [], f"NETWORK ERROR: {e}"
-
-    client = genai.Client(api_key=key)
-    for model_name in test_models:
-        try:
-            res = client.models.generate_content(
-                model=model_name,
-                contents="Reply OK",
-                config=types.GenerateContentConfig(max_output_tokens=8, temperature=0.0),
-            )
-            if res and res.text is not None:
-                working.append(model_name)
-                # Once we confirm at least 2 working models, stop burning extra ping calls
-                if len(working) >= 2:
-                    break
-        except Exception as e:
-            err = str(e)
-            low = err.lower()
-            if "api_key_invalid" in low or "access_token_type_unsupported" in low or "401" in low or "403" in low:
-                return False, [], f"AUTH FAILED on {model_name}: {err[:180]}"
-            if "503" in low or "unavailable" in low:
-                # Key is valid, this model is just momentarily overloaded
-                working.append(model_name)
-                last_reason = f"{model_name} 503 busy (key valid)"
-            elif "429" in low or "resource_exhausted" in low:
-                last_reason = f"{model_name} 429 quota exhausted"
-            else:
-                last_reason = f"{model_name}: {err[:120]}"
-
-    if working:
-        return True, working, f"OK ({', '.join(working)})"
-    return False, [], f"FAILED ({last_reason})"
 
 
 def preflight_validate_keys(raw_free_keys: list, raw_paid_key: str, strategy: str, tg_bot: str, tg_chat: str):
     """
-    Validates all configured Free and Paid keys BEFORE downloading or running FFmpeg.
+    Validates all configured Free and Paid keys IN PARALLEL in ~2-4 seconds total
+    BEFORE downloading video or running FFmpeg.
     """
-    print("=" * 60)
-    print("PRE-FLIGHT API KEY VALIDATION")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print("PRE-FLIGHT API KEY VALIDATION (FAST PARALLEL)", flush=True)
+    print("=" * 60, flush=True)
 
     valid_free = []
-    report_lines = []
-
-    for idx, k in enumerate(raw_free_keys, 1):
-        ok, models, detail = validate_single_key(k, f"FREE#{idx}", FREE_MODELS)
-        status_icon = "✅" if ok else "❌"
-        line = f"{status_icon} FREE #{idx} ({mask_key(k)}): {detail}"
-        print(line)
-        report_lines.append(line)
-        if ok:
-            valid_free.append((k, models))
-
     valid_paid = None
     paid_models = []
+    report_lines = []
+
+    tasks = [(f"FREE #{i}", k, PREFERRED_FLASH_ORDER, False) for i, k in enumerate(raw_free_keys, 1)]
     if raw_paid_key:
-        ok, models, detail = validate_single_key(raw_paid_key, "PAID", PAID_CHUNK_MODELS)
-        status_icon = "✅" if ok else "❌"
-        line = f"{status_icon} PAID ({mask_key(raw_paid_key)}): {detail}"
-        print(line)
-        report_lines.append(line)
-        if ok:
-            valid_paid = raw_paid_key
-            paid_models = models
-    else:
-        print("ℹ️ PAID key: not configured")
+        tasks.append(("PAID", raw_paid_key, PREFERRED_FLASH_ORDER, True))
+
+    if tasks:
+        with ThreadPoolExecutor(max_workers=min(10, len(tasks))) as ex:
+            futs = {
+                ex.submit(validate_single_key, k, pref, is_paid): (lbl, k, is_paid)
+                for lbl, k, pref, is_paid in tasks
+            }
+            for fut in as_completed(futs):
+                lbl, k, is_paid = futs[fut]
+                ok, models, detail = fut.result()
+                line = f"{'✅' if ok else '❌'} {lbl} ({mask_key(k)}): {detail}"
+                print(line, flush=True)
+                report_lines.append(line)
+                if ok:
+                    if is_paid:
+                        valid_paid = k
+                        paid_models = models
+                    else:
+                        valid_free.append((k, models))
+
+    if not raw_paid_key:
+        print("ℹ️ PAID key: not configured", flush=True)
         report_lines.append("ℹ️ PAID key: not configured")
 
-    print("=" * 60)
+    print("=" * 60, flush=True)
 
-    can_run = False
-    if strategy == "flash_only" and len(valid_free) > 0:
-        can_run = True
-    elif strategy == "pro_only" and valid_paid is not None:
-        can_run = True
-    elif strategy == "hybrid" and (len(valid_free) > 0 or valid_paid is not None):
-        can_run = True
+    can_run = (
+        (strategy == "flash_only" and len(valid_free) > 0)
+        or (strategy == "pro_only" and valid_paid is not None)
+        or (strategy == "hybrid" and (len(valid_free) > 0 or valid_paid is not None))
+    )
 
-    summary_msg = (
+    send_tg(
         f"🔑 <b>فحص المفاتيح المسبق ({strategy})</b>\n"
         f"• المجانية الصالحة: {len(valid_free)}/{len(raw_free_keys)}\n"
-        f"• المفتاح المدفوع: {'✅ صالح' if valid_paid else '❌ غير صالح / غير مضاف'}"
+        f"• المفتاح المدفوع: {'✅ صالح' if valid_paid else '❌ غير صالح / غير مضاف'}",
+        tg_bot,
+        tg_chat,
     )
-    send_tg(summary_msg, tg_bot, tg_chat)
 
     if not can_run:
-        err_msg = (
-            f"❌ <b>توقف فوري: لا يوجد أي مفتاح API صالح للتشغيل ({strategy})</b>\n"
-            + "\n".join(report_lines[:8])
+        send_tg(
+            f"❌ <b>توقف فوري: لا يوجد أي مفتاح API صالح ({strategy})</b>\n" + "\n".join(report_lines[:8]),
+            tg_bot,
+            tg_chat,
         )
-        send_tg(err_msg, tg_bot, tg_chat)
         return [], None, []
 
     return valid_free, valid_paid, paid_models
@@ -390,12 +395,13 @@ def calc_cost(model_name: str, usage, is_paid: bool) -> float:
     return (in_t / 1e6) * rates["in"] + (out_t / 1e6) * rates["out"]
 
 
-def call_gemini_chunk(media_path, prompt, schema, valid_free, valid_paid, strategy, exhausted_pairs, bad_keys):
+def call_gemini_chunk(media_path, prompt, schema, valid_free, valid_paid, paid_models, strategy, exhausted_pairs, bad_keys):
     """
-    Uploads ONE muxed MP4 file per key attempt and tries active models with smart fallback:
+    Uploads ONE muxed MP4 file per key attempt and tries that key's discovered models:
     - 400 API_KEY_INVALID / 401 / 403 -> bans key permanently
-    - 429 RESOURCE_EXHAUSTED -> marks only (key, model) exhausted, tries next model/key
-    - 503 UNAVAILABLE -> tries next model immediately without banning key
+    - 429 RESOURCE_EXHAUSTED -> marks only (key, model) exhausted, rotates model on same uploaded file
+    - 503 UNAVAILABLE -> retries once then moves to next model without banning key
+    - 404 NOT_FOUND -> marks (key, model) unavailable and moves to next model
     """
     last_err = ""
     config = build_gen_config(schema)
@@ -406,7 +412,6 @@ def call_gemini_chunk(media_path, prompt, schema, valid_free, valid_paid, strate
             if api_key in bad_keys:
                 return None
 
-        # Filter out (key, model) pairs that already hit 429
         models_to_try = []
         with STATE_LOCK:
             for m in model_candidates:
@@ -422,7 +427,7 @@ def call_gemini_chunk(media_path, prompt, schema, valid_free, valid_paid, strate
             uploaded = wait_file_active(client, uploaded)
 
             for model_name in models_to_try:
-                for retry in range(2):
+                for attempt in range(2):
                     try:
                         res = client.models.generate_content(
                             model=model_name,
@@ -436,7 +441,7 @@ def call_gemini_chunk(media_path, prompt, schema, valid_free, valid_paid, strate
                         err = str(e)
                         low = err.lower()
                         last_err = f"[{model_name}] {err[:220]}"
-                        print(f"API Error ({'PAID' if is_paid else 'FREE'} {mask_key(api_key)} / {model_name}): {err[:200]}")
+                        print(f"API Error ({'PAID' if is_paid else 'FREE'} {mask_key(api_key)} / {model_name}): {err[:200]}", flush=True)
 
                         if "api_key_invalid" in low or "access_token_type_unsupported" in low or "401" in low or "403" in low:
                             with STATE_LOCK:
@@ -445,14 +450,16 @@ def call_gemini_chunk(media_path, prompt, schema, valid_free, valid_paid, strate
                         elif "429" in low or "resource_exhausted" in low or "quota" in low:
                             with STATE_LOCK:
                                 exhausted_pairs.add((api_key, model_name))
-                            break  # try next model on same uploaded file!
-                        elif "503" in low or "unavailable" in low or "overloaded" in low:
-                            time.sleep(random.uniform(2, 5))
-                            continue  # retry once, then try next model (do NOT ban key!)
-                        elif "404" in low or "not_found" in low:
+                            break
+                        elif "404" in low or "not_found" in low or "no longer available" in low:
                             with STATE_LOCK:
                                 exhausted_pairs.add((api_key, model_name))
                             break
+                        elif "503" in low or "unavailable" in low or "overloaded" in low:
+                            if attempt == 0:
+                                time.sleep(random.uniform(2, 4))
+                                continue
+                            break  # move to next model without banning key
                         else:
                             time.sleep(2)
                             break
@@ -460,7 +467,7 @@ def call_gemini_chunk(media_path, prompt, schema, valid_free, valid_paid, strate
             err = str(e)
             low = err.lower()
             last_err = f"[UPLOAD] {err[:220]}"
-            print(f"Upload Error ({'PAID' if is_paid else 'FREE'} {mask_key(api_key)}): {err[:200]}")
+            print(f"Upload Error ({'PAID' if is_paid else 'FREE'} {mask_key(api_key)}): {err[:200]}", flush=True)
             if "api_key_invalid" in low or "access_token_type_unsupported" in low or "401" in low or "403" in low:
                 with STATE_LOCK:
                     bad_keys.add(api_key)
@@ -472,18 +479,18 @@ def call_gemini_chunk(media_path, prompt, schema, valid_free, valid_paid, strate
                     pass
         return None
 
-    # 1. Free tier attempts (shuffled slightly to distribute load across keys)
+    # 1. Free tier attempts
     if strategy in ("flash_only", "hybrid") and valid_free:
         free_order = list(valid_free)
         random.shuffle(free_order)
-        for key, _ in free_order:
-            out = run_with_key(key, FREE_MODELS, is_paid=False)
+        for key, key_models in free_order:
+            out = run_with_key(key, key_models, is_paid=False)
             if out is not None:
                 return out
 
     # 2. Paid fallback / pro_only
     if strategy in ("hybrid", "pro_only") and valid_paid:
-        out = run_with_key(valid_paid, PAID_CHUNK_MODELS, is_paid=True)
+        out = run_with_key(valid_paid, paid_models or PREFERRED_FLASH_ORDER, is_paid=True)
         if out is not None:
             return out
 
@@ -556,7 +563,7 @@ def refund_webhook(cfg, actual_cost: float):
                 timeout=15,
             )
         except Exception as e:
-            print(f"[Webhook Warning] {e}")
+            print(f"[Webhook Warning] {e}", flush=True)
 
 
 def download_video_resilient(url: str, dest: str, max_retries: int = 3) -> bool:
@@ -571,7 +578,7 @@ def download_video_resilient(url: str, dest: str, max_retries: int = 3) -> bool:
             if os.path.exists(dest) and os.path.getsize(dest) > 50_000:
                 return True
         except Exception as e:
-            print(f"[Download Attempt {attempt}/{max_retries} Failed] {e}")
+            print(f"[Download Attempt {attempt}/{max_retries} Failed] {e}", flush=True)
             time.sleep(3)
     return False
 
@@ -607,7 +614,7 @@ def main():
                     timeout=20,
                 ).text.strip()
     except Exception as e:
-        print(f"[Config Fetch Error] {e}")
+        print(f"[Config Fetch Error] {e}", flush=True)
 
     mode = cfg.get("run_mode", "daily")
     chunk_sec = int(cfg.get("chunk_size", 10)) * 60
@@ -616,8 +623,8 @@ def main():
     system_prompt = cfg.get("system_prompt", "")
     fps = cfg.get("daily_fps", "1/5") if mode == "daily" else cfg.get("eval_fps", "1")
 
-    # STEP 1: PRE-FLIGHT KEY VALIDATION (runs in ~2-5s BEFORE video download/FFmpeg!)
-    valid_free, valid_paid, _ = preflight_validate_keys(fk_list, pk, strat, tg_bot, tg_chat)
+    # STEP 1: FAST PARALLEL PRE-FLIGHT KEY VALIDATION (~2-4 seconds total)
+    valid_free, valid_paid, paid_models = preflight_validate_keys(fk_list, pk, strat, tg_bot, tg_chat)
     if (strat == "flash_only" and not valid_free) or (strat == "pro_only" and not valid_paid) or (not valid_free and not valid_paid):
         refund_webhook(cfg, 0.0)
         sys.exit(1)
@@ -639,7 +646,7 @@ def main():
         if probe_out:
             dur = float(probe_out)
     except Exception as e:
-        print(f"[ffprobe warning] {e}")
+        print(f"[ffprobe warning] {e}", flush=True)
 
     tot = math.ceil(dur / chunk_sec)
     if tot <= 0:
@@ -649,16 +656,16 @@ def main():
 
     local_input = src_url
     downloaded_local = False
-    if mode == "eval" or dur <= 9000:  # Download locally if eval or <= 2.5 hours
+    if mode == "eval" or dur <= 9000:
         send_tg(f"📥 تحميل الحلقة محلياً ({dur/60:.1f} دقيقة) لمنع انقطاع البث...", tg_bot, tg_chat)
         tmp_src = "/tmp/source_video.mp4"
         if download_video_resilient(src_url, tmp_src):
             local_input = tmp_src
             downloaded_local = True
             size_mb = os.path.getsize(tmp_src) / (1024 * 1024)
-            print(f"✅ Downloaded locally: {size_mb:.1f} MB")
+            print(f"✅ Downloaded locally: {size_mb:.1f} MB", flush=True)
         else:
-            print("⚠️ Local download failed; falling back to resilient HTTP streaming.")
+            print("⚠️ Local download failed; falling back to resilient HTTP streaming.", flush=True)
 
     send_tg(f"🚀 بدء التحليل V5 | المسار: {mode} | المقاطع: {tot} | الاستراتيجية: {strat}", tg_bot, tg_chat)
 
@@ -674,7 +681,6 @@ def main():
         d = min(chunk_sec, dur - st)
         mp4_path = f"/tmp/chunk_{idx}.mp4"
 
-        # Single-pass FFmpeg: ONE lightweight MP4 containing both video + mono audio
         extracted = False
         for attempt in range(1, 4):
             cmd = ["ffmpeg", "-y", "-loglevel", "error"]
@@ -695,7 +701,7 @@ def main():
             if proc.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 5000:
                 extracted = True
                 break
-            print(f"[FFmpeg Retry {attempt}/3 on chunk {idx+1}] rc={proc.returncode} err={proc.stderr[:160]}")
+            print(f"[FFmpeg Retry {attempt}/3 on chunk {idx+1}] rc={proc.returncode} err={proc.stderr[:160]}", flush=True)
             time.sleep(2)
 
         if not extracted:
@@ -712,9 +718,9 @@ def main():
         run_strat = "pro_only" if force_paid else strat
         try:
             data, cost, used_model, tier = call_gemini_chunk(
-                mp4_path, pr, schema, valid_free, valid_paid, run_strat, exhausted_pairs, bad_keys
+                mp4_path, pr, schema, valid_free, valid_paid, paid_models, run_strat, exhausted_pairs, bad_keys
             )
-            print(f"✅ Chunk {idx+1}/{tot} done via {tier} ({used_model}) | cost=${cost:.4f}")
+            print(f"✅ Chunk {idx+1}/{tot} done via {tier} ({used_model}) | cost=${cost:.4f}", flush=True)
             return data, cost
         finally:
             if os.path.exists(mp4_path):
@@ -734,11 +740,11 @@ def main():
                     act_cost += c
             except Exception as e:
                 failed.append(i)
-                print(f"⚠️ Chunk {i+1} Failed: {e}")
+                print(f"⚠️ Chunk {i+1} Failed: {e}", flush=True)
 
-    # DLQ Rescue (keep local file until AFTER DLQ finishes!)
+    # DLQ Rescue (before cleaning up local source video)
     if failed:
-        print(f"Entering Dead-Letter Queue (DLQ) for {len(failed)} chunks...")
+        print(f"Entering Dead-Letter Queue (DLQ) for {len(failed)} chunks...", flush=True)
         time.sleep(10)
         for i in failed:
             try:
@@ -747,9 +753,9 @@ def main():
                 results[i] = {"chunk_index": i + 1, "data": data}
                 with STATE_LOCK:
                     act_cost += c
-                print(f"🚑 Chunk {i+1} Rescued.")
+                print(f"🚑 Chunk {i+1} Rescued.", flush=True)
             except Exception as ex:
-                print(f"❌ DLQ Rescue Failed for chunk {i+1}: {ex}")
+                print(f"❌ DLQ Rescue Failed for chunk {i+1}: {ex}", flush=True)
                 results[i] = None
                 time.sleep(4)
 
@@ -772,10 +778,11 @@ def main():
     if mode == "eval":
         synth_candidates = []
         if strat != "flash_only" and valid_paid:
-            for m in PAID_SYNTH_MODELS:
+            synth_order = rank_discovered_models(paid_models, PREFERRED_SYNTH_ORDER, allow_pro=True) or paid_models
+            for m in synth_order:
                 synth_candidates.append((valid_paid, m, True))
-        for k, _ in valid_free:
-            for m in FREE_MODELS:
+        for k, kmodels in valid_free:
+            for m in kmodels:
                 synth_candidates.append((k, m, False))
 
         synth_prompt = EVAL_SYNTHESIS_PROMPT.format(editorial=cfg.get("editorial_mode", "directed")) + json.dumps(valid_chunks, ensure_ascii=False)
@@ -789,10 +796,10 @@ def main():
                 )
                 final_data = clean_json_text(res.text)
                 act_cost += calc_cost(smodel, res.usage_metadata, spaid)
-                print(f"✅ Synthesis complete via {'PAID' if spaid else 'FREE'} ({smodel})")
+                print(f"✅ Synthesis complete via {'PAID' if spaid else 'FREE'} ({smodel})", flush=True)
                 break
             except Exception as e:
-                print(f"[Synthesis Retry {smodel}] {str(e)[:160]}")
+                print(f"[Synthesis Retry {smodel}] {str(e)[:160]}", flush=True)
 
         if not final_data:
             final_data = {"total_score": 0, "percentage": 0, "strengths": [], "priorities": [], "sub_criteria": []}
@@ -843,7 +850,7 @@ def main():
         pass
 
     refund_webhook(cfg, act_cost)
-    print(f"🎉 Pipeline completed successfully! Chunks: {len(valid_chunks)}/{tot} | Total Cost: ${act_cost:.4f}")
+    print(f"🎉 Pipeline completed successfully! Chunks: {len(valid_chunks)}/{tot} | Total Cost: ${act_cost:.4f}", flush=True)
 
 
 if __name__ == "__main__":
