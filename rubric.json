@@ -1,0 +1,207 @@
+{
+  "rubric_version": "manar-100-v2",
+  "name": "تقييم الأداء الحواري في قناة موجّهة الخط",
+  "total": 100,
+  "principles": [
+    "عطب واحد يُحتسب في محور واحد فقط",
+    "كل بند له مؤشر قابل للعدّ ومرساة معلنة",
+    "التوجيه التحريري داخل السلّم لا خارجه",
+    "النتيجة تُنشر نطاقاً لا كسراً عشرياً"
+  ],
+  "bands": [
+    { "min": 90, "max": 100, "label": "استثنائي" },
+    { "min": 80, "max": 89, "label": "احترافي متقدّم" },
+    { "min": 70, "max": 79, "label": "احترافي سليم" },
+    { "min": 55, "max": 69, "label": "مقبول بثغرات بنيوية" },
+    { "min": 40, "max": 54, "label": "ضعيف" },
+    { "min": 0, "max": 39, "label": "فشل مهني" }
+  ],
+  "difficulty_modifier": {
+    "max": 5,
+    "rules": [
+      { "condition": "live_broadcast", "points": 1 },
+      { "condition": "breaking_news_file", "points": 2 },
+      { "condition": "two_or_more_sources", "points": 1 }
+    ]
+  },
+  "axes": [
+    {
+      "id": "A",
+      "name": "إيقاع البث والتحكّم الزمني",
+      "max": 22,
+      "items": [
+        {
+          "id": "A1", "name": "معدّل التدخّل", "max": 6,
+          "kpi": "interventions_per_10min", "unit": "per_10min", "direction": "higher_better",
+          "anchors": { "full": 10, "half": 6, "zero": 3 }
+        },
+        {
+          "id": "A2", "name": "متوسّط طول المداخلة", "max": 5,
+          "kpi": "mean_intervention_s", "unit": "seconds", "direction": "lower_better",
+          "anchors": { "full": 8, "half": 18, "zero": 35 }
+        },
+        {
+          "id": "A3", "name": "أطول بلوك متّصل", "max": 5,
+          "kpi": "longest_unbroken_block_s", "unit": "seconds", "direction": "lower_better",
+          "anchors": { "full": 90, "half": 150, "zero": 300 }
+        },
+        {
+          "id": "A4", "name": "اقتصاد الوقت بين المصادر", "max": 6,
+          "kpi": "source_share_pct", "unit": "percent", "direction": "range",
+          "target_range": { "anchor_pct": [20, 30], "guest_pct": [45, 55], "field_pct": [25, 35] }
+        }
+      ]
+    },
+    {
+      "id": "B",
+      "name": "هندسة السؤال",
+      "max": 18,
+      "items": [
+        {
+          "id": "B1", "name": "سؤال واحد لكل مداخلة", "max": 5,
+          "kpi": "single_question_pct", "unit": "percent", "direction": "higher_better",
+          "anchors": { "full": 90, "half": 60, "zero": 30 }
+        },
+        {
+          "id": "B2", "name": "اقتصاد التمهيد", "max": 5,
+          "kpi": "mean_preamble_s", "unit": "seconds", "direction": "lower_better",
+          "anchors": { "full": 10, "half": 22, "zero": 35 }
+        },
+        {
+          "id": "B3", "name": "الدقّة والمرجعية", "max": 4,
+          "kpi": "verifiable_referent_pct", "unit": "percent", "direction": "higher_better",
+          "anchors": { "full": 90, "half": 60, "zero": 30 }
+        },
+        {
+          "id": "B4", "name": "منع تكرار الملف", "max": 4,
+          "kpi": "duplicated_files", "unit": "count", "direction": "lower_better",
+          "anchors": { "full": 0, "half": 1, "zero": 2 }
+        }
+      ]
+    },
+    {
+      "id": "C",
+      "name": "المساءلة والتحقّق الداخلي",
+      "max": 16,
+      "items": [
+        {
+          "id": "C1", "name": "طلب الدليل والمصدر", "max": 5,
+          "kpi": "evidence_request_per_hour", "unit": "per_hour", "direction": "higher_better",
+          "anchors": { "full": 4, "half": 1, "zero": 0 }
+        },
+        {
+          "id": "C2", "name": "اختبار الفرضية المضادة", "max": 5,
+          "kpi": "counter_hypothesis_per_hour", "unit": "per_hour", "direction": "higher_better",
+          "anchors": { "full": 3, "half": 1, "zero": 0 }
+        },
+        {
+          "id": "C3", "name": "تصحيح الخطأ الواقعي", "max": 3,
+          "kpi": "factual_error_corrected", "unit": "boolean", "direction": "boolean",
+          "anchors": { "full": "فوري", "half": "متأخر", "zero": "بلا تصحيح" }
+        },
+        {
+          "id": "C4", "name": "دقّة الإحالة على الهواء", "max": 3,
+          "kpi": "name_or_number_errors", "unit": "count", "direction": "lower_better",
+          "anchors": { "full": 0, "half": 1, "zero": 2 }
+        }
+      ]
+    },
+    {
+      "id": "D",
+      "name": "إدارة الضيف والمصادر",
+      "max": 14,
+      "items": [
+        {
+          "id": "D1", "name": "الإصغاء والبناء على الجواب", "max": 4,
+          "kpi": "reasked_answered_questions", "unit": "count", "direction": "lower_better",
+          "anchors": { "full": 0, "half": 1, "zero": 2 }
+        },
+        {
+          "id": "D2", "name": "عدالة المساحة بين المصادر", "max": 4,
+          "kpi": "source_starvation_last_10min", "unit": "boolean", "direction": "boolean",
+          "anchors": { "full": "لا تهميش", "half": "تهميش جزئي", "zero": "مصدر غائب" }
+        },
+        {
+          "id": "D3", "name": "جودة الاحتواء", "max": 4,
+          "kpi": "touch_per_90s", "unit": "ratio", "direction": "higher_better",
+          "anchors": { "full": 1.0, "half": 0.5, "zero": 0.0 }
+        },
+        {
+          "id": "D4", "name": "التسليم والتنبيه الزمني", "max": 2,
+          "kpi": "time_warning_before_long_block", "unit": "boolean", "direction": "boolean",
+          "anchors": { "full": "تنبيه مسبق", "half": "تنبيه متأخر", "zero": "لا تنبيه" }
+        }
+      ]
+    },
+    {
+      "id": "E",
+      "name": "القيمة المضافة التحريرية",
+      "max": 16,
+      "items": [
+        {
+          "id": "E1", "name": "معلومة جديدة", "max": 5,
+          "kpi": "new_facts_per_10min", "unit": "count", "direction": "higher_better",
+          "anchors": { "full": 2, "half": 1, "zero": 0 }
+        },
+        {
+          "id": "E2", "name": "ربط الميداني بالاستراتيجي", "max": 4,
+          "kpi": "field_events_read_strategically_pct", "unit": "percent", "direction": "higher_better",
+          "anchors": { "full": 90, "half": 60, "zero": 30 }
+        },
+        {
+          "id": "E3", "name": "استثمار العواجل", "max": 4,
+          "kpi": "local_chyron_coverage_pct", "unit": "percent", "direction": "higher_better",
+          "anchors": { "full": 100, "half": 60, "zero": 0 }
+        },
+        {
+          "id": "E4", "name": "تفكيك السردية بالحجّة", "max": 3,
+          "kpi": "argument_vs_metaphor_ratio", "unit": "ratio", "direction": "higher_better",
+          "anchors": { "full": 0.9, "half": 0.5, "zero": 0.2 }
+        }
+      ]
+    },
+    {
+      "id": "F",
+      "name": "الحضور والإلقاء واللغة",
+      "max": 8,
+      "items": [
+        { "id": "F1", "name": "وضوح الإلقاء وسلامة النطق", "max": 3, "kpi": "delivery_errors_per_hour", "unit": "count", "direction": "lower_better", "anchors": { "full": 0, "half": 3, "zero": 6 } },
+        { "id": "F2", "name": "لغة الجسد والتواصل البصري", "max": 3, "kpi": "shot_confidence", "unit": "enum", "direction": "max_confidence", "note": "بمعدّل إطار/ثانية لا تتجاوز الثقة medium" },
+        { "id": "F3", "name": "الحضور الذهني والارتجال", "max": 2, "kpi": "breaking_news_handled", "unit": "boolean", "direction": "boolean", "anchors": { "full": "استُثمر", "half": "أُهمل", "zero": "أخطأ" } }
+      ]
+    },
+    {
+      "id": "G",
+      "name": "البنية والافتتاح والخاتمة",
+      "max": 6,
+      "items": [
+        { "id": "G1", "name": "الافتتاح", "max": 2, "kpi": "welcome_duration_s", "unit": "seconds", "direction": "lower_better", "anchors": { "full": 20, "half": 40, "zero": 60 } },
+        { "id": "G2", "name": "الخاتمة", "max": 2, "kpi": "takeaways_count", "unit": "count", "direction": "higher_better", "anchors": { "full": 3, "half": 1, "zero": 0 } },
+        { "id": "G3", "name": "سلامة الإغلاق", "max": 2, "kpi": "closing_errors", "unit": "count", "direction": "lower_better", "anchors": { "full": 0, "half": 1, "zero": 2 } }
+      ]
+    }
+  ],
+  "critical_error_caps": [
+    { "event": "name_error", "cap": 79 },
+    { "event": "local_chyron_unread", "cap": 85 },
+    { "event": "monologue_over_180s", "cap": 82 },
+    { "event": "duplicate_file", "cap": 80 },
+    { "event": "factual_error_uncorrected", "cap": 75 },
+    { "event": "multiple_critical", "threshold": 2, "cap": 70 }
+  ],
+  "protected_against_penalty": [
+    "adoption_of_channel_editorial_line",
+    "absence_of_political_balance_toward_adversary",
+    "lebanese_spoken_dialect",
+    "granting_allied_guest_space_without_output_test"
+  ],
+  "output_test": {
+    "name": "اختبار المردود",
+    "applies_to": "أي بلوك يتجاوز 180 ثانية",
+    "questions": [
+      "هل أنتج معلومة قابلة للتحقق لم تكن على الشاشة؟",
+      "أو هل أنتج استنتاجاً قرارياً لا يستطيع المشاهد استنتاجه بنفسه؟"
+    ],
+    "if_both_no": "استرسال بلا مردود — يُخصم في A3"
+  }
+}

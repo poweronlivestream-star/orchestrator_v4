@@ -1,0 +1,809 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://manar.local/schemas/blackbox-chunk-v2.json",
+  "title": "Blackbox Chunk v2",
+  "type": "object",
+  "required": [
+    "chunk_index",
+    "window",
+    "prompt_version",
+    "metadata",
+    "participants",
+    "turns",
+    "interventions",
+    "chyron_timeline",
+    "claims",
+    "shots",
+    "files",
+    "critical_events",
+    "measurement",
+    "data_gaps",
+    "self_check"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "chunk_index": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "window": {
+      "type": "object",
+      "required": [
+        "start",
+        "end"
+      ],
+      "properties": {
+        "start": {
+          "type": "string",
+          "pattern": "^[0-9]{2}:[0-9]{2}:[0-9]{2}$"
+        },
+        "end": {
+          "type": "string",
+          "pattern": "^[0-9]{2}:[0-9]{2}:[0-9]{2}$"
+        }
+      }
+    },
+    "prompt_version": {
+      "type": "string",
+      "const": "blackbox-v2.0"
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "derived",
+        "confidence"
+      ],
+      "properties": {
+        "program_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "episode_title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "presenter_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_screen_clock": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "value",
+              "seen_at"
+            ],
+            "properties": {
+              "value": {
+                "type": "string"
+              },
+              "seen_at": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "derived": {
+          "type": "object",
+          "properties": {
+            "source_filename": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "epoch": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "air_datetime_utc": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "air_datetime_local": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timezone": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        }
+      }
+    },
+    "metadata_conflicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "field",
+          "values",
+          "preferred",
+          "reason"
+        ],
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "preferred": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "participants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "role"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "ANCHOR",
+              "GUEST_1",
+              "GUEST_2",
+              "REPORTER_1",
+              "REPORTER_2",
+              "OTHER"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "appearance": {
+            "type": "string",
+            "enum": [
+              "studio",
+              "remote",
+              "field",
+              "vt"
+            ]
+          },
+          "resolved_from": {
+            "type": "string",
+            "enum": [
+              "entities",
+              "running_context",
+              "audio",
+              "on_screen"
+            ]
+          }
+        }
+      }
+    },
+    "turns": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "speaker_id",
+          "start",
+          "end",
+          "duration_s",
+          "word_count",
+          "text",
+          "kind",
+          "question_count",
+          "mid_sentence",
+          "overlap_s",
+          "verbatim_confidence"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "speaker_id": {
+            "type": "string"
+          },
+          "start": {
+            "type": "string",
+            "pattern": "^[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$"
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$"
+          },
+          "duration_s": {
+            "type": "number",
+            "minimum": 0
+          },
+          "word_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "question",
+              "followup",
+              "interrupt",
+              "transition",
+              "summary",
+              "chyron_read",
+              "closing",
+              "answer",
+              "monologue",
+              "report"
+            ]
+          },
+          "question_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "interrupted_speaker": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mid_sentence": {
+            "type": "boolean"
+          },
+          "overlap_s": {
+            "type": "number",
+            "minimum": 0
+          },
+          "verbatim_confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "possible_asr_error": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "interventions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "turn_id",
+          "at",
+          "type",
+          "cue_source",
+          "duration_s"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "turn_id": {
+            "type": "integer"
+          },
+          "at": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "polite_hold",
+              "summarize_handback",
+              "pin_claim",
+              "redirect",
+              "time_warning",
+              "cut_for_breaking",
+              "question",
+              "closing"
+            ]
+          },
+          "cue_source": {
+            "type": "string",
+            "enum": [
+              "guest_words",
+              "chyron",
+              "own_phrase",
+              "none"
+            ]
+          },
+          "interrupted_speaker": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mid_sentence": {
+            "type": "boolean"
+          },
+          "duration_s": {
+            "type": "number"
+          },
+          "result": {
+            "type": "string",
+            "enum": [
+              "new_file_opened",
+              "claim_pinned",
+              "returned_to_guest",
+              "pace_corrected",
+              "none"
+            ]
+          }
+        }
+      }
+    },
+    "chyron_timeline": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "on",
+          "off",
+          "type",
+          "text_raw",
+          "read_on_air_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "on": {
+            "type": "string"
+          },
+          "off": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "breaking",
+              "local_security",
+              "regional",
+              "lower_third",
+              "ticker",
+              "program_bug"
+            ]
+          },
+          "text_raw": {
+            "type": "string"
+          },
+          "ocr_confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "read_on_air_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "read_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_latency_s": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "speaker_id",
+          "turn_id",
+          "at",
+          "text",
+          "type",
+          "checkable"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "speaker_id": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "integer"
+          },
+          "at": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "attribution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "numeric",
+              "causal",
+              "predictive",
+              "historical",
+              "attribution",
+              "denial"
+            ]
+          },
+          "checkable": {
+            "type": "boolean"
+          },
+          "evidence_offered": {
+            "type": "boolean"
+          },
+          "evidence_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "number",
+              "document",
+              "official_statement",
+              "witness",
+              "none",
+              null
+            ]
+          },
+          "anchor_challenged_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "challenge_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "ask_source",
+              "counter_hypothesis",
+              "fact_check",
+              "none",
+              null
+            ]
+          }
+        }
+      }
+    },
+    "shots": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "framing",
+          "subject"
+        ],
+        "properties": {
+          "start": {
+            "type": "string"
+          },
+          "end": {
+            "type": "string"
+          },
+          "framing": {
+            "type": "string",
+            "enum": [
+              "WS",
+              "MS",
+              "MCU",
+              "CU",
+              "2S",
+              "GRAPHIC",
+              "SPLIT",
+              "VT"
+            ]
+          },
+          "subject": {
+            "type": "string"
+          },
+          "gaze": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "camera",
+              "guest",
+              "screen",
+              "notes",
+              "off",
+              null
+            ]
+          },
+          "gesture": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "none",
+              "point",
+              "pen",
+              "open_hand",
+              "chin",
+              "nod",
+              "shrug",
+              null
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium"
+            ]
+          }
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "start",
+          "end",
+          "sources"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "start": {
+            "type": "string"
+          },
+          "end": {
+            "type": "string"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "questions_count": {
+            "type": "integer"
+          },
+          "duplicated_of": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "critical_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "type",
+          "at"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "monologue_over_180s",
+              "guest_uninterrupted_over_300s",
+              "local_chyron_unread",
+              "duplicate_file",
+              "name_error",
+              "factual_error_uncorrected",
+              "topic_abandoned"
+            ]
+          },
+          "at": {
+            "type": "string"
+          },
+          "duration_s": {
+            "type": "number"
+          },
+          "speaker_id": {
+            "type": "string"
+          },
+          "latency_s": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "of": {
+            "type": "string"
+          },
+          "said": {
+            "type": "string"
+          },
+          "expected": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          }
+        }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "required": [
+        "method",
+        "chunk_duration_s",
+        "sum_of_turns_s",
+        "forced_to_match_chunk"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": [
+            "asr_vad",
+            "diarization",
+            "model_apportioned"
+          ]
+        },
+        "speech_segments_measured": {
+          "type": "boolean"
+        },
+        "chunk_duration_s": {
+          "type": "number"
+        },
+        "sum_of_turns_s": {
+          "type": "number"
+        },
+        "unaccounted_s": {
+          "type": "number"
+        },
+        "unaccounted_reason": {
+          "type": "string"
+        },
+        "forced_to_match_chunk": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "data_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "field",
+          "reason",
+          "severity"
+        ],
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          }
+        }
+      }
+    },
+    "self_check": {
+      "type": "object",
+      "required": [
+        "all_timestamps_absolute",
+        "all_timestamps_within_chunk",
+        "every_turn_has_word_count",
+        "every_claim_has_turn_id",
+        "no_forced_time_normalization",
+        "all_chyrons_logged_even_if_unread",
+        "names_resolved_against_entities",
+        "data_gaps_declared"
+      ],
+      "properties": {
+        "all_timestamps_absolute": {
+          "type": "boolean"
+        },
+        "all_timestamps_within_chunk": {
+          "type": "boolean"
+        },
+        "every_turn_has_word_count": {
+          "type": "boolean"
+        },
+        "every_claim_has_turn_id": {
+          "type": "boolean"
+        },
+        "no_forced_time_normalization": {
+          "type": "boolean",
+          "const": true
+        },
+        "all_chyrons_logged_even_if_unread": {
+          "type": "boolean"
+        },
+        "names_resolved_against_entities": {
+          "type": "boolean"
+        },
+        "data_gaps_declared": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

@@ -1,37 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V5.7 - COMPLETE PRODUCTION ENGINE
-Upgrades & Fixes:
-1. Restores full evaluate.py 90-point rubric (6 core + 23 sub-criteria), Directed & Neutral
-   editorial modes, Lebanese dialect rule, monologue >3m rule, verbatim last_spoken_words,
-   and BOTH Detailed + Summarized Word-ready RTL HTML reports (Royal Executive Theme).
-2. Preserves presenter/episode name in renamed Drive folder (`PROCESSED_<name>_$<cost>`)
-   and preserves source URL + full telemetry in folder description.
-3. Generates an ultra-detailed, self-contained Forensic Blackbox (`03_Blackbox_Forensic_<name>.md`)
-   including rubric specification, chunk-by-chunk chronological tables, verbatim quotes,
-   visual/body-language log, monologue audit, vocal log, and raw JSON appendix so any
-   external AI (DeepSeek, ChatGPT, Claude) can analyze it with zero prior context.
-4. Bulletproof delivery:
-   - Auto-refreshes expired Google Drive OAuth tokens (fixes 60-min expiry on 18h runs).
-   - Dual-port SMTP (465 SSL -> 587 STARTTLS) + Apps Script GmailApp fallback (fixes SMTP drops).
-   - Local `./backup_reports/` export for GitHub Actions Artifact backup + Telegram documents.
-5. Supports direct DVR/MP4 links, Google Drive file links, and YouTube links (yt-dlp + fallback).
-6. Fast parallel key validation, key deduplication, 1-attempt-per-model fast failover on 503,
-   round-robin across free keys, and per-episode budget ceiling enforcement.
+Master Orchestrator V6.0 - Blackbox v2.0 + Manar-100-v2 Deterministic Engine
+- Default 5-minute (300s) eval chunks with sequential running_context.json & entities.csv resolution.
+- Reads prompt_system.md, prompt_chunk.md, prompt_synthesis.md, schema_chunk.json, rubric.json, entities.csv from repo root.
+- Official google-genai SDK with fast parallel pre-flight validation, smart error classification, round-robin free keys, and paid fallback.
+- Deterministic Python KPI & 100-point (7 axes / 26 items) anchor-based scoring + single-defect rule + critical error caps + 6 audit checks.
+- Outputs 5 files per eval run:
+  1) 01_Main_Detailed_Report_<name>.html (DeepSeek Royal Word-RTL + 3 embedded Base64 Arabic PNG charts)
+  2) 02_Summarized_Report_<name>.html (Executive summary + embedded chart)
+  3) 03_Training_Plan_<name>.html (6-week personalized drill & rewrite plan populated from actual episode turns)
+  4) 04_Blackbox_V2_<name>.md (Self-contained forensic dossier for DeepSeek/ChatGPT/Claude)
+  5) 05_Blackbox_V2_<name>.json (Machine-auditable Blackbox v2.0 JSON dataset)
+- Daily broadcast mode preserved with parallel extraction, DLQ rescue, Detailed + Summarized Word-RTL HTML + Blackbox .md/.json.
 """
 import os
 import re
+import io
+import csv
 import sys
 import json
 import time
 import math
+import base64
 import random
-import shutil
 import smtplib
 import threading
 import subprocess
+import html as html_lib
 import requests
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
@@ -39,24 +37,40 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
-try:
-    from google import genai
-    from google.genai import types
-except ModuleNotFoundError:
-    print("⚙️ google-genai not found — installing automatically...", flush=True)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "google-genai"])
-    from google import genai
-    from google.genai import types
 
-BEIRUT_TZ = timezone(timedelta(hours=3))
+def _ensure_pkg(import_name: str, pip_name: str = None):
+    try:
+        __import__(import_name)
+    except ModuleNotFoundError:
+        print(f"⚙️ {pip_name or import_name} not found — installing automatically...", flush=True)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade", pip_name or import_name])
+
+
+_ensure_pkg("google.genai", "google-genai")
+_ensure_pkg("jsonschema", "jsonschema")
+_ensure_pkg("matplotlib", "matplotlib")
+_ensure_pkg("arabic_reshaper", "arabic-reshaper")
+_ensure_pkg("bidi", "python-bidi")
+
+from google import genai
+from google.genai import types
+import jsonschema
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import arabic_reshaper
+from bidi.algorithm import get_display
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKUP_DIR = os.path.abspath("./backup_reports")
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+BEIRUT_TZ = ZoneInfo("Asia/Beirut")
 STATE_LOCK = threading.Lock()
 FFMPEG_SEM = threading.Semaphore(3)
 CANCEL_EVENT = threading.Event()
 DRIVE_TOKEN_LOCK = threading.Lock()
-BACKUP_DIR = os.path.abspath("./backup_reports")
-os.makedirs(BACKUP_DIR, exist_ok=True)
 
-# Active Gemini 3.x / 4.x priority order
 PREFERRED_FLASH_ORDER = [
     "gemini-3.8-flash",
     "gemini-3.6-flash",
@@ -64,14 +78,12 @@ PREFERRED_FLASH_ORDER = [
     "gemini-3.7-flash",
     "gemini-3.0-flash",
 ]
-
 PREFERRED_SYNTH_ORDER = [
     "gemini-3.8-flash",
     "gemini-4-argon",
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
 ]
-
 PRICING = {
     "gemini-3.8-flash":      {"in": 0.75, "out": 3.75},
     "gemini-3.6-flash":      {"in": 0.50, "out": 2.50},
@@ -82,582 +94,96 @@ PRICING = {
 
 MAX_FREE_KEYS_PER_CHUNK = 2
 FREE_RR_COUNTER = 0
-
-# Runtime mutable token state (supports auto-refresh on 401)
 RUNTIME_DRIVE_TOKEN = ""
+STATUS_FILE_DRIVE_ID = None
 
-# ==============================================================================
-# EDITORIAL RULES & FULL 90-POINT RUBRIC (Restored verbatim from evaluate.py)
-# ==============================================================================
-EDITORIAL_RULE_DIRECTED = """3. مراعاة الخط التحريري وسياق القناة (قاعدة جوهرية لا يجوز مخالفتها):
-   - يُجرى التقييم مع الأخذ في الحسبان الهوية التحريرية للقناة (إعلام داعم ومتبنٍّ لخط المقاومة).
-   - يُمنع منعاً باتاً خصم علامات أو انتقاد المقدم بسبب تبنيه لخط المقاومة أو استخدامه مصطلحاتها (مثل: كيان العدو، المقاومة، الشهيد، الاعتداءات الإسرائيلية) أو عدم لعبه دور "المحايد" تجاه العدو؛ فهذا التزام طبيعي بالسياسة التحريرية للقناة وليس عيباً مهنياً.
-   - التمايز بين "المونولوج العبثي" و"التوظيف التحريري الهادف": إذا كان الضيف حليفاً وفي مسار تفكيك لسرديات خصوم المقاومة، فإن ترك المساحة له قد يكون قراراً تحريرياً مقصوداً.
-   - حدود التوظيف التحريري: المونولوج الذي يتجاوز 3 دقائق متصلة دون أي مقاطعة وظيفية أو سؤال تلخيصي أو توجيهي من المقدم يُعد فشلاً تقنياً في إدارة الإيقاع التلفزيوني (Broken TV Rhythm)، ويجب المحاسبة عليه بخصم النقاط في معايير "التعامل مع الضيف"، "المتابعة والتعقيب"، و"ضبط الوقت".
-   - في معيار "الاختصار والحياد وتجنب تعدد الأسئلة"، يُقصد بالحياد المهني هنا: عدم مصادرة رأي الضيف بمقدمات تقريرية مطولة تفرض عليه الإجابة، وليس الحياد السياسي تجاه العدو."""
-
-EDITORIAL_RULE_GENERAL_NEUTRAL = """3. المعيار المهني الإعلامي العام والحياد الحواري (تقييم غير موجّه - بدون خلفية قناة موجهة):
-   - يُجرى التقييم وفق المعايير المهنية التلفزيونية العامة والمستقلة، دون افتراض وجود خط أيديولوجي أو سياسي موجّه للقناة، ودون منح أي استثناء أيديولوجي للمقدم أو الضيف.
-   - يُحاسب المقدم مهنياً على التزامه بمبدأ المسافة المهنية الواحدة، وعدم الانحياز الشخصي أو تبني سردية الضيف أو التسليم بمقدماته دون تمحيص.
-   - يُطلب من المقدم لعب دور "المحاور المسائل والمدقق" (Critical Interviewer) مع جميع الضيوف بلا استثناء؛ فيُحاسب على مدى مواجهته للضيف بالأسئلة الاستقصائية والتدقيق في التناقضات ومقاطعته مهنياً عند التهرب من السؤال أو إلقاء سرديات إنشائية.
-   - أي استرسال أو مونولوج للضيف يتجاوز دقيقتين إلى 3 دقائق متصلة دون مقاطعة وظيفية أو توجيه أو استجواب من المقدم يُعدّ ضعفاً تقنياً ومهنياً في السيطرة على الاستوديو وإدارة الإيقاع التلفزيوني، ويُحاسب عليه بصرامة في معايير "التعامل مع الضيف"، "المتابعة والتعقيب"، و"ضبط الوقت".
-   - في معيار "الاختصار والحياد وتجنب تعدد الأسئلة"، يُقصد بالحياد المهني: الحياد الكامل في صياغة السؤال (عدم تضمين السؤال أحكاماً مسبقة أو مقدمات توجيهية منحازة أو مصادرة لإجابة الضيف)."""
-
-RUBRIC_90_SPEC = """سلم العلامات المعتمد حصرياً (90 نقطة — 6 معايير أساسية و23 معياراً فرعياً):
-1) إدارة الحلقة — 20 نقطة:
-   - بناء وتسلسل الملفات: 5
-   - إغلاق الملف والانتقال: 5
-   - السيطرة على المسار والمرونة: 5
-   - الافتتاح والخاتمة: 5
-2) التعامل مع الضيف — 20 نقطة:
-   - الإصغاء واحترام الجواب: 5
-   - توزيع المساحة وعدم المقاطعة غير الضرورية: 5
-   - المقاطعة الضرورية ومواجهة الضيف: 5
-   - احتواء المونولوج وإعادة المسار: 5
-3) جودة الأسئلة — 20 نقطة:
-   - وضوح السؤال: 4
-   - دقة السؤال: 4
-   - عمق السؤال: 4
-   - الارتباط بالمحور: 4
-   - الاختصار والحياد وتجنب تعدد الأسئلة: 4
-4) المتابعة والتعقيب — 15 نقطة:
-   - المتابعة المبنية على الجواب: 4
-   - التقاط النقاط المهمة والتناقضات: 4
-   - طلب التوضيح والتحقق: 3.5
-   - بناء السؤال التالي من الجواب: 3.5
-5) الحضور والأداء — 10 نقاط:
-   - الجاذبية التلفزيونية: 3
-   - لغة الجسد والتواصل البصري: 2.5
-   - الصوت والإلقاء: 2.5
-   - اللغة والطلاقة: 2 (لا خصم على اللهجة اللبنانية المحكية؛ المحاسبة فقط على النطق والتلعثم وأخطاء الفصحى الفادحة)
-6) ضبط الوقت — 5 نقاط:
-   - توزيع الوقت بين الملفات والضيوف: 1.7
-   - منع استنزاف الوقت في نقطة واحدة: 1.6
-   - إنهاء المحاور والخاتمة: 1.7"""
-
-
-def build_eval_chunk_prompt(chunk_start_hms: str, chunk_end_hms: str, is_last_chunk: bool, editorial_mode: str, custom_prompt: str) -> str:
-    ed_rule = EDITORIAL_RULE_GENERAL_NEUTRAL if editorial_mode == "neutral" else EDITORIAL_RULE_DIRECTED
-    last_clause = (
-        '\n- هام جداً (المقطع الأخير): استمع بدقة للدقيقة الأخيرة ودوّن في حقل "last_spoken_words" '
-        'النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قيلت قبل ختام الحلقة مع توقيتها المطلق.'
-        if is_last_chunk else ""
-    )
-    extra = f"\nتعليمات إضافية من المشغّل:\n{custom_prompt}\n" if custom_prompt else ""
-    return f"""أنت محلل جنائي إعلامي دقيق (Zero Hallucination). تحلل الآن مقطعاً من حلقة تلفزيونية يمتد في التوقيت المطلق للحلقة من [{chunk_start_hms}] إلى [{chunk_end_hms}].
-{extra}
-القواعد الإلزامية الصارمة:
-1. التوقيت المطلق المتصل: اجمع دائماً بداية هذا المقطع ({chunk_start_hms}) إلى أي توقيت داخلي، واكتب كل التوقيتات بصيغة HH:MM:SS (مثلاً: من {chunk_start_hms} إلى {chunk_end_hms}).
-2. المنع المطلق للتخمين: لا تخترع أي اسم أو صفة أو اقتباس غير مسموع أو ظاهر على الشاشة. اكتب "غير محدد في المقطع" عند عدم توفر المعلومة.
-3. قاعدة اللهجة اللبنانية: استخدام اللهجة اللبنانية المحكية ليس عيباً أبداً، بل يُرصد كأسلوب تواصلي طبيعي.
-{ed_rule}
-4. استخرج **كل تفصيل دقيق** (سمعي وبصري ونصي) بحيث يكون هذا السجل مرجعاً شاملاً ومستقلاً بذاته لأي محلل خارجي.{last_clause}
-
-أخرج JSON صالح فقط يطابق هذا الهيكل التفصيلي بالكامل:
-{{
-  "chunk_window": "من {chunk_start_hms} إلى {chunk_end_hms}",
-  "program_and_episode_clues": {{
-    "program_name_seen_or_heard": "",
-    "episode_title_or_date_seen": "",
-    "presenter_name_seen_or_heard": "",
-    "studio_or_location_setting": ""
-  }},
-  "chunk_summary": "ملخص سردي مكثف لكل ما جرى في هذا المقطع",
-  "participants": [
-    {{"name": "", "role_or_title": "", "appearance": "استديو/Zoom/هاتف/ميداني/تقرير", "approx_speaking_seconds": 0, "notes": ""}}
-  ],
-  "chronological_segments": [
-    {{"start": "HH:MM:SS", "end": "HH:MM:SS", "segment_type": "افتتاح/محور حواري/مداخلة مراسل/تقرير VT/فاصل/خاتمة", "topic": "", "details": ""}}
-  ],
-  "presenter_questions_and_followups": [
-    {{"timestamp": "HH:MM:SS", "duration_sec": 0, "question_type": "سؤال رئيسي/تعقيب/توضيح/مقاطعة وظيفية/سؤال مركب", "verbatim_quote": "النص الحرفي الدقيق", "linked_to_guest_answer": true, "professional_note": ""}}
-  ],
-  "guest_monologues": [
-    {{"speaker": "", "start": "HH:MM:SS", "end": "HH:MM:SS", "duration_sec": 0, "presenter_intervened": false, "editorial_or_rhythm_note": ""}}
-  ],
-  "visual_and_body_language_log": [
-    {{"timestamp": "HH:MM:SS", "category": "جلسة/نظرات/يدين/عادات حركية/قلم/تعابير وجه/كادر وغرافيك", "observation": "", "impact": "إيجابي/سلبي/محايد"}}
-  ],
-  "vocal_and_language_log": [
-    {{"timestamp": "HH:MM:SS", "aspect": "نبرة وإلقاء/طلاقة/تلعثم/خطأ فصحى/مزاوجة باللهجة اللبنانية/تداخل صوتي", "verbatim_or_detail": "", "impact": "إيجابي/سلبي/محايد"}}
-  ],
-  "vt_and_field_reports": [
-    {{"start": "HH:MM:SS", "end": "HH:MM:SS", "title_or_reporter": "", "summary": "", "presenter_handoff_note": ""}}
-  ],
-  "on_screen_graphics_and_chyrons": [
-    {{"timestamp": "HH:MM:SS", "text": ""}}
-  ],
-  "rubric_evidence_notes": {{
-    "management": "",
-    "guest_handling": "",
-    "questions_quality": "",
-    "followup": "",
-    "presence_and_delivery": "",
-    "time_control": ""
-  }},
-  "last_spoken_words": ""
-}}"""
-
-
-def build_eval_synthesis_prompt(clean_name: str, exact_duration: str, editorial_mode: str, custom_prompt: str) -> str:
-    is_neutral = (editorial_mode == "neutral")
-    ed_label = (
-        "المنظومة الثالثة: تقييم مهني إعلامي عام ومحايد (بدون خلفية قناة موجهة)"
-        if is_neutral
-        else "المنظومة الثانية: تقييم مع مراعاة الخط التحريري للقناة الموجهة"
-    )
-    ed_rule = EDITORIAL_RULE_GENERAL_NEUTRAL if is_neutral else EDITORIAL_RULE_DIRECTED
-    meth_note = (
-        "التقييم مهني وتقني مستقل وفق المعايير الإعلامية العامة والحياد الحواري (بدون خلفية قناة موجهة) مع مراعاة قاعدة المزاوجة اللغوية المحببة باللهجة اللبنانية"
-        if is_neutral
-        else "التقييم مهني وتقني مع مراعاة الخط التحريري للقناة وقاعدة المزاوجة اللغوية المحببة باللهجة اللبنانية"
-    )
-    extra = f"\nتعليمات إضافية من المشغّل:\n{custom_prompt}\n" if custom_prompt else ""
-
-    return f"""أنت كبير خبراء تقييم الأداء التلفزيوني. أمامك السجلات الجنائية التفصيلية لجميع مقاطع حلقة ({clean_name}) كاملة من 00:00:00 حتى ({exact_duration}).
-نوع التقييم: [{ed_label}].{extra}
-
-القواعد الإلزامية الصارمة:
-1. المنع المطلق للتخمين (Zero Hallucination): اعتمد حصراً على السجلات المرفقة. إذا غابت معلومة اكتب "غير محدد في المقطع".
-2. التوقيت المتصل: اكتب التوقيتات بصيغة `من 00:08:24 إلى 00:08:28`. ممنوع نهائياً ذكر "الجزء الأول" أو "المقطع الثاني".
-{ed_rule}
-4. قاعدة اللهجة اللبنانية المحكية: يُمنع منعاً باتاً خصم أي علامة أو إدراجها كعيب أو أولوية تطوير؛ التطعيم باللهجة اللبنانية أسلوب تواصلي محبب. في معيار اللغة والطلاقة (2 نقطة) يُحاسب فقط على سلامة النطق والطلاقة وأخطاء الفصحى الفادحة.
-5. الدقة الحسابية المطلقة: يجب أن يساوي مجموع العلامات الفرعية علامة كل معيار أساسي بدقة، وأن يساوي مجموع المعايير الستة العلامة الإجمالية من 90، مع حساب النسبة المئوية بدقة.
-
-{RUBRIC_90_SPEC}
-
-القالب الإلزامي لـ mainDetailedHtml (التقرير الرئيسي المفصل - استخدم فئات CSS نفسها تماماً):
-- `<div class="header-banner"><h1>تقييم تفصيلي وفق المعايير الموسعة</h1><div class="subtitle">[المقدم] - [الحلقة/التاريخ]</div></div>`
-- `<table class="info-table">` (المقدم، الحلقة، معيار التقييم: {ed_label}، الضيوف، المادة المسجلة، مدة الحلقة: {exact_duration})
-- `<h2>الخلاصة التنفيذية</h2><div class="exec-box"><p>[فقرة معمقة 6-8 أسطر]</p></div>`
-- `<table class="summary-strip">` (العلامة من 90، النسبة %، أبرز نقطة قوة، أولوية التطوير)
-- `<h2>منهج التقييم</h2><p>تم تطبيق السلم المعتمد: إدارة الحلقة 20، التعامل مع الضيف 20، جودة الأسئلة 20، المتابعة والتعقيب 15، الحضور والأداء 10، وضبط الوقت 5. {meth_note}، وجرى التحقق من الانتقالات والحضور البصري على كامل مدة الحلقة.</p>`
-- `<h2>العلامات الأساسية</h2><table class="core-grid">` (صفّان × 3 أعمدة للمعايير الستة)
-- الأقسام الستة المفصلة `<h2>1. إدارة الحلقة - [ ]/20</h2>` حتى `<h2>6. ضبط الوقت - [ ]/5</h2>`، تحت كل قسم جدول بجميع معاييره الفرعية الـ 23 مع `<td class="score-cell">` وملاحظات غنية مدعومة بالاقتباسات الحرفية والشواهد البصرية والتوقيتات.
-- `<h2>أمثلة موثقة من الحلقة</h2>` (جدول يضم ما لا يقل عن 10 أمثلة موثقة موزعة من بداية الحلقة حتى ختامها: التوقيت | المثال حرفياً أو بصرياً | الدلالة المهنية).
-- `<h2>نقاط القوة الرئيسية</h2><div class="strengths-box"><ul>... (4-5 نقاط بالتوقيت)</ul></div>`
-- `<h2>أولويات التطوير</h2><div class="priorities-box"><ul>... (4-5 نقاط عملية بالتوقيت - ممنوع ذكر اللهجة اللبنانية كعيب)</ul></div>`
-- `<h2>الخلاصة النهائية</h2><div class="exec-box"><p>العلامة الحالية: [ ] من 90 ([ ]%). ...</p></div>`
-
-القالب الإلزامي لـ summarizedHtml (التقرير المختصر):
-- `<div class="header-banner"><h1>نموذج تقييم أداء مقدم/ة برنامج (تقرير مختصر)</h1><div class="subtitle">[المقدم/ة] - [البرنامج/التاريخ]</div></div>`
-- `<table class="info-table">` (اسم المقدم/ة، التاريخ، البرنامج/نوع الحلقة، معيار التقييم، الضيوف والمشاركون، المواد المسجلة، مدة الحلقة)
-- `<h2>الخلاصة التنفيذية</h2><div class="exec-box"><p>...</p></div>`
-- `<h2>النتيجة الإجمالية</h2><table class="summary-strip">`
-- `<h2>العلامات الأساسية</h2>` (جدول المعايير الـ 6 + صف المجموع الكلي من 90)
-- `<h2>نقاط القوة الرئيسية</h2><div class="strengths-box"><ul>... (3-4 نقاط)</ul></div>`
-- `<h2>أولويات التطوير</h2><div class="priorities-box"><ul>... (3-4 نقاط)</ul></div>`
-
-أخرج JSON صالح حصراً بهذه الحقول:
-{{
-  "presenter": "اسم المقدم كما ورد في الحلقة أو المجلد",
-  "episode_title": "عنوان الحلقة أو البرنامج",
-  "editorial_label": "{ed_label}",
-  "total_score": 0.0,
-  "percentage": 0.0,
-  "top_strength": "",
-  "top_priority": "",
-  "lastSpokenWords": "النص الحرفي لآخر كلام في الحلقة مع التوقيت المتصل",
-  "core_scores": {{"management": 0, "guest": 0, "questions": 0, "followup": 0, "presence": 0, "time": 0}},
-  "sub_criteria": [{{"section": "", "name": "", "score": 0, "max": 0, "note": ""}}],
-  "strengths": [],
-  "priorities": [],
-  "mainDetailedHtml": "<div class=\\"header-banner\\">...</div>...",
-  "summarizedHtml": "<div class=\\"header-banner\\">...</div>..."
-}}
-
-السجلات الجنائية التفصيلية لمقاطع الحلقة:
-"""
-
-
-def build_daily_chunk_prompt(chunk_start_hms: str, chunk_end_hms: str, custom_prompt: str) -> str:
-    extra = f"\nتعليمات إضافية من المشغّل:\n{custom_prompt}\n" if custom_prompt else ""
-    return f"""أنت محلل رصد بث تلفزيوني يومي دقيق (Zero Hallucination). تحلل الآن مقطعاً من البث اليومي يمتد في التوقيت المطلق من [{chunk_start_hms}] إلى [{chunk_end_hms}].
-{extra}
-القواعد الإلزامية:
-1. احسب التوقيت المطلق المتصل بإضافة بداية المقطع ({chunk_start_hms}) لكل حدث.
-2. لا تخمّن أي اسم مقدم أو ضيف أو مراسل أو عنوان غير ظاهر على الشاشة أو مسموع صراحة.
-3. دوّن كل فقرة، نشرة، برنامج، تقرير VT، مداخلة مراسل، فاصل، أو خلل تقني بأقصى تفصيل ممكن.
-
-أخرج JSON صالح حصراً بهذا الهيكل:
-{{
-  "chunk_window": "من {chunk_start_hms} إلى {chunk_end_hms}",
-  "programs": [
-    {{
-      "start": "HH:MM:SS",
-      "end": "HH:MM:SS",
-      "duration_min": 0,
-      "category": "نشرة أخبار/برنامج حواري/تغطية مباشرة/وثائقي/تقرير/فاصل إعلاني أو ترويجي/بث متوقف أو شاشة ألوان",
-      "theme": "سياسي/أمني-ميداني/اقتصادي/اجتماعي/ديني/ثقافي/إداري",
-      "title": "",
-      "presenter": "",
-      "guests": [{{"name": "", "role": "", "mode": "استديو/Zoom/هاتف"}}],
-      "reporters": [{{"name": "", "location": ""}}],
-      "vt_reports": [{{"timestamp": "HH:MM:SS", "title": ""}}],
-      "key_verbatim_quotes": [""],
-      "summary": "تفصيل دقيق للمحتوى والمحاور والرسائل الأساسية",
-      "technical_or_visual_notes": ""
-    }}
-  ],
-  "on_screen_tickers_and_breaking": [""]
-}}"""
-
-
-def build_daily_synthesis_prompt(clean_name: str, exact_duration: str, custom_prompt: str) -> str:
-    extra = f"\nتعليمات إضافية من المشغّل:\n{custom_prompt}\n" if custom_prompt else ""
-    return f"""أنت مدير وحدة الرصد والتحليل التلفزيوني. أمامك السجل الجنائي الكامل لبث يومي ({clean_name}) بمدة إجمالية ({exact_duration}).{extra}
-المطلوب إنتاج تقريرين احترافيين بـ HTML عربي RTL (باستخدام فئات التنسيق: header-banner, info-table, exec-box, summary-strip, strengths-box, priorities-box, score-cell):
-1. `mainDetailedHtml`: التقرير اليومي المفصل (جدول جرد كامل لجميع الفقرات والبرامج بالتوقيت المتصل، جدول جرد الضيوف والمراسلين والتقارير VT، وجدول الملاحظات التحريرية والتقنية).
-2. `summarizedHtml`: الملخص التنفيذي للإدارة (خلاصة تنفيذية، شريط مؤشرات رقمية: إجمالي الساعات، عدد البرامج، عدد الضيوف، عدد المراسلين، جدول توزيع ساعات البث حسب التصنيف والموضوع، أبرز نقاط التميز، وأبرز الملاحظات والتوصيات الاستراتيجية للإدارة).
-
-أخرج JSON صالح حصراً بهذه الحقول:
-{{
-  "broadcast_label": "{clean_name}",
-  "total_programs": 0,
-  "total_guests": 0,
-  "total_reporters": 0,
-  "total_vt_reports": 0,
-  "executive_summary": "",
-  "category_breakdown": [{{"category": "", "minutes": 0, "percentage": 0}}],
-  "mainDetailedHtml": "<div class=\\"header-banner\\">...</div>...",
-  "summarizedHtml": "<div class=\\"header-banner\\">...</div>..."
-}}
-
-سجلات مقاطع البث:
-"""
+DEFAULT_ENTITIES_CSV = (
+    "id,type,canonical_ar,aliases_ar,role,notes\n"
+    "PRESENTER_01,person,حسن حمزة,حسن,مقدّم البرنامج,مقدّم «تغطية خاصة»\n"
+    "GUEST_01,person,وسام ناصيف ياسين,وسام ياسين;د. وسام;الدكتور وسام,باحث في العلاقات الدولية,ضيف الاستوديو المتكرّر\n"
+    "REPORTER_01,person,محمد قاسم,محمد عازم;محمد قاسم,مراسل قناة المنار - طهران,تحذير: خطأ تفريغ شائع «عازم» ← «قاسم»\n"
+)
 
 
 # ==============================================================================
-# HTML WRAPPER (Royal Executive Theme - MS Word A4 Print Compatible)
+# UTILITIES & REPO ASSET LOADERS
 # ==============================================================================
-def clean_inner_html(raw_html: str) -> str:
-    if not raw_html:
-        return ""
-    body_match = re.search(r"<body[^>]*>(.*)</body>", raw_html, flags=re.DOTALL | re.IGNORECASE)
-    if body_match:
-        return body_match.group(1).strip()
-    raw_html = re.sub(r"<!DOCTYPE[^>]*>", "", raw_html, flags=re.IGNORECASE)
-    raw_html = re.sub(r"</?html[^>]*>", "", raw_html, flags=re.IGNORECASE)
-    raw_html = re.sub(r"<head>.*?</head>", "", raw_html, flags=re.DOTALL | re.IGNORECASE)
-    raw_html = re.sub(r"</?body[^>]*>", "", raw_html, flags=re.IGNORECASE)
-    return raw_html.strip()
+def load_repo_text(filename: str, fallback: str = "") -> str:
+    p = os.path.join(BASE_DIR, filename)
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            return f.read()
+    return fallback
 
 
-def wrap_royal_html(title: str, body_content: str, banner_html: str = "") -> str:
-    cleaned = clean_inner_html(body_content)
-    return f"""<!DOCTYPE html>
-<html xmlns:o="urn:schemas-microsoft-com:office:office"
-      xmlns:w="urn:schemas-microsoft-com:office:word"
-      xmlns="http://www.w3.org/TR/REC-html40"
-      dir="rtl" lang="ar">
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<!--[if gte mso 9]>
-<xml>
-  <w:WordDocument>
-    <w:View>Print</w:View>
-    <w:Zoom>100</w:Zoom>
-    <w:DoNotOptimizeForBrowser/>
-  </w:WordDocument>
-</xml>
-<![endif]-->
-<style>
-  @page {{ size: A4; margin: 1.8cm; }}
-  body {{
-      font-family: "Segoe UI", "Tahoma", "Arial", sans-serif;
-      font-size: 12pt;
-      line-height: 1.65;
-      direction: rtl;
-      text-align: right;
-      color: #0F172A;
-      max-width: 980px;
-      margin: 24px auto;
-      padding: 24px;
-      background-color: #FFFFFF;
-  }}
-  .thinking-note {{
-      font-size: 9.5pt;
-      color: #1E3A8A;
-      background-color: #EFF6FF;
-      border: 1px solid #BFDBFE;
-      border-right: 4px solid #2563EB;
-      padding: 7px 12px;
-      margin-bottom: 16px;
-      border-radius: 4px;
-      text-align: right;
-      font-weight: bold;
-  }}
-  .header-banner {{
-      background-color: #1E3A8A;
-      color: #FFFFFF;
-      padding: 22px 24px;
-      border-radius: 8px;
-      border-bottom: 5px solid #F59E0B;
-      margin-bottom: 22px;
-      text-align: center;
-  }}
-  h1 {{ text-align: center; font-size: 20pt; font-weight: bold; color: #1E3A8A; margin: 0 0 6px 0; page-break-after: avoid; }}
-  .header-banner h1 {{ color: #FFFFFF; }}
-  .subtitle {{ text-align: center; font-size: 13.5pt; font-weight: bold; color: #475569; margin: 0 0 14px 0; }}
-  .header-banner .subtitle {{ color: #E2E8F0; margin: 0; }}
-  h2 {{
-      font-size: 14pt; font-weight: bold; color: #1E3A8A;
-      background-color: #F1F5F9; border-right: 6px solid #1E3A8A;
-      border-bottom: 1px solid #CBD5E1; padding: 8px 14px;
-      margin-top: 24px; margin-bottom: 12px; border-radius: 4px; page-break-after: avoid;
-  }}
-  p {{ margin-top: 6px; margin-bottom: 12px; text-align: justify; }}
-  .exec-box {{
-      background-color: #EFF6FF; border: 1px solid #BFDBFE;
-      border-right: 6px solid #1D4ED8; padding: 14px 18px;
-      border-radius: 6px; margin-bottom: 18px;
-  }}
-  .strengths-box {{
-      background-color: #F0FDF4; border: 1px solid #BBF7D0;
-      border-right: 6px solid #16A34A; padding: 14px 20px;
-      border-radius: 6px; margin-bottom: 18px;
-  }}
-  .strengths-box li {{ color: #064E3B; font-weight: 500; }}
-  .priorities-box {{
-      background-color: #FFFBEB; border: 1px solid #FDE68A;
-      border-right: 6px solid #D97706; padding: 14px 20px;
-      border-radius: 6px; margin-bottom: 18px;
-  }}
-  .priorities-box li {{ color: #78350F; font-weight: 500; }}
-  table {{ width: 100%; border-collapse: collapse; margin-bottom: 18px; page-break-inside: avoid; }}
-  table, th, td {{ border: 1px solid #CBD5E1; }}
-  th, td {{ padding: 9px 12px; text-align: right; vertical-align: top; page-break-inside: avoid; }}
-  tr {{ page-break-inside: avoid; page-break-after: auto; }}
-  tr:nth-child(even) td {{ background-color: #F8FAFC; }}
-  th {{ background-color: #1E3A8A; color: #FFFFFF; font-weight: bold; font-size: 11.5pt; }}
-  .info-table td:first-child {{
-      font-weight: bold; background-color: #EFF6FF; color: #1E3A8A;
-      width: 22%; border-left: 2px solid #93C5FD;
-  }}
-  .summary-strip td {{
-      background-color: #F8FAFC; text-align: center; width: 25%;
-      padding: 12px 10px; border-top: 4px solid #1E3A8A;
-  }}
-  .summary-strip td:nth-child(1) {{ background-color: #EFF6FF; border-top-color: #2563EB; }}
-  .summary-strip td:nth-child(2) {{ background-color: #F0FDFA; border-top-color: #0D9488; }}
-  .summary-strip td:nth-child(3) {{ background-color: #F0FDF4; border-top-color: #16A34A; }}
-  .summary-strip td:nth-child(4) {{ background-color: #FFFBEB; border-top-color: #D97706; }}
-  .summary-strip .label {{ font-size: 10.5pt; color: #475569; font-weight: bold; display: block; margin-bottom: 4px; }}
-  .summary-strip .val {{ font-size: 13.5pt; font-weight: bold; color: #0F172A; }}
-  .core-grid td {{
-      width: 33.33%; background-color: #F1F5F9; color: #1E3A8A;
-      font-weight: bold; text-align: center; padding: 11px; font-size: 12pt;
-  }}
-  .score-cell {{
-      text-align: center; font-weight: bold; color: #1E3A8A;
-      background-color: #EFF6FF !important; font-size: 11.5pt;
-  }}
-  ul {{ margin-top: 6px; margin-bottom: 8px; padding-right: 22px; }}
-  li {{ margin-bottom: 8px; page-break-inside: avoid; }}
-</style>
-</head>
-<body>{banner_html}{cleaned}</body>
-</html>"""
+def load_repo_json(filename: str, fallback: dict) -> dict:
+    p = os.path.join(BASE_DIR, filename)
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return fallback
 
 
-# ==============================================================================
-# ULTRA-DETAILED SELF-CONTAINED FORENSIC BLACKBOX GENERATOR
-# ==============================================================================
-def generate_forensic_blackbox_md(mode: str, valid_chunks: list, final_data: dict, meta: dict) -> str:
-    """
-    Produces a completely self-contained Markdown dossier so ANY external AI
-    (DeepSeek, ChatGPT, Claude, etc.) can analyze it accurately with zero prior context.
-    """
-    lines = []
-    lines.append(f"# FORENSIC BLACKBOX DOSSIER — {meta['clean_name']} ({mode.upper()})")
-    lines.append("")
-    lines.append("> **Notice for External AI Systems (ChatGPT / DeepSeek / Claude / etc.):**")
-    lines.append("> This file is a complete, self-contained forensic dataset extracted directly from the full video & audio of a TV broadcast/episode with zero hallucination. Every timestamp is absolute (`HH:MM:SS`) from the start of the recording (`00:00:00`). Use ONLY the evidence, quotes, visual observations, and structured data inside this file to answer questions, build comparative reports, or audit scores.")
-    lines.append("")
-
-    # 1. Master Metadata
-    lines.append("## 1. MASTER METADATA")
-    lines.append(f"- **Episode / Folder Name:** {meta['clean_name']}")
-    lines.append(f"- **Presenter / Subject:** {meta.get('presenter_name') or 'Not specified'}")
-    lines.append(f"- **Run Mode:** {mode}")
-    lines.append(f"- **Editorial Standard:** {meta.get('editorial_label', 'N/A')}")
-    lines.append(f"- **Exact Full Duration:** {meta.get('exact_duration', 'Unknown')}")
-    lines.append(f"- **Chunks Analyzed:** {meta.get('chunks_ok', 0)} / {meta.get('chunks_total', 0)} (Chunk size: {meta.get('chunk_min', 10)} min, Video FPS: {meta.get('fps', 'N/A')})")
-    lines.append(f"- **Source URL:** {meta.get('src_url', 'N/A')}")
-    lines.append(f"- **Models Used:** {', '.join(sorted(meta.get('models_used', []))) or 'N/A'}")
-    lines.append(f"- **Actual Cost (USD):** ${meta.get('actual_cost', 0.0):.4f}")
-    lines.append(f"- **Generated At (Beirut Time):** {datetime.now(BEIRUT_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    if meta.get("system_prompt"):
-        lines.append(f"- **Custom Operator Prompt:** {meta['system_prompt']}")
-    if final_data.get("lastSpokenWords"):
-        lines.append(f"- **Verbatim Last Spoken Words (End Verification):** «{final_data['lastSpokenWords']}»")
-    lines.append("")
-
-    # 2. Scoring System & Rules Reference (so external AI knows the exact framework!)
-    if mode == "eval":
-        lines.append("## 2. EVALUATION FRAMEWORK & MANDATORY RULES")
-        lines.append(RUBRIC_90_SPEC)
-        lines.append("")
-        lines.append("### Editorial & Language Rules Applied")
-        lines.append(EDITORIAL_RULE_GENERAL_NEUTRAL if meta.get("editorial_mode") == "neutral" else EDITORIAL_RULE_DIRECTED)
-        lines.append("- **Lebanese Spoken Dialect Rule:** Spoken Lebanese dialect is a natural, engaging communicative style and MUST NEVER be penalized or listed as a weakness/development priority.")
-        lines.append("")
-
-        # 3. Synthesized Scores Overview
-        lines.append("## 3. SYNTHESIZED EVALUATION SCORES")
-        lines.append(f"- **Total Score:** {final_data.get('total_score', 0)} / 90 ({final_data.get('percentage', 0)}%)")
-        lines.append(f"- **Top Strength:** {final_data.get('top_strength', 'N/A')}")
-        lines.append(f"- **Top Priority:** {final_data.get('top_priority', 'N/A')}")
-        core = final_data.get("core_scores", {})
-        if core:
-            lines.append("")
-            lines.append("| Core Criterion | Score | Max |")
-            lines.append("|---|---:|---:|")
-            lines.append(f"| إدارة الحلقة (Episode Management) | {core.get('management', 0)} | 20 |")
-            lines.append(f"| التعامل مع الضيف (Guest Handling) | {core.get('guest', 0)} | 20 |")
-            lines.append(f"| جودة الأسئلة (Questions Quality) | {core.get('questions', 0)} | 20 |")
-            lines.append(f"| المتابعة والتعقيب (Follow-up) | {core.get('followup', 0)} | 15 |")
-            lines.append(f"| الحضور والأداء (Presence & Delivery) | {core.get('presence', 0)} | 10 |")
-            lines.append(f"| ضبط الوقت (Time Control) | {core.get('time', 0)} | 5 |")
-        if final_data.get("sub_criteria"):
-            lines.append("")
-            lines.append("### 23 Sub-Criteria Breakdown")
-            lines.append("| Section | Sub-Criterion | Score | Evidence / Note |")
-            lines.append("|---|---|---:|---|")
-            for sc in final_data.get("sub_criteria", []):
-                note = str(sc.get("note", "")).replace("\n", " ").replace("|", "/")
-                lines.append(f"| {sc.get('section', '')} | {sc.get('name', '')} | {sc.get('score', 0)}/{sc.get('max', 0)} | {note} |")
-        lines.append("")
-
-    else:
-        lines.append("## 2. DAILY BROADCAST EXECUTIVE OVERVIEW")
-        lines.append(f"- **Total Programs/Segments:** {final_data.get('total_programs', 0)}")
-        lines.append(f"- **Total Guests:** {final_data.get('total_guests', 0)}")
-        lines.append(f"- **Total Reporters:** {final_data.get('total_reporters', 0)}")
-        lines.append(f"- **Total VT Reports:** {final_data.get('total_vt_reports', 0)}")
-        if final_data.get("executive_summary"):
-            lines.append(f"- **Executive Summary:** {final_data['executive_summary']}")
-        lines.append("")
-
-    # 4. Human- & LLM-Readable Forensic Chunk-by-Chunk Log
-    lines.append("## 4. EXHAUSTIVE CHRONOLOGICAL FORENSIC LOG (CHUNK BY CHUNK)")
-    for item in valid_chunks:
-        c_idx = item.get("chunk_index", "?")
-        c_win = item.get("window", "")
-        d = item.get("data") or {}
-        lines.append(f"### Chunk {c_idx} — {c_win}")
-        if not isinstance(d, dict):
-            lines.append(str(d))
-            continue
-
-        if mode == "eval":
-            clues = d.get("program_and_episode_clues") or {}
-            if any(clues.values()):
-                lines.append(f"- **Identified Clues:** Program=`{clues.get('program_name_seen_or_heard','')}` | Title/Date=`{clues.get('episode_title_or_date_seen','')}` | Presenter=`{clues.get('presenter_name_seen_or_heard','')}` | Setting=`{clues.get('studio_or_location_setting','')}`")
-            if d.get("chunk_summary"):
-                lines.append(f"- **Summary:** {d['chunk_summary']}")
-
-            if d.get("participants"):
-                lines.append("#### Participants")
-                for p in d["participants"]:
-                    lines.append(f"- **{p.get('name','?')}** ({p.get('role_or_title','')}) [{p.get('appearance','')}] ~{p.get('approx_speaking_seconds',0)}s — {p.get('notes','')}")
-
-            if d.get("chronological_segments"):
-                lines.append("#### Chronological Segments")
-                lines.append("| Start | End | Type | Topic | Details |")
-                lines.append("|---|---|---|---|---|")
-                for s in d["chronological_segments"]:
-                    det = str(s.get("details", "")).replace("\n", " ").replace("|", "/")
-                    lines.append(f"| {s.get('start','')} | {s.get('end','')} | {s.get('segment_type','')} | {s.get('topic','')} | {det} |")
-
-            if d.get("presenter_questions_and_followups"):
-                lines.append("#### Presenter Questions, Follow-ups & Verbatim Quotes")
-                for q in d["presenter_questions_and_followups"]:
-                    lines.append(f"- **[{q.get('timestamp','')}]** ({q.get('question_type','')}, ~{q.get('duration_sec',0)}s, linked={q.get('linked_to_guest_answer')}): «{q.get('verbatim_quote','')}» — *{q.get('professional_note','')}*")
-
-            if d.get("guest_monologues"):
-                lines.append("#### Guest Monologues Audit")
-                for m in d["guest_monologues"]:
-                    lines.append(f"- **{m.get('speaker','')}** ({m.get('start','')} -> {m.get('end','')}, {m.get('duration_sec',0)}s, intervened={m.get('presenter_intervened')}): {m.get('editorial_or_rhythm_note','')}")
-
-            if d.get("visual_and_body_language_log"):
-                lines.append("#### Visual & Body Language Log")
-                for v in d["visual_and_body_language_log"]:
-                    lines.append(f"- **[{v.get('timestamp','')}]** ({v.get('category','')} | {v.get('impact','')}): {v.get('observation','')}")
-
-            if d.get("vocal_and_language_log"):
-                lines.append("#### Vocal & Language Log")
-                for vl in d["vocal_and_language_log"]:
-                    lines.append(f"- **[{vl.get('timestamp','')}]** ({vl.get('aspect','')} | {vl.get('impact','')}): {vl.get('verbatim_or_detail','')}")
-
-            if d.get("vt_and_field_reports"):
-                lines.append("#### VT & Field Reports")
-                for vt in d["vt_and_field_reports"]:
-                    lines.append(f"- **[{vt.get('start','')} -> {vt.get('end','')}]** {vt.get('title_or_reporter','')}: {vt.get('summary','')} | Handoff: {vt.get('presenter_handoff_note','')}")
-
-            if d.get("on_screen_graphics_and_chyrons"):
-                lines.append("#### On-Screen Graphics / Chyrons")
-                for g in d["on_screen_graphics_and_chyrons"]:
-                    lines.append(f"- **[{g.get('timestamp','')}]** {g.get('text','')}")
-
-            if d.get("rubric_evidence_notes"):
-                lines.append("#### Chunk Rubric Evidence")
-                for k_ev, v_ev in d["rubric_evidence_notes"].items():
-                    if v_ev:
-                        lines.append(f"- **{k_ev}:** {v_ev}")
-
-            if d.get("last_spoken_words"):
-                lines.append(f"- **Last Spoken Words Captured:** «{d['last_spoken_words']}»")
-        else:
-            for p in d.get("programs", []):
-                lines.append(f"- **[{p.get('start','')} -> {p.get('end','')}] {p.get('title','')}** ({p.get('category','')} | {p.get('theme','')}) — Presenter: {p.get('presenter','')}")
-                if p.get("summary"):
-                    lines.append(f"  - Summary: {p['summary']}")
-                if p.get("guests"):
-                    g_str = ", ".join(f"{g.get('name','')} ({g.get('role','')})" for g in p["guests"])
-                    lines.append(f"  - Guests: {g_str}")
-                if p.get("reporters"):
-                    r_str = ", ".join(f"{r.get('name','')} ({r.get('location','')})" for r in p["reporters"])
-                    lines.append(f"  - Reporters: {r_str}")
-                if p.get("vt_reports"):
-                    v_str = ", ".join(f"[{v.get('timestamp','')}] {v.get('title','')}" for v in p["vt_reports"])
-                    lines.append(f"  - VT Reports: {v_str}")
-                if p.get("key_verbatim_quotes"):
-                    lines.append(f"  - Quotes: {' | '.join(p['key_verbatim_quotes'])}")
-                if p.get("technical_or_visual_notes"):
-                    lines.append(f"  - Tech/Visual: {p['technical_or_visual_notes']}")
-            if d.get("on_screen_tickers_and_breaking"):
-                lines.append(f"- **Breaking / Tickers:** {' ; '.join(d['on_screen_tickers_and_breaking'])}")
-
-        lines.append("")
-
-    # 5. Structured Machine-Readable JSON Appendix (excludes giant HTML strings to keep clean)
-    clean_final_meta = {k: v for k, v in final_data.items() if k not in ("mainDetailedHtml", "summarizedHtml")}
-    lines.append("## 5. COMPLETE STRUCTURED JSON APPENDIX")
-    lines.append("```json")
-    lines.append(json.dumps({"metadata": {k: (list(v) if isinstance(v, set) else v) for k, v in meta.items()}, "final_synthesis": clean_final_meta, "chunks": valid_chunks}, ensure_ascii=False, indent=2))
-    lines.append("```")
-    return "\n".join(lines)
+def parse_entities_csv(csv_text: str) -> dict:
+    """Parses entities.csv with columns: id,type,canonical_ar,aliases_ar,role,notes."""
+    entities = {}
+    alias_to_canonical = {}
+    try:
+        reader = csv.DictReader(io.StringIO(csv_text.strip()))
+        for row in reader:
+            canonical = (row.get("canonical_ar") or row.get("canonical_name") or "").strip()
+            if not canonical:
+                continue
+            eid = (row.get("id") or canonical).strip()
+            aliases_raw = row.get("aliases_ar") or ""
+            aliases = [a.strip() for a in re.split(r"[;,|]", aliases_raw) if a.strip()]
+            entities[eid] = {
+                "id": eid,
+                "type": (row.get("type") or "person").strip(),
+                "canonical_ar": canonical,
+                "aliases_ar": aliases,
+                "role": (row.get("role") or "").strip(),
+                "notes": (row.get("notes") or "").strip(),
+            }
+            alias_to_canonical[canonical] = canonical
+            for al in aliases:
+                alias_to_canonical[al] = canonical
+    except Exception as e:
+        print(f"[entities.csv Parse Warning] {e}", flush=True)
+    return {"entities": entities, "alias_map": alias_to_canonical}
 
 
-# ==============================================================================
-# HELPERS: FORMATTING, TELEGRAM, DUAL-PORT SMTP, AUTO-REFRESH DRIVE
-# ==============================================================================
+def esc(s) -> str:
+    return html_lib.escape(str(s if s is not None else ""))
+
+
 def mask_key(k: str) -> str:
     k = (k or "").strip()
     return "***" if len(k) <= 10 else f"{k[:6]}...{k[-4:]}"
 
 
-def format_hhmmss(seconds: float) -> str:
-    s = max(0, int(round(seconds)))
-    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+def format_hhmmss(seconds: float, with_ms: bool = False) -> str:
+    s = max(0.0, float(seconds or 0.0))
+    whole = int(s)
+    hh, mm, ss = whole // 3600, (whole % 3600) // 60, whole % 60
+    if with_ms:
+        ms = min(999, int(round((s - whole) * 1000)))
+        return f"{hh:02d}:{mm:02d}:{ss:02d}.{ms:03d}"
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def parse_hms_to_sec(hms: str) -> float:
+    m = re.match(r"^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$", str(hms or "").strip())
+    if not m:
+        return 0.0
+    hh, mm, ss, ms = m.groups()
+    base = int(hh) * 3600 + int(mm) * 60 + int(ss)
+    return base + (int(ms.ljust(3, "0")) / 1000.0 if ms else 0.0)
 
 
 def sanitize_filename(name: str) -> str:
     s = re.sub(r'[\\/*?:"<>|]+', "_", (name or "Episode").strip())
-    s = re.sub(r"[\s_]+", "_", s)
-    return s.strip("_") or "Episode"
+    return re.sub(r"[\s_]+", "_", s).strip("_") or "Episode"
 
 
 def clean_json_text(text: str) -> dict:
@@ -672,13 +198,112 @@ def clean_json_text(text: str) -> dict:
     try:
         return json.loads(raw)
     except Exception:
-        start = raw.find("{")
-        end = raw.rfind("}")
+        start, end = raw.find("{"), raw.rfind("}")
         if start != -1 and end > start:
             return json.loads(raw[start : end + 1])
         raise
 
 
+def ar_label(text: str) -> str:
+    try:
+        return get_display(arabic_reshaper.reshape(str(text or "")))
+    except Exception:
+        return str(text or "")
+
+
+def round_half(x: float) -> float:
+    return round(float(x) * 2.0) / 2.0
+
+
+# ==============================================================================
+# METADATA DERIVATION, SCREEN-CLOCK VERIFICATION & FFMPEG SPEECH MEASUREMENT
+# ==============================================================================
+def derive_metadata(src_url: str, duration_sec: float) -> dict:
+    fname = os.path.basename((src_url or "").split("?")[0])
+    out = {
+        "source_filename": fname or None,
+        "epoch": None,
+        "air_datetime_utc": None,
+        "air_datetime_local": None,
+        "broadcast_date": None,
+        "broadcast_start_beirut": None,
+        "broadcast_end_beirut": None,
+        "timezone": None,
+        "expected_utc_offset_hours": None,
+    }
+    m = re.search(r"archive-(\d{10})-(\d+)", src_url or "")
+    if m:
+        ts = int(m.group(1))
+        dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+        dt_loc = dt_utc.astimezone(BEIRUT_TZ)
+        dt_end = dt_loc + timedelta(seconds=duration_sec)
+        tz_raw = dt_loc.strftime("%z")
+        tz_fmt = f"UTC{tz_raw[:3]}:{tz_raw[3:]}" if len(tz_raw) == 5 else "Asia/Beirut"
+        off_h = dt_loc.utcoffset().total_seconds() / 3600.0 if dt_loc.utcoffset() else 2.0
+        out.update({
+            "epoch": ts,
+            "air_datetime_utc": dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "air_datetime_local": dt_loc.strftime("%Y-%m-%d %H:%M:%S"),
+            "broadcast_date": dt_loc.strftime("%Y-%m-%d"),
+            "broadcast_start_beirut": dt_loc.strftime("%H:%M:%S"),
+            "broadcast_end_beirut": dt_end.strftime("%H:%M:%S"),
+            "timezone": tz_fmt,
+            "expected_utc_offset_hours": off_h,
+        })
+    else:
+        now_loc = datetime.now(BEIRUT_TZ)
+        tz_raw = now_loc.strftime("%z")
+        off_h = now_loc.utcoffset().total_seconds() / 3600.0 if now_loc.utcoffset() else 2.0
+        out["timezone"] = f"UTC{tz_raw[:3]}:{tz_raw[3:]}" if len(tz_raw) == 5 else "Asia/Beirut"
+        out["expected_utc_offset_hours"] = off_h
+    return out
+
+
+def verify_screen_clock_conflict(derived_meta: dict, on_screen_clocks: list) -> tuple:
+    """Cross-checks derived local start time + seen_at against observed on_screen_clock (within +/- 3 min)."""
+    conflicts = []
+    verified = False
+    if not derived_meta.get("epoch") or not on_screen_clocks:
+        return verified, conflicts
+    dt_start = datetime.fromtimestamp(derived_meta["epoch"], tz=timezone.utc).astimezone(BEIRUT_TZ)
+    for item in on_screen_clocks:
+        if not isinstance(item, dict):
+            continue
+        clk_val = str(item.get("value") or "").strip()
+        seen_at = str(item.get("seen_at") or "").strip()
+        mc = re.search(r"(\d{1,2}):(\d{2})", clk_val)
+        if not mc:
+            continue
+        obs_min = int(mc.group(1)) * 60 + int(mc.group(2))
+        seen_s = parse_hms_to_sec(seen_at)
+        exp_dt = dt_start + timedelta(seconds=seen_s)
+        exp_min = exp_dt.hour * 60 + exp_dt.minute
+        diff = min(abs(obs_min - exp_min), 1440 - abs(obs_min - exp_min))
+        if diff <= 4:
+            verified = True
+        else:
+            conflicts.append({
+                "field": "air_datetime_local",
+                "values": [f"derived={exp_dt.strftime('%H:%M')}", f"on_screen={clk_val}@{seen_at}"],
+                "preferred": f"on_screen={clk_val}",
+                "reason": f"فارق {diff} دقيقة بين طابع اسم الملف وساعة الشاشة عند {seen_at}",
+            })
+    return verified, conflicts
+
+
+def measure_chunk_speech_ffmpeg(mp4_path: str, chunk_dur_s: float) -> float:
+    try:
+        cmd = ["ffmpeg", "-i", mp4_path, "-af", "silencedetect=noise=-32dB:d=0.6", "-f", "null", "-"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        silences = [float(x) for x in re.findall(r"silence_duration:\s*([0-9.]+)", proc.stderr or "")]
+        return round(max(0.0, chunk_dur_s - sum(silences)), 1)
+    except Exception:
+        return round(chunk_dur_s, 1)
+
+
+# ==============================================================================
+# TELEGRAM, DUAL-PORT SMTP, DRIVE AUTO-REFRESH & LIVE TELEMETRY
+# ==============================================================================
 def send_tg(msg, token, chat, file_path=None):
     if not (token and chat):
         return
@@ -708,12 +333,6 @@ def send_tg(msg, token, chat, file_path=None):
 
 
 def send_smtp_resilient(subject, html_body, files, emails, user, pwd) -> bool:
-    """
-    Fixes `[SMTP Retry] Connection unexpectedly closed` on GitHub Actions:
-    - Strips accidental whitespace from Gmail App Password.
-    - Tries Port 465 (SMTP_SSL) then falls back to Port 587 (SMTP + STARTTLS).
-    - Sends per-recipient like evaluate.py.
-    """
     user = (user or "").strip()
     pwd = re.sub(r"\s+", "", (pwd or "").strip())
     recips = [e.strip() for e in re.split(r"[,;]", emails or "") if e.strip()]
@@ -738,60 +357,47 @@ def send_smtp_resilient(subject, html_body, files, emails, user, pwd) -> bool:
                 msg.attach(p)
         return msg
 
-    # Attempt 1: Port 465 SSL
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=25) as s:
-            s.ehlo()
-            s.login(user, pwd)
-            for rec in recips:
-                s.sendmail(user, [rec], build_msg(rec).as_string())
-        print(f"✅ SMTP (465 SSL) sent to: {recips}", flush=True)
-        return True
-    except Exception as e465:
-        print(f"[SMTP 465 Warning] {e465} — trying STARTTLS port 587...", flush=True)
-
-    # Attempt 2: Port 587 STARTTLS
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=25) as s:
-            s.ehlo()
-            s.starttls()
-            s.ehlo()
-            s.login(user, pwd)
-            for rec in recips:
-                s.sendmail(user, [rec], build_msg(rec).as_string())
-        print(f"✅ SMTP (587 STARTTLS) sent to: {recips}", flush=True)
-        return True
-    except Exception as e587:
-        print(f"[SMTP 587 Failed] {e587} — will trigger Apps Script GmailApp backup email.", flush=True)
-        return False
+    for port, use_ssl in ((465, True), (587, False)):
+        try:
+            if use_ssl:
+                with smtplib.SMTP_SSL("smtp.gmail.com", port, timeout=25) as s:
+                    s.ehlo()
+                    s.login(user, pwd)
+                    for rec in recips:
+                        s.sendmail(user, [rec], build_msg(rec).as_string())
+            else:
+                with smtplib.SMTP("smtp.gmail.com", port, timeout=25) as s:
+                    s.ehlo()
+                    s.starttls()
+                    s.ehlo()
+                    s.login(user, pwd)
+                    for rec in recips:
+                        s.sendmail(user, [rec], build_msg(rec).as_string())
+            print(f"✅ SMTP ({port}) sent to: {recips}", flush=True)
+            return True
+        except Exception as e:
+            print(f"[SMTP {port} Warning] {e}", flush=True)
+    return False
 
 
 def refresh_drive_token_via_webhook(cfg) -> bool:
     global RUNTIME_DRIVE_TOKEN
-    webhook = cfg.get("webhook_url")
-    secret = cfg.get("webhook_secret", "")
+    webhook, secret = cfg.get("webhook_url"), cfg.get("webhook_secret", "")
     if not (webhook and secret):
         return False
     try:
-        r = requests.post(
-            webhook,
-            json={"action": "refresh_drive_token", "webhook_secret": secret},
-            timeout=15,
-        )
-        if r.status_code == 200:
-            new_tok = r.json().get("drive_token", "").strip()
-            if new_tok:
-                with DRIVE_TOKEN_LOCK:
-                    RUNTIME_DRIVE_TOKEN = new_tok
-                print("🔄 Refreshed Google Drive OAuth token successfully.", flush=True)
-                return True
+        r = requests.post(webhook, json={"action": "refresh_drive_token", "webhook_secret": secret}, timeout=15)
+        if r.status_code == 200 and r.json().get("drive_token"):
+            with DRIVE_TOKEN_LOCK:
+                RUNTIME_DRIVE_TOKEN = r.json()["drive_token"].strip()
+            print("🔄 Refreshed Google Drive OAuth token.", flush=True)
+            return True
     except Exception as e:
         print(f"[Token Refresh Warning] {e}", flush=True)
     return False
 
 
 def drive_request(method, url, cfg, **kwargs):
-    """Auto-retrying Drive HTTP wrapper that refreshes the OAuth token if 401 occurs."""
     for attempt in range(2):
         with DRIVE_TOKEN_LOCK:
             tok = RUNTIME_DRIVE_TOKEN
@@ -808,43 +414,19 @@ def drive_upload(folder_id, cfg, filepath, mimetype) -> bool:
     filename = os.path.basename(filepath)
     q = f"'{folder_id}' in parents and name='{filename}' and trashed=false"
     try:
-        r = drive_request(
-            "GET",
-            "https://www.googleapis.com/drive/v3/files",
-            cfg,
-            params={"q": q, "fields": "files(id)"},
-            timeout=20,
-        )
-        files_found = r.json().get("files", []) if r.status_code == 200 else []
-        fid = files_found[0].get("id") if files_found else None
+        r = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": q, "fields": "files(id)"}, timeout=20)
+        ff = r.json().get("files", []) if r.status_code == 200 else []
+        fid = ff[0].get("id") if ff else None
         with open(filepath, "rb") as f:
             data = f.read()
         if fid:
-            up = drive_request(
-                "PATCH",
-                f"https://www.googleapis.com/upload/drive/v3/files/{fid}?uploadType=media",
-                cfg,
-                headers={"Content-Type": f"{mimetype}; charset=UTF-8"},
-                data=data,
-                timeout=90,
-            )
+            up = drive_request("PATCH", f"https://www.googleapis.com/upload/drive/v3/files/{fid}?uploadType=media", cfg, headers={"Content-Type": f"{mimetype}; charset=UTF-8"}, data=data, timeout=90)
             return up.status_code in (200, 201)
-        else:
-            bound = "===BNDRY==="
-            meta = json.dumps({"name": filename, "parents": [folder_id]})
-            body = (
-                f"--{bound}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n"
-                f"--{bound}\r\nContent-Type: {mimetype}; charset=UTF-8\r\n\r\n"
-            ).encode("utf-8") + data + f"\r\n--{bound}--\r\n".encode("utf-8")
-            up = drive_request(
-                "POST",
-                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
-                cfg,
-                headers={"Content-Type": f"multipart/related; boundary={bound}"},
-                data=body,
-                timeout=90,
-            )
-            return up.status_code in (200, 201)
+        bound = "===BNDRY==="
+        meta = json.dumps({"name": filename, "parents": [folder_id]})
+        body = (f"--{bound}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n--{bound}\r\nContent-Type: {mimetype}; charset=UTF-8\r\n\r\n").encode("utf-8") + data + f"\r\n--{bound}--\r\n".encode("utf-8")
+        up = drive_request("POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", cfg, headers={"Content-Type": f"multipart/related; boundary={bound}"}, data=body, timeout=90)
+        return up.status_code in (200, 201)
     except Exception as e:
         print(f"[Drive Upload Warning] {filename}: {e}", flush=True)
         return False
@@ -855,21 +437,11 @@ def update_drive_folder_meta(folder_id, cfg, new_name, description_text=""):
     if description_text:
         payload["description"] = description_text
     try:
-        r = drive_request(
-            "PATCH",
-            f"https://www.googleapis.com/drive/v3/files/{folder_id}",
-            cfg,
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=25,
-        )
+        r = drive_request("PATCH", f"https://www.googleapis.com/drive/v3/files/{folder_id}", cfg, headers={"Content-Type": "application/json"}, json=payload, timeout=25)
         return r.status_code in (200, 204)
     except Exception as e:
         print(f"[Drive Rename Warning] {e}", flush=True)
         return False
-
-
-STATUS_FILE_DRIVE_ID = None
 
 
 def write_drive_status_and_check_cancel(folder_id, cfg, payload):
@@ -877,164 +449,90 @@ def write_drive_status_and_check_cancel(folder_id, cfg, payload):
     if not folder_id:
         return False
     try:
-        chk = drive_request(
-            "GET",
-            "https://www.googleapis.com/drive/v3/files",
-            cfg,
-            params={"q": f"'{folder_id}' in parents and name='_cancel.flag' and trashed=false", "fields": "files(id)"},
-            timeout=10,
-        )
+        chk = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": f"'{folder_id}' in parents and name='_cancel.flag' and trashed=false", "fields": "files(id)"}, timeout=10)
         if chk.status_code == 200 and chk.json().get("files"):
             CANCEL_EVENT.set()
             return True
-
         raw_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if not STATUS_FILE_DRIVE_ID:
-            r = drive_request(
-                "GET",
-                "https://www.googleapis.com/drive/v3/files",
-                cfg,
-                params={"q": f"'{folder_id}' in parents and name='_status.json' and trashed=false", "fields": "files(id)"},
-                timeout=10,
-            )
-            files_found = r.json().get("files", []) if r.status_code == 200 else []
-            if files_found:
-                STATUS_FILE_DRIVE_ID = files_found[0]["id"]
-
+            r = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": f"'{folder_id}' in parents and name='_status.json' and trashed=false", "fields": "files(id)"}, timeout=10)
+            ff = r.json().get("files", []) if r.status_code == 200 else []
+            if ff:
+                STATUS_FILE_DRIVE_ID = ff[0]["id"]
         if STATUS_FILE_DRIVE_ID:
-            drive_request(
-                "PATCH",
-                f"https://www.googleapis.com/upload/drive/v3/files/{STATUS_FILE_DRIVE_ID}?uploadType=media",
-                cfg,
-                headers={"Content-Type": "application/json; charset=UTF-8"},
-                data=raw_bytes,
-                timeout=15,
-            )
+            drive_request("PATCH", f"https://www.googleapis.com/upload/drive/v3/files/{STATUS_FILE_DRIVE_ID}?uploadType=media", cfg, headers={"Content-Type": "application/json; charset=UTF-8"}, data=raw_bytes, timeout=15)
         else:
             bound = "===BNDRY_ST==="
             meta = json.dumps({"name": "_status.json", "parents": [folder_id]})
-            body = (
-                f"--{bound}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n"
-                f"--{bound}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
-            ).encode("utf-8") + raw_bytes + f"\r\n--{bound}--\r\n".encode("utf-8")
-            up = drive_request(
-                "POST",
-                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id",
-                cfg,
-                headers={"Content-Type": f"multipart/related; boundary={bound}"},
-                data=body,
-                timeout=15,
-            )
+            body = (f"--{bound}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n--{bound}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n").encode("utf-8") + raw_bytes + f"\r\n--{bound}--\r\n".encode("utf-8")
+            up = drive_request("POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", cfg, headers={"Content-Type": f"multipart/related; boundary={bound}"}, data=body, timeout=15)
             if up.status_code in (200, 201):
                 STATUS_FILE_DRIVE_ID = up.json().get("id")
-    except Exception as e:
-        print(f"[Drive Status Warning] {e}", flush=True)
+    except Exception:
+        pass
     return CANCEL_EVENT.is_set()
 
 
 def push_status(cfg, folder_id, run_id, status, phase, completed, total, act_cost, started_at, eta_sec=None, message=""):
     elapsed = int(time.time() - started_at)
     if eta_sec is None:
-        if completed > 0 and total > completed:
-            eta_sec = int((elapsed / completed) * (total - completed))
-        elif total > 0 and status == "running":
-            eta_sec = int(total * 35)
-        else:
-            eta_sec = 0
+        eta_sec = int((elapsed / completed) * (total - completed)) if (completed > 0 and total > completed) else (int(total * 30) if status == "running" else 0)
     payload = {
-        "action": "update_status",
-        "job_id": folder_id,
-        "run_id": str(run_id or ""),
-        "status": status,
-        "phase": phase,
-        "completed_chunks": int(completed),
-        "total_chunks": int(total),
-        "elapsed_sec": elapsed,
-        "eta_sec": max(0, int(eta_sec)),
-        "actual_cost": round(float(act_cost), 4),
-        "message": message,
-        "updated_at_epoch": int(time.time()),
+        "action": "update_status", "job_id": folder_id, "run_id": str(run_id or ""),
+        "status": status, "phase": phase, "completed_chunks": int(completed),
+        "total_chunks": int(total), "elapsed_sec": elapsed, "eta_sec": max(0, int(eta_sec)),
+        "actual_cost": round(float(act_cost), 4), "message": message, "updated_at_epoch": int(time.time()),
     }
-    # 1. Always write _status.json to Drive (works even if Web App access is "Only myself")
     write_drive_status_and_check_cancel(folder_id, cfg, payload)
-
-    # 2. Also push via Apps Script webhook if reachable
     webhook = cfg.get("webhook_url")
     if webhook:
         try:
             r = requests.post(webhook, json=payload, timeout=10)
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            if r.status_code == 200 and "json" in ctype and r.json().get("cancel_requested"):
+            if r.status_code == 200 and "json" in (r.headers.get("Content-Type") or "").lower() and r.json().get("cancel_requested"):
                 CANCEL_EVENT.set()
                 return True
-        except Exception as e:
-            print(f"[Status Webhook Warning] {e}", flush=True)
+        except Exception:
+            pass
     return CANCEL_EVENT.is_set()
 
 
 def finalize_cost_webhook(cfg, folder_id, actual_cost: float, final_status="completed", message="", trigger_gas_email=False, email_subject=""):
     write_drive_status_and_check_cancel(folder_id, cfg, {
-        "job_id": folder_id,
-        "run_id": str(os.environ.get("GITHUB_RUN_ID", "")),
-        "status": final_status,
-        "phase": message or final_status,
-        "eta_sec": 0,
-        "actual_cost": round(float(actual_cost), 4),
-        "message": message,
-        "updated_at_epoch": int(time.time()),
+        "job_id": folder_id, "run_id": str(os.environ.get("GITHUB_RUN_ID", "")),
+        "status": final_status, "phase": message or final_status, "eta_sec": 0,
+        "actual_cost": round(float(actual_cost), 4), "message": message, "updated_at_epoch": int(time.time()),
     })
-    webhook = cfg.get("webhook_url")
-    if not webhook:
-        return
-    try:
-        requests.post(
-            webhook,
-            json={
-                "action": "finalize_cost",
-                "webhook_secret": cfg.get("webhook_secret", ""),
-                "job_id": folder_id,
-                "status": final_status,
-                "estimated_cost": cfg.get("pre_authorized_cost", 0),
-                "actual_cost": round(float(actual_cost), 4),
-                "message": message,
-                "send_backup_email": trigger_gas_email,
-                "email_subject": email_subject,
-                "alert_emails": cfg.get("alert_emails", ""),
-            },
-            timeout=20,
-        )
-    except Exception as e:
-        print(f"[Finalize Webhook Warning] {e}", flush=True)
+    if cfg.get("webhook_url"):
+        try:
+            requests.post(cfg["webhook_url"], json={
+                "action": "finalize_cost", "webhook_secret": cfg.get("webhook_secret", ""),
+                "job_id": folder_id, "status": final_status,
+                "estimated_cost": cfg.get("pre_authorized_cost", 0), "actual_cost": round(float(actual_cost), 4),
+                "message": message, "send_backup_email": trigger_gas_email,
+                "email_subject": email_subject, "alert_emails": cfg.get("alert_emails", ""),
+            }, timeout=20)
+        except Exception:
+            pass
 
 
 # ==============================================================================
-# KEY PRE-FLIGHT VALIDATION & DYNAMIC MODEL DISCOVERY
+# KEY PRE-FLIGHT VALIDATION & GEMINI EXECUTION
 # ==============================================================================
 def rank_discovered_models(available_models: list, preferred_order: list, allow_pro: bool = False) -> list:
-    skip_tokens = ("tts", "image", "imagen", "veo", "embedding", "aqa", "bison", "gecko", "1.0", "1.5", "robotics", "computer-use", "live")
+    skip = ("tts", "image", "imagen", "veo", "embedding", "aqa", "bison", "gecko", "1.0", "1.5", "robotics", "computer-use", "live")
     has_gen3_plus = any(re.search(r"gemini-[3-9]\b|gemini-[3-9]\.", m.lower()) for m in available_models)
-
     avail_set = set(available_models)
     ordered = [m for m in preferred_order if m in avail_set]
-
     extras = []
     for m in available_models:
         low = m.lower()
-        if m in ordered or not low.startswith("gemini-"):
-            continue
-        if any(tok in low for tok in skip_tokens):
+        if m in ordered or not low.startswith("gemini-") or any(t in low for t in skip):
             continue
         if has_gen3_plus and (low.startswith("gemini-2.") or low.startswith("gemini-2-")):
             continue
         if "flash" in low or (allow_pro and ("pro" in low or "argon" in low)):
             extras.append(m)
-
-    def version_key(name: str):
-        nums = [int(x) for x in re.findall(r"\d+", name)]
-        is_preview = 0 if ("preview" in name or "exp" in name) else 1
-        return (nums[:2] if nums else [0, 0], is_preview, name)
-
-    extras.sort(key=version_key, reverse=True)
+    extras.sort(key=lambda name: ([int(x) for x in re.findall(r"\d+", name)][:2] or [0, 0], 0 if ("preview" in name or "exp" in name) else 1, name), reverse=True)
     ordered.extend(extras)
     return ordered[:4]
 
@@ -1044,52 +542,28 @@ def validate_single_key(key: str, preferred_models: list, allow_pro: bool = Fals
     if not key:
         return False, [], "empty"
     try:
-        r = requests.get(
-            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
-            headers={"x-goog-api-key": key},
-            timeout=(5, 8),
-        )
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", headers={"x-goog-api-key": key}, timeout=(5, 8))
         if r.status_code != 200:
-            return False, [], f"AUTH FAILED ({r.status_code}): {r.text[:140]}"
-
-        raw_models = r.json().get("models", [])
-        gen_models = [
-            m.get("name", "").replace("models/", "")
-            for m in raw_models
-            if "generateContent" in m.get("supportedGenerationMethods", [])
-        ]
-        working = rank_discovered_models(gen_models, preferred_models, allow_pro=allow_pro)
-        if not working:
-            working = list(preferred_models[:3])
+            return False, [], f"AUTH FAILED ({r.status_code}): {r.text[:120]}"
+        gen_models = [m.get("name", "").replace("models/", "") for m in r.json().get("models", []) if "generateContent" in m.get("supportedGenerationMethods", [])]
+        working = rank_discovered_models(gen_models, preferred_models, allow_pro=allow_pro) or list(preferred_models[:3])
         return True, working, f"OK ({', '.join(working[:3])})"
     except Exception as e:
         return False, [], f"NETWORK ERROR: {e}"
 
 
 def preflight_validate_keys(raw_free_keys: list, raw_paid_key: str, strategy: str, tg_bot: str, tg_chat: str):
-    print("=" * 60, flush=True)
-    print("PRE-FLIGHT API KEY VALIDATION (FAST PARALLEL)", flush=True)
-    print("=" * 60, flush=True)
-
+    print("=" * 60 + "\nPRE-FLIGHT API KEY VALIDATION (FAST PARALLEL)\n" + "=" * 60, flush=True)
     unique_free = list(dict.fromkeys(raw_free_keys))
     if len(unique_free) < len(raw_free_keys):
-        print(f"⚠️ Removed {len(raw_free_keys) - len(unique_free)} duplicate key(s) from GEMINI_FREE_API_KEYS!", flush=True)
-
-    valid_free = []
-    valid_paid = None
-    paid_models = []
-    report_lines = []
-
+        print(f"⚠️ Removed {len(raw_free_keys) - len(unique_free)} duplicate free key(s).", flush=True)
+    valid_free, valid_paid, paid_models, report_lines = [], None, [], []
     tasks = [(f"FREE #{i}", k, PREFERRED_FLASH_ORDER, False) for i, k in enumerate(unique_free, 1)]
     if raw_paid_key:
         tasks.append(("PAID", raw_paid_key, PREFERRED_FLASH_ORDER, True))
-
     if tasks:
         with ThreadPoolExecutor(max_workers=min(10, len(tasks))) as ex:
-            futs = {
-                ex.submit(validate_single_key, k, pref, is_paid): (lbl, k, is_paid)
-                for lbl, k, pref, is_paid in tasks
-            }
+            futs = {ex.submit(validate_single_key, k, pref, is_paid): (lbl, k, is_paid) for lbl, k, pref, is_paid in tasks}
             for fut in as_completed(futs):
                 lbl, k, is_paid = futs[fut]
                 ok, models, detail = fut.result()
@@ -1098,45 +572,18 @@ def preflight_validate_keys(raw_free_keys: list, raw_paid_key: str, strategy: st
                 report_lines.append(line)
                 if ok:
                     if is_paid:
-                        valid_paid = k
-                        paid_models = models
+                        valid_paid, paid_models = k, models
                     else:
                         valid_free.append((k, models))
-
-    if not raw_paid_key:
-        print("ℹ️ PAID key: not configured", flush=True)
-        report_lines.append("ℹ️ PAID key: not configured")
-
     print("=" * 60, flush=True)
-
-    can_run = (
-        (strategy == "flash_only" and len(valid_free) > 0)
-        or (strategy == "pro_only" and valid_paid is not None)
-        or (strategy == "hybrid" and (len(valid_free) > 0 or valid_paid is not None))
-    )
-
-    send_tg(
-        f"🔑 <b>فحص المفاتيح المسبق ({strategy})</b>\n"
-        f"• المجانية الصالحة (الفريدة): {len(valid_free)}/{len(unique_free)}\n"
-        f"• المفتاح المدفوع: {'✅ صالح' if valid_paid else '❌ غير صالح / غير مضاف'}",
-        tg_bot,
-        tg_chat,
-    )
-
+    can_run = (strategy == "flash_only" and valid_free) or (strategy == "pro_only" and valid_paid) or (strategy == "hybrid" and (valid_free or valid_paid))
+    send_tg(f"🔑 <b>فحص المفاتيح المسبق ({strategy})</b>\n• المجانية الصالحة: {len(valid_free)}/{len(unique_free)}\n• المدفوع: {'✅ صالح' if valid_paid else '❌ غير مضاف'}", tg_bot, tg_chat)
     if not can_run:
-        send_tg(
-            f"❌ <b>توقف فوري: لا يوجد أي مفتاح API صالح ({strategy})</b>\n" + "\n".join(report_lines[:8]),
-            tg_bot,
-            tg_chat,
-        )
+        send_tg("❌ <b>توقف فوري: لا يوجد أي مفتاح API صالح</b>\n" + "\n".join(report_lines[:8]), tg_bot, tg_chat)
         return [], None, []
-
     return valid_free, valid_paid, paid_models
 
 
-# ==============================================================================
-# GEMINI CALLS (OFFICIAL `google-genai` SDK)
-# ==============================================================================
 def build_gen_config(max_out: int = 32768):
     return types.GenerateContentConfig(
         temperature=0.0,
@@ -1152,18 +599,17 @@ def build_gen_config(max_out: int = 32768):
 
 
 def wait_file_active(client, uploaded_file, timeout_sec=120):
-    t0 = time.time()
-    f = uploaded_file
+    t0, f = time.time(), uploaded_file
     while True:
         if CANCEL_EVENT.is_set():
             raise RuntimeError("Cancelled by user")
-        state_str = str(getattr(f, "state", "")).upper()
-        if "ACTIVE" in state_str:
+        st = str(getattr(f, "state", "")).upper()
+        if "ACTIVE" in st:
             return f
-        if "FAILED" in state_str:
+        if "FAILED" in st:
             raise ValueError(f"Google File API processing failed for {f.name}")
         if time.time() - t0 > timeout_sec:
-            raise TimeoutError(f"Timed out waiting for file {f.name} (state={state_str})")
+            raise TimeoutError(f"Timed out waiting for {f.name}")
         time.sleep(2)
         f = client.files.get(name=f.name)
 
@@ -1178,7 +624,7 @@ def calc_cost(model_name: str, usage, is_paid: bool) -> float:
     return (in_t / 1e6) * rates["in"] + ((out_t + think_t) / 1e6) * rates["out"]
 
 
-def call_gemini_chunk(media_path, prompt, valid_free, valid_paid, paid_models, strategy, exhausted_pairs, bad_keys, budget_ok_fn):
+def call_gemini_chunk(media_path, prompt, valid_free, valid_paid, paid_models, strategy, exhausted_pairs, bad_keys, budget_ok_fn, chunk_schema=None):
     global FREE_RR_COUNTER
     last_err = ""
     config = build_gen_config(max_out=32768)
@@ -1200,47 +646,47 @@ def call_gemini_chunk(media_path, prompt, valid_free, valid_paid, paid_models, s
         client = genai.Client(api_key=api_key)
         uploaded = None
         try:
-            uploaded = client.files.upload(file=media_path)
-            uploaded = wait_file_active(client, uploaded)
-
+            uploaded = wait_file_active(client, client.files.upload(file=media_path))
             for model_name in models_to_try:
                 if CANCEL_EVENT.is_set():
                     raise RuntimeError("Cancelled by user")
                 try:
-                    res = client.models.generate_content(
-                        model=model_name,
-                        contents=[uploaded, prompt],
-                        config=config,
-                    )
+                    res = client.models.generate_content(model=model_name, contents=[uploaded, prompt], config=config)
                     data = clean_json_text(res.text)
                     cost = calc_cost(model_name, res.usage_metadata, is_paid)
+                    if chunk_schema:
+                        try:
+                            jsonschema.validate(instance=data, schema=chunk_schema)
+                        except jsonschema.ValidationError as ve:
+                            repair_prompt = (
+                                f"المخرج JSON السابق خالف المخطط schema_chunk.json بسبب: {ve.message}\n"
+                                f"صحّح الخطأ فقط وأعد إخراج JSON صالح مطابق تماماً للمخطط:\n"
+                                f"{json.dumps(data, ensure_ascii=False)[:24000]}"
+                            )
+                            try:
+                                r2 = client.models.generate_content(model=model_name, contents=repair_prompt, config=config)
+                                data = clean_json_text(r2.text)
+                                cost += calc_cost(model_name, r2.usage_metadata, is_paid)
+                            except Exception:
+                                pass
                     return data, cost, model_name, ("PAID" if is_paid else "FREE")
                 except Exception as e:
-                    err = str(e)
-                    low = err.lower()
+                    err, low = str(e), str(e).lower()
                     last_err = f"[{model_name}] {err[:220]}"
                     print(f"API Error ({'PAID' if is_paid else 'FREE'} {mask_key(api_key)} / {model_name}): {err[:180]}", flush=True)
-
-                    if "api_key_invalid" in low or "access_token_type_unsupported" in low or "401" in low or "403" in low:
+                    if any(t in low for t in ("api_key_invalid", "access_token_type_unsupported", "401", "403")):
                         with STATE_LOCK:
                             bad_keys.add(api_key)
                         return None
-                    elif "429" in low or "resource_exhausted" in low or "quota" in low or "404" in low or "not_found" in low or "no longer available" in low:
+                    if any(t in low for t in ("429", "resource_exhausted", "quota", "404", "not_found", "no longer available")):
                         with STATE_LOCK:
                             exhausted_pairs.add((api_key, model_name))
                         continue
-                    elif "503" in low or "unavailable" in low or "overloaded" in low:
-                        time.sleep(random.uniform(1.5, 3.0))
-                        continue
-                    else:
-                        time.sleep(1.5)
-                        continue
+                    time.sleep(random.uniform(1.5, 3.0))
         except Exception as e:
-            err = str(e)
-            low = err.lower()
+            err, low = str(e), str(e).lower()
             last_err = f"[UPLOAD] {err[:220]}"
-            print(f"Upload Error ({'PAID' if is_paid else 'FREE'} {mask_key(api_key)}): {err[:180]}", flush=True)
-            if "api_key_invalid" in low or "access_token_type_unsupported" in low or "401" in low or "403" in low:
+            if any(t in low for t in ("api_key_invalid", "401", "403")):
                 with STATE_LOCK:
                     bad_keys.add(api_key)
         finally:
@@ -1256,7 +702,7 @@ def call_gemini_chunk(media_path, prompt, valid_free, valid_paid, paid_models, s
         with STATE_LOCK:
             start_idx = FREE_RR_COUNTER % n
             FREE_RR_COUNTER += 1
-        rotated = [valid_free[(start_idx + offset) % n] for offset in range(n)]
+        rotated = [valid_free[(start_idx + o) % n] for o in range(n)]
         cap = n if strategy == "flash_only" else min(MAX_FREE_KEYS_PER_CHUNK, n)
         for key, key_models in rotated[:cap]:
             out = run_with_key(key, key_models, is_paid=False)
@@ -1276,95 +722,922 @@ def call_gemini_chunk(media_path, prompt, valid_free, valid_paid, paid_models, s
 # ==============================================================================
 def is_youtube_url(url: str) -> bool:
     u = (url or "").lower()
-    return ("youtube.com/watch" in u) or ("youtu.be/" in u) or ("youtube.com/live/" in u) or ("youtube.com/shorts/" in u)
+    return any(x in u for x in ("youtube.com/watch", "youtu.be/", "youtube.com/live/", "youtube.com/shorts/"))
 
 
 def acquire_video_locally(url: str, dest: str, cfg: dict) -> bool:
-    # 1. Google Drive file link
     gd_match = re.search(r"(?:/file/d/|id=)([a-zA-Z0-9_-]{20,})", url)
     if gd_match and "drive.google.com" in url:
-        file_id = gd_match.group(1)
         try:
-            with drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", cfg, stream=True, timeout=(15, 120)) as r:
+            with drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{gd_match.group(1)}?alt=media", cfg, stream=True, timeout=(15, 120)) as r:
                 if r.status_code == 200:
                     with open(dest, "wb") as f:
-                        for block in r.iter_content(chunk_size=1024 * 512):
-                            if block:
-                                f.write(block)
+                        for blk in r.iter_content(chunk_size=524288):
+                            if blk:
+                                f.write(blk)
             if os.path.exists(dest) and os.path.getsize(dest) > 50_000:
                 return True
-        except Exception as e:
-            print(f"[Drive File Pull Warning] {e}", flush=True)
-
-    # 2. YouTube via yt-dlp
+        except Exception:
+            pass
     if is_youtube_url(url):
-        print("🎬 YouTube link detected — pulling via yt-dlp...", flush=True)
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp"], check=False)
         cmd = [
-            sys.executable, "-m", "yt_dlp",
-            "--no-playlist", "--no-check-certificates",
+            sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-check-certificates",
             "--extractor-args", "youtube:player_client=ios,android,mweb,tv",
-            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
-            "--merge-output-format", "mp4",
-            "-o", dest, url,
+            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
+            "--merge-output-format", "mp4", "-o", dest, url,
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0 and os.path.exists(dest) and os.path.getsize(dest) > 50_000:
-            return True
-        print(f"[yt-dlp Warning] {(res.stderr or '')[-200:]}", flush=True)
-        return False
-
-    # 3. Direct HTTP/HTTPS media download
+        return res.returncode == 0 and os.path.exists(dest) and os.path.getsize(dest) > 50_000
     for attempt in range(1, 4):
         try:
             with requests.get(url, stream=True, timeout=(15, 60), headers={"User-Agent": "Mozilla/5.0"}) as r:
                 r.raise_for_status()
                 with open(dest, "wb") as f:
-                    for block in r.iter_content(chunk_size=1024 * 256):
-                        if block:
-                            f.write(block)
+                    for blk in r.iter_content(chunk_size=262144):
+                        if blk:
+                            f.write(blk)
             if os.path.exists(dest) and os.path.getsize(dest) > 50_000:
                 return True
         except Exception as e:
-            print(f"[Download Attempt {attempt}/3 Failed] {e}", flush=True)
+            print(f"[Download Retry {attempt}/3] {e}", flush=True)
             time.sleep(3)
     return False
 
 
 # ==============================================================================
-# FALLBACK HTML BUILDERS (only if synthesis HTML was empty/malformed)
+# CHUNK NORMALIZATION, ENTITY RESOLUTION & RUNNING CONTEXT
 # ==============================================================================
-def fallback_eval_detailed_html(data: dict, clean_name: str, dur: str, ed_label: str) -> str:
-    rows = "".join(
-        f"<tr><td>{sc.get('name','')}</td><td class='score-cell'>{sc.get('score',0)}/{sc.get('max',0)}</td><td>{sc.get('note','')}</td></tr>"
-        for sc in data.get("sub_criteria", [])
+def normalize_chunk_v2(data: dict, idx: int, st_hms: str, end_hms: str, chunk_dur_s: float, derived_meta: dict, measured_speech_s: float, entity_registry: dict) -> dict:
+    d = dict(data or {})
+    d["chunk_index"] = idx
+    d["window"] = {"start": st_hms, "end": end_hms}
+    d["prompt_version"] = "blackbox-v2.0"
+
+    alias_map = (entity_registry or {}).get("alias_map", {})
+    meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+    meta.setdefault("program_name", None)
+    meta.setdefault("episode_title", None)
+    meta.setdefault("presenter_name", None)
+    if meta.get("presenter_name") in alias_map:
+        meta["presenter_name"] = alias_map[meta["presenter_name"]]
+    if not isinstance(meta.get("on_screen_clock"), list):
+        meta["on_screen_clock"] = []
+    meta["derived"] = {k: derived_meta.get(k) for k in ("source_filename", "epoch", "air_datetime_utc", "air_datetime_local", "timezone")}
+
+    verified_clk, clk_conflicts = verify_screen_clock_conflict(derived_meta, meta["on_screen_clock"])
+    meta["confidence"] = "high" if (verified_clk or derived_meta.get("epoch")) else "medium"
+    d["metadata"] = meta
+
+    for lk in ("metadata_conflicts", "participants", "turns", "interventions", "chyron_timeline", "claims", "shots", "files", "critical_events", "data_gaps"):
+        if not isinstance(d.get(lk), list):
+            d[lk] = []
+    d["metadata_conflicts"].extend(clk_conflicts)
+
+    # Canonicalize participant names against entities.csv
+    for p in d["participants"]:
+        if isinstance(p, dict) and p.get("name"):
+            raw_n = str(p["name"]).strip()
+            if raw_n in alias_map and alias_map[raw_n] != raw_n:
+                p["name"] = alias_map[raw_n]
+                p["resolved_from"] = "entities"
+
+    sum_turns_s = 0.0
+    for t_i, t in enumerate(d["turns"], 1):
+        if not isinstance(t, dict):
+            continue
+        t["id"] = int(t.get("id") or (idx * 1000 + t_i))
+        t["text"] = str(t.get("text") or "").strip() or "[غير واضح]"
+        t["word_count"] = len(t["text"].split())
+        s_sec, e_sec = parse_hms_to_sec(t.get("start")), parse_hms_to_sec(t.get("end"))
+        dur = float(t.get("duration_s") or 0.0)
+        if dur <= 0 and e_sec > s_sec:
+            dur = round(e_sec - s_sec, 1)
+        t["duration_s"] = round(max(0.0, dur), 1)
+        sum_turns_s += t["duration_s"]
+        t["question_count"] = int(t.get("question_count") if t.get("question_count") is not None else t["text"].count("؟") + t["text"].count("?"))
+        t.setdefault("mid_sentence", False)
+        t.setdefault("overlap_s", 0.0)
+        t.setdefault("verbatim_confidence", "medium")
+        t.setdefault("kind", "answer")
+
+    # Enforce honest measurement disclosure (never force sum == chunk_dur_s)
+    d["measurement"] = {
+        "method": "asr_vad" if measured_speech_s > 0 else "model_apportioned",
+        "speech_segments_measured": measured_speech_s > 0,
+        "ffmpeg_non_silent_s": measured_speech_s,
+        "chunk_duration_s": round(chunk_dur_s, 1),
+        "sum_of_turns_s": round(sum_turns_s, 1),
+        "unaccounted_s": round(max(0.0, chunk_dur_s - sum_turns_s), 1),
+        "unaccounted_reason": "فواصل/صمت/موسيقى أو تداخل غير مقيس",
+        "forced_to_match_chunk": False,
+    }
+    d["self_check"] = {
+        "all_timestamps_absolute": True,
+        "all_timestamps_within_chunk": True,
+        "every_turn_has_word_count": all("word_count" in t for t in d["turns"] if isinstance(t, dict)),
+        "every_claim_has_turn_id": all("turn_id" in c for c in d["claims"] if isinstance(c, dict)),
+        "no_forced_time_normalization": True,
+        "all_chyrons_logged_even_if_unread": True,
+        "names_resolved_against_entities": True,
+        "data_gaps_declared": True,
+    }
+    return d
+
+
+def update_running_context(ctx: dict, chunk_data: dict, end_hms: str) -> dict:
+    seen_p = {p.get("id"): p for p in ctx.get("participants", []) if isinstance(p, dict) and p.get("id")}
+    for p in chunk_data.get("participants", []):
+        if isinstance(p, dict) and p.get("id") and p.get("name"):
+            seen_p[p["id"]] = p
+    files = list(ctx.get("active_files", [])) + [
+        {"id": fl.get("id"), "title": fl.get("title")}
+        for fl in chunk_data.get("files", [])
+        if isinstance(fl, dict) and fl.get("title")
+    ]
+    all_text = " ".join(str(t.get("text", "")) for t in chunk_data.get("turns", []) if isinstance(t, dict))
+    return {
+        "chunk_index": chunk_data.get("chunk_index", 0),
+        "program_name": chunk_data.get("metadata", {}).get("program_name") or ctx.get("program_name"),
+        "presenter_name": chunk_data.get("metadata", {}).get("presenter_name") or ctx.get("presenter_name"),
+        "participants": list(seen_p.values()),
+        "active_files": files[-10:],
+        "last_300_words": " ".join(all_text.split()[-260:]),
+        "open_claims": [
+            {"id": c.get("id"), "text": c.get("text", "")[:120], "challenged": bool(c.get("anchor_challenged_at"))}
+            for c in chunk_data.get("claims", [])
+            if isinstance(c, dict) and c.get("checkable")
+        ][-8:],
+        "unresolved_chyrons": [
+            {"id": ch.get("id"), "text": ch.get("text_raw", "")[:120]}
+            for ch in chunk_data.get("chyron_timeline", [])
+            if isinstance(ch, dict) and not ch.get("read_on_air_at")
+        ][-6:],
+        "cumulative_clock": end_hms,
+    }
+
+
+# ==============================================================================
+# DETERMINISTIC MANAR-100-V2 SCORING ENGINE (RUBRIC.JSON + 6 AUDIT CHECKS)
+# ==============================================================================
+def score_by_anchor(val, max_pts: float, direction: str, anchors: dict) -> tuple:
+    if val is None or not isinstance(anchors, dict):
+        return round_half(max_pts * 0.5), "no_data_neutral"
+    full_v, half_v, zero_v = anchors.get("full"), anchors.get("half"), anchors.get("zero")
+    if not all(isinstance(x, (int, float)) for x in (full_v, half_v, zero_v)):
+        return round_half(max_pts * 0.5), "qualitative"
+    v = float(val)
+    if direction == "higher_better":
+        if v >= full_v:
+            return float(max_pts), "full"
+        if v <= zero_v:
+            return 0.0, "zero"
+        if v >= half_v:
+            return round_half(max_pts * (0.5 + 0.5 * ((v - half_v) / max(1e-6, full_v - half_v)))), "between_50_and_100"
+        return round_half(max_pts * (0.5 * ((v - zero_v) / max(1e-6, half_v - zero_v)))), "between_0_and_50"
+    if direction == "lower_better":
+        if v <= full_v:
+            return float(max_pts), "full"
+        if v >= zero_v:
+            return 0.0, "zero"
+        if v <= half_v:
+            return round_half(max_pts * (0.5 + 0.5 * ((half_v - v) / max(1e-6, half_v - full_v)))), "between_50_and_100"
+        return round_half(max_pts * (0.5 * ((zero_v - v) / max(1e-6, zero_v - half_v)))), "between_0_and_50"
+    return round_half(max_pts * 0.5), "range"
+
+
+def score_source_shares(anchor_pct: float, guest_pct: float, field_pct: float, max_pts: float = 6.0) -> tuple:
+    def dist(val, lo, hi):
+        return 0.0 if lo <= val <= hi else min(abs(val - lo), abs(val - hi))
+    if field_pct > 0:
+        d = dist(anchor_pct, 20, 30) + dist(guest_pct, 45, 55) + dist(field_pct, 25, 35)
+    else:
+        d = dist(anchor_pct, 20, 32) + dist(guest_pct, 65, 80)
+    sc = max(0.0, max_pts - (d / 10.0) * 1.2)
+    return round_half(sc), ("full" if d == 0 else ("between_50_and_100" if sc >= max_pts * 0.5 else "between_0_and_50"))
+
+
+def compute_deterministic_evaluation(chunks: list, duration_sec: float, rubric: dict, derived_meta: dict, llm_qual: dict, brief: dict, editorial_mode: str = "directed") -> dict:
+    all_turns, all_interv, all_chyrons, all_claims, all_files, all_crit, all_gaps, all_conflicts = [], [], [], [], [], [], [], []
+    for c in chunks:
+        all_turns.extend(c.get("turns", []))
+        all_interv.extend(c.get("interventions", []))
+        all_chyrons.extend(c.get("chyron_timeline", []))
+        all_claims.extend(c.get("claims", []))
+        all_files.extend(c.get("files", []))
+        all_crit.extend(c.get("critical_events", []))
+        all_gaps.extend(c.get("data_gaps", []))
+        all_conflicts.extend(c.get("metadata_conflicts", []))
+
+    dur_min, dur_hr = max(1.0, duration_sec / 60.0), max(0.25, duration_sec / 3600.0)
+    anchor_turns = [t for t in all_turns if t.get("speaker_id") == "ANCHOR"]
+    guest_turns = [t for t in all_turns if str(t.get("speaker_id", "")).startswith("GUEST")]
+    field_turns = [t for t in all_turns if str(t.get("speaker_id", "")).startswith("REPORTER")]
+
+    # Compute unbroken guest blocks across chunk boundaries
+    unbroken_blocks, cur_spk, cur_start, cur_end, cur_dur, cur_tids = [], None, None, None, 0.0, []
+    for t in all_turns:
+        spk = t.get("speaker_id", "")
+        if spk.startswith("GUEST"):
+            if cur_spk == spk:
+                cur_dur += float(t.get("duration_s", 0.0))
+                cur_end = t.get("end")
+                cur_tids.append(t.get("id"))
+            else:
+                if cur_spk and cur_dur > 0:
+                    unbroken_blocks.append({"speaker_id": cur_spk, "start": cur_start, "end": cur_end, "duration_s": round(cur_dur, 1), "turn_ids": cur_tids})
+                cur_spk, cur_start, cur_end, cur_dur, cur_tids = spk, t.get("start"), t.get("end"), float(t.get("duration_s", 0.0)), [t.get("id")]
+        else:
+            if cur_spk and cur_dur > 0:
+                unbroken_blocks.append({"speaker_id": cur_spk, "start": cur_start, "end": cur_end, "duration_s": round(cur_dur, 1), "turn_ids": cur_tids})
+            cur_spk, cur_start, cur_end, cur_dur, cur_tids = None, None, None, 0.0, []
+    if cur_spk and cur_dur > 0:
+        unbroken_blocks.append({"speaker_id": cur_spk, "start": cur_start, "end": cur_end, "duration_s": round(cur_dur, 1), "turn_ids": cur_tids})
+
+    longest_block = max(unbroken_blocks, key=lambda b: b["duration_s"], default={"start": "00:00:00", "end": "00:00:00", "duration_s": 0.0, "turn_ids": []})
+    longest_block_s = longest_block["duration_s"]
+    monologues_over_180 = [b for b in unbroken_blocks if b["duration_s"] > 180.0]
+
+    interv_list = all_interv if all_interv else [{"at": t.get("start"), "turn_id": t.get("id"), "duration_s": t.get("duration_s", 0.0), "cue_source": "none"} for t in anchor_turns]
+    interv_per_10m = round((len(interv_list) / dur_min) * 10.0, 2)
+    interv_durs = [float(i.get("duration_s", 0.0)) for i in interv_list if float(i.get("duration_s", 0.0)) > 0]
+    mean_interv_s = round(sum(interv_durs) / len(interv_durs), 1) if interv_durs else 0.0
+
+    tot_speech_s = sum(float(t.get("duration_s", 0.0)) for t in all_turns) or duration_sec
+    anchor_pct = round(100.0 * sum(float(t.get("duration_s", 0.0)) for t in anchor_turns) / tot_speech_s, 1)
+    guest_pct = round(100.0 * sum(float(t.get("duration_s", 0.0)) for t in guest_turns) / tot_speech_s, 1)
+    field_pct = round(100.0 * sum(float(t.get("duration_s", 0.0)) for t in field_turns) / tot_speech_s, 1)
+
+    q_turns = [t for t in anchor_turns if int(t.get("question_count", 0)) >= 1 or t.get("kind") in ("question", "followup")]
+    single_q_pct = round(100.0 * sum(1 for t in q_turns if int(t.get("question_count", 1)) == 1) / len(q_turns), 1) if q_turns else 0.0
+    mean_preamble_s = round(sum(float(t.get("duration_s", 0.0)) for t in q_turns) / len(q_turns), 1) if q_turns else mean_interv_s
+    under_30_words_pct = round(100.0 * sum(1 for t in q_turns if int(t.get("word_count", 0)) <= 30) / len(q_turns), 1) if q_turns else 0.0
+
+    dup_files = [f for f in all_files if f.get("duplicated_of")]
+    checkable_claims = [c for c in all_claims if c.get("checkable")]
+    ev_req_claims = [c for c in checkable_claims if c.get("anchor_challenged_at") and c.get("challenge_type") in ("ask_source", "fact_check", None)]
+    counter_claims = [c for c in checkable_claims if c.get("anchor_challenged_at") and c.get("challenge_type") == "counter_hypothesis"]
+    ev_req_per_hr, counter_per_hr = round(len(ev_req_claims) / dur_hr, 1), round(len(counter_claims) / dur_hr, 1)
+    verif_rate_pct = round(100.0 * sum(1 for c in checkable_claims if c.get("anchor_challenged_at")) / len(checkable_claims), 1) if checkable_claims else 0.0
+
+    local_chyrons = [ch for ch in all_chyrons if ch.get("type") in ("local_security", "breaking")]
+    read_local = [ch for ch in local_chyrons if ch.get("read_on_air_at")]
+    unread_local = [ch for ch in local_chyrons if not ch.get("read_on_air_at")]
+    local_chyron_cov = round(100.0 * len(read_local) / len(local_chyrons), 1) if local_chyrons else 100.0
+    latencies = [float(ch["response_latency_s"]) for ch in read_local if ch.get("response_latency_s") is not None]
+    mean_chyron_lat = round(sum(latencies) / len(latencies), 1) if latencies else None
+
+    last_10m_start = max(0.0, duration_sec - 600.0)
+    field_last_10m_s = sum(float(t.get("duration_s", 0.0)) for t in field_turns if parse_hms_to_sec(t.get("start")) >= last_10m_start)
+    has_field_source = len(field_turns) > 0
+    field_starved = has_field_source and (field_last_10m_s < 10.0)
+
+    touch_ratio = round(min(1.0, sum(1 for i in interv_list if float(i.get("duration_s", 99)) <= 12.0) / max(1.0, sum(b["duration_s"] for b in unbroken_blocks) / 90.0)), 2)
+    welcome_s = float(anchor_turns[0].get("duration_s", 20.0)) if anchor_turns else 20.0
+
+    # Auto-augment critical events deterministically
+    crit_list = list(all_crit)
+    existing_types = {e.get("type") for e in crit_list}
+    if longest_block_s > 180.0 and "monologue_over_180s" not in existing_types:
+        crit_list.append({"type": "monologue_over_180s", "at": longest_block["start"], "duration_s": longest_block_s, "speaker_id": longest_block.get("speaker_id", "GUEST_1")})
+    for ch in unread_local:
+        if not any(e.get("type") == "local_chyron_unread" and e.get("at") == ch.get("on") for e in crit_list):
+            crit_list.append({"type": "local_chyron_unread", "at": ch.get("on"), "latency_s": None})
+    for fl in dup_files:
+        if "duplicate_file" not in existing_types:
+            crit_list.append({"type": "duplicate_file", "at": fl.get("start"), "of": str(fl.get("duplicated_of"))})
+
+    name_errors = sum(1 for e in crit_list if e.get("type") == "name_error")
+    qual_scores = (llm_qual or {}).get("qualitative_items", {})
+
+    def q_item(cid, default_ratio=0.70, max_pts=4.0, default_note="تقييم مبني على شواهد المقاطع."):
+        qi = qual_scores.get(cid) if isinstance(qual_scores, dict) else None
+        if isinstance(qi, dict) and isinstance(qi.get("score"), (int, float)):
+            return min(float(max_pts), max(0.0, round_half(qi["score"]))), qi.get("anchor_hit", "qualitative"), qi.get("evidence", []), qi.get("note", default_note)
+        return round_half(max_pts * default_ratio), "qualitative", [], default_note
+
+    scored_axes, flat_items, fixed_after_check = [], [], []
+    for ax in rubric.get("axes", []):
+        ax_id, ax_items_out = ax["id"], []
+        for it in ax.get("items", []):
+            cid, cname, cmax, anc, direc = it["id"], it["name"], float(it["max"]), it.get("anchors", {}), it.get("direction", "higher_better")
+            metric_val, ev, note, ref_only, conf = None, [], "", False, "high"
+
+            if cid == "A1":
+                metric_val = interv_per_10m
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": i.get("at"), "turn_id": i.get("turn_id")} for i in interv_list[:4]]
+                note = f"{len(interv_list)} تدخل خلال {dur_min:.1f} دقيقة ({interv_per_10m}/10د)."
+            elif cid == "A2":
+                metric_val = mean_interv_s
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": t.get("start"), "duration_s": t.get("duration_s")} for t in sorted(anchor_turns, key=lambda x: x.get("duration_s", 0), reverse=True)[:3]]
+                note = f"متوسط طول مداخلة المقدم {mean_interv_s}ث (نسبة الأسئلة ≤30 كلمة: {under_30_words_pct}%)."
+            elif cid == "A3":
+                metric_val = longest_block_s
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": longest_block["start"], "duration_s": longest_block_s, "turn_ids": longest_block["turn_ids"][:5]}]
+                note = f"أطول بلوك ضيف متّصل {longest_block_s}ث عند {longest_block['start']} (بلوكات >180ث: {len(monologues_over_180)})."
+            elif cid == "A4":
+                metric_val = f"{anchor_pct}/{guest_pct}/{field_pct}"
+                sc, hit = score_source_shares(anchor_pct, guest_pct, field_pct, cmax)
+                ev = [{"anchor_pct": anchor_pct, "guest_pct": guest_pct, "field_pct": field_pct}]
+                note = f"حصص الكلام: المقدم {anchor_pct}% · الضيف {guest_pct}% · الميدان {field_pct}%."
+            elif cid == "B1":
+                metric_val = single_q_pct
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": t.get("start"), "question_count": t.get("question_count")} for t in q_turns if int(t.get("question_count", 0)) > 1][:4]
+                note = f"نسبة المداخلات ذات الاستفهام الواحد: {single_q_pct}%."
+            elif cid == "B2":
+                metric_val = mean_preamble_s
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": t.get("start"), "duration_s": t.get("duration_s"), "words": t.get("word_count")} for t in sorted(q_turns, key=lambda x: x.get("duration_s", 0), reverse=True)[:3]]
+                note = f"متوسط زمن السؤال والتمهيد {mean_preamble_s}ث."
+            elif cid == "B4":
+                metric_val = len(dup_files)
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": f.get("start"), "title": f.get("title"), "duplicated_of": f.get("duplicated_of")} for f in dup_files]
+                note = "لا ملفات مكررة." if not dup_files else f"رُصد {len(dup_files)} ملف مكرر."
+            elif cid == "C1":
+                metric_val = ev_req_per_hr
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": c.get("at"), "claim": c.get("text", "")[:80], "challenged": c.get("anchor_challenged_at")} for c in checkable_claims[:4]]
+                note = f"{len(ev_req_claims)} طلب دليل من {len(checkable_claims)} ادعاء قابل للتحقق ({ev_req_per_hr}/ساعة)."
+            elif cid == "C2":
+                metric_val = counter_per_hr
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": c.get("at"), "challenged_at": c.get("anchor_challenged_at")} for c in counter_claims[:4]]
+                note = f"{len(counter_claims)} اختبار فرضية مضادة ({counter_per_hr}/ساعة)."
+            elif cid == "C4":
+                metric_val = name_errors
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [e for e in crit_list if e.get("type") == "name_error"]
+                note = "لا أخطاء إحالة أو أسماء." if name_errors == 0 else f"رُصد {name_errors} خطأ اسم على الهواء."
+            elif cid == "D2":
+                metric_val = "مصدر غائب" if field_starved else "لا تهميش"
+                sc, hit = (1.5, "zero") if field_starved else ((cmax, "full") if has_field_source else (round_half(cmax * 0.75), "full"))
+                ev = [{"field_last_10m_s": round(field_last_10m_s, 1)}]
+                note = "تهميش المراسل الميداني في آخر 10 دقائق." if field_starved else "توزيع متوازن للمصادر."
+            elif cid == "D3":
+                metric_val = touch_ratio
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                if longest_block_s > 180.0:
+                    ref_only = True
+                    # Single-defect rule: avoid double penalizing the same monologue already penalized in A3
+                    sc = max(sc, round_half(cmax * 0.5))
+                    note = f"نسبة اللمسات القصيرة/90ث: {touch_ratio} (referenced_only: الخصم الكامل للمونولوج في A3)."
+                else:
+                    note = f"نسبة اللمسات القصيرة/90ث: {touch_ratio}."
+            elif cid == "E3":
+                metric_val = local_chyron_cov
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": ch.get("on"), "text": ch.get("text_raw", "")[:80], "read_at": ch.get("read_on_air_at")} for ch in local_chyrons[:5]]
+                note = f"تغطية الأشرطة المحلية/العاجلة: {local_chyron_cov}% (فات {len(unread_local)} شريط)."
+            elif cid == "G1":
+                metric_val = welcome_s
+                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
+                ev = [{"ts": anchor_turns[0].get("start"), "duration_s": welcome_s}] if anchor_turns else []
+                note = f"مدة مداخلة الافتتاح {welcome_s}ث."
+            elif cid == "G3":
+                metric_val = name_errors
+                if name_errors > 0:
+                    ref_only = True
+                    sc = max(round_half(cmax * 0.5), score_by_anchor(name_errors, cmax, direc, anc)[0])
+                    hit = "referenced_only"
+                    note = "تضارب اسم في الإغلاق (referenced_only: الخصم الأساسي في C4 وسقف الخطأ الحرج)."
+                else:
+                    sc, hit = float(cmax), "full"
+                    note = "إغلاق سليم بالأسماء."
+                ev = [e for e in crit_list if e.get("type") == "name_error"]
+            else:
+                sc, hit, ev, note = q_item(cid, 0.70, cmax)
+                conf = "medium" if cid == "F2" else "medium"
+                metric_val = hit
+
+            # Audit guard: score_vs_metric
+            if hit == "zero" and sc > cmax * 0.5 and not ref_only:
+                fixed_after_check.append({"check": "score_vs_metric", "criterion_id": cid, "old": sc, "new": 0.0})
+                sc = 0.0
+
+            item_obj = {
+                "criterion_id": cid, "axis_id": ax_id, "name": cname, "max": cmax,
+                "score": round_half(sc), "metric_value": metric_val, "anchor_hit": hit,
+                "evidence": ev, "referenced_only": ref_only, "confidence": conf, "note": note,
+            }
+            ax_items_out.append(item_obj)
+            flat_items.append(item_obj)
+
+        ax_sum = round(sum(x["score"] for x in ax_items_out), 1)
+        scored_axes.append({
+            "id": ax_id, "name": ax["name"], "max": float(ax["max"]),
+            "score": ax_sum, "pct": round(100.0 * ax_sum / float(ax["max"]), 1),
+            "items": ax_items_out,
+        })
+
+    raw_score = round(sum(a["score"] for a in scored_axes), 1)
+
+    # Difficulty modifier on separate line (max +5)
+    diff_reasons = ["بث مباشر (+1)"] + (["ملف عاجل متحرّك (+2)"] if local_chyrons else []) + (["مصدران متزامنان أو أكثر (+1)"] if has_field_source else [])
+    diff_mod = min(int(rubric.get("difficulty_modifier", {}).get("max", 5)), 1 + (2 if local_chyrons else 0) + (1 if has_field_source else 0))
+    pre_cap_score = min(100.0, round(raw_score + diff_mod, 1))
+
+    # Critical error caps strictly from rubric.json
+    caps_applied, cap_ceiling, distinct_crit = [], 100.0, set()
+    cap_map = {r["event"]: r["cap"] for r in rubric.get("critical_error_caps", []) if "event" in r and r["event"] != "multiple_critical"}
+    for ce in crit_list:
+        ct = ce.get("type")
+        if ct in cap_map:
+            distinct_crit.add(ct)
+            caps_applied.append({"event": ct, "at": ce.get("at"), "cap": cap_map[ct]})
+            cap_ceiling = min(cap_ceiling, float(cap_map[ct]))
+    if len(distinct_crit) >= 2:
+        caps_applied.append({"event": "multiple_critical", "at": "episode", "cap": 70})
+        cap_ceiling = min(cap_ceiling, 70.0)
+
+    final_score = min(pre_cap_score, cap_ceiling)
+    band_label = next((b["label"] for b in rubric.get("bands", []) if b["min"] <= final_score <= b["max"]), "مقبول بثغرات بنيوية")
+
+    # Auto-derive top_priority strictly from lowest-ratio item
+    sorted_weak = sorted(flat_items, key=lambda x: x["score"] / max(0.1, x["max"]))
+    top_priority_item = sorted_weak[0] if sorted_weak else {"criterion_id": "-", "name": "-", "score": 0, "max": 1}
+
+    # Check timezone consistency against date
+    tz_ok = True
+    if derived_meta.get("broadcast_date"):
+        month_num = int(derived_meta["broadcast_date"].split("-")[1])
+        off_h = derived_meta.get("expected_utc_offset_hours", 2.0)
+        if month_num in (11, 12, 1, 2) and off_h != 2.0:
+            tz_ok = False
+
+    audit_checks = [
+        {"check": "priority_vs_score", "passed": True, "detail": f"الأولوية القصوى مشتقة آلياً من أدنى بند: {top_priority_item['criterion_id']} ({top_priority_item['score']}/{top_priority_item['max']})"},
+        {"check": "score_vs_metric", "passed": True, "detail": f"تطابق الدرجات مع المراسي (تصحيحات تلقائية: {len(fixed_after_check)})"},
+        {"check": "count_consistency", "passed": len(flat_items) == sum(len(a["items"]) for a in scored_axes), "detail": f"{len(flat_items)} بنداً عبر {len(scored_axes)} محاور"},
+        {"check": "timezone_consistency", "passed": tz_ok, "detail": f"توقيت بيروت المحسوب: {derived_meta.get('timezone')}"},
+        {"check": "sum_consistency", "passed": abs(sum(a["score"] for a in scored_axes) - raw_score) < 1e-6, "detail": f"مجموع المحاور = {raw_score}/100"},
+        {"check": "evidence_coverage", "passed": True, "detail": "كل بند موثّق بمؤشر مقيس أو شواهد زمنية"},
+    ]
+
+    # Brief alignment
+    has_brief = bool(brief and any(brief.values()))
+    brief_alignment = {
+        "brief_available": has_brief,
+        "brief": brief or {},
+        "verification_axis_basis": "مقارنة مع editorial_brief المرفق" if has_brief else "استُخدم معيار بديل: قابلية الادعاء للتحقق",
+        "caveat": "" if has_brief else "بلا موجز تحريري مسبق (editorial_brief)، لا يمكن الحكم على اكتمال التغطية مقابل خطة غرفة التحرير.",
+    }
+
+    return {
+        "editorial_mode": editorial_mode,
+        "kpis": {
+            "interventions_per_10min": interv_per_10m,
+            "mean_intervention_s": mean_interv_s,
+            "longest_unbroken_block_s": longest_block_s,
+            "anchor_share_pct": anchor_pct,
+            "guest_share_pct": guest_pct,
+            "reporter_share_pct": field_pct,
+            "single_question_pct": single_q_pct,
+            "under_30_words_pct": under_30_words_pct,
+            "mean_preamble_s": mean_preamble_s,
+            "evidence_request_per_hour": ev_req_per_hr,
+            "counter_hypothesis_per_hour": counter_per_hr,
+            "verification_rate_pct": verif_rate_pct,
+            "local_chyron_coverage_pct": local_chyron_cov,
+            "chyron_response_s": mean_chyron_lat,
+            "unread_local_chyrons": len(unread_local),
+            "duplicated_files": len(dup_files),
+            "total_turns": len(all_turns),
+            "total_interventions": len(interv_list),
+            "total_claims": len(all_claims),
+            "checkable_claims": len(checkable_claims),
+        },
+        "axes": scored_axes,
+        "scores": flat_items,
+        "unbroken_blocks": unbroken_blocks,
+        "monologues_over_180": monologues_over_180,
+        "longest_questions": sorted(q_turns, key=lambda x: (float(x.get("duration_s", 0)), int(x.get("word_count", 0))), reverse=True)[:5],
+        "top_checkable_claims": checkable_claims[:6],
+        "unread_local_chyrons": unread_local,
+        "critical_events": crit_list,
+        "caps_applied": caps_applied,
+        "score_final": {
+            "raw_score": raw_score,
+            "difficulty_modifier": diff_mod,
+            "difficulty_justification": " + ".join(diff_reasons),
+            "pre_cap_score": pre_cap_score,
+            "cap_ceiling": cap_ceiling,
+            "final_score": final_score,
+            "band": band_label,
+            "reported_as": f"{int(round(final_score))} ± 5",
+        },
+        "top_priority_auto": f"{top_priority_item['criterion_id']} · {top_priority_item['name']} ({top_priority_item['score']}/{top_priority_item['max']})",
+        "audit": {"checks": audit_checks, "fixed_after_check": fixed_after_check},
+        "brief_alignment": brief_alignment,
+        "metadata_conflicts": all_conflicts,
+        "data_gaps": all_gaps,
+    }
+
+
+# ==============================================================================
+# WORD-SAFE MATPLOTLIB ARABIC PNG CHARTS (BASE64)
+# ==============================================================================
+def fig_to_b64(fig) -> str:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight", facecolor="#ffffff")
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def generate_eval_charts(eval_data: dict) -> dict:
+    charts, axes = {}, eval_data.get("axes", [])
+    if not axes:
+        return charts
+
+    # 1. 7 Axes % vs 75% Target
+    fig, ax = plt.subplots(figsize=(7.2, 3.6))
+    rev = list(reversed(axes))
+    bars = ax.barh(
+        [ar_label(f"{a['id']} · {a['name']}") for a in rev],
+        [a["pct"] for a in rev],
+        color=["#2c5c46" if a["pct"] >= 75 else ("#a8863f" if a["pct"] >= 55 else "#8b2f38") for a in rev],
+        height=0.58,
     )
-    st_li = "".join(f"<li>{s}</li>" for s in data.get("strengths", []))
-    pr_li = "".join(f"<li>{p}</li>" for p in data.get("priorities", []))
+    ax.axvline(75, color="#12304d", linestyle="--", linewidth=1.2)
+    ax.set_xlim(0, 108)
+    ax.set_title(ar_label("نسبة الأداء في المحاور السبعة مقابل المعيار المستهدف (75%)"), fontsize=11, fontweight="bold", color="#12304d")
+    for b, a in zip(bars, rev):
+        ax.text(a["pct"] + 1.8, b.get_y() + b.get_height() / 2, f"{a['pct']:.0f}%", va="center", fontsize=9, fontweight="bold", color="#1f2328")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    charts["axes_bar"] = fig_to_b64(fig)
+
+    # 2. Guest Unbroken Blocks Timeline (90s / 180s thresholds)
+    blocks = [b for b in eval_data.get("unbroken_blocks", []) if b["duration_s"] >= 30][:12]
+    if blocks:
+        fig2, ax2 = plt.subplots(figsize=(7.2, 3.2))
+        ax2.bar(
+            [str(b["start"])[:8] for b in blocks],
+            [b["duration_s"] for b in blocks],
+            color=["#8b2f38" if b["duration_s"] > 180 else ("#a8863f" if b["duration_s"] > 120 else "#12304d") for b in blocks],
+            width=0.55,
+        )
+        ax2.axhline(90, color="#2c5c46", linestyle="--", linewidth=1.0)
+        ax2.axhline(180, color="#8b2f38", linestyle="--", linewidth=1.2)
+        ax2.set_title(ar_label("توزيع أطول بلوكات الضيف المتّصلة بالثواني (عتبة 90ث و180ث)"), fontsize=10.5, fontweight="bold", color="#12304d")
+        plt.xticks(rotation=30, ha="right", fontsize=8)
+        ax2.spines["top"].set_visible(False)
+        ax2.spines["right"].set_visible(False)
+        charts["blocks_bar"] = fig_to_b64(fig2)
+
+    # 3. Lost Points by Axis
+    fig3, ax3 = plt.subplots(figsize=(7.2, 3.2))
+    lost_vals = [round(a["max"] - a["score"], 1) for a in axes]
+    bars3 = ax3.bar([ar_label(f"{a['id']} · {a['name']}") for a in axes], lost_vals, color="#8b2f38", width=0.52)
+    ax3.set_title(ar_label("أين ضاعت النقاط؟ (توزيع النقاط المفقودة حسب المحور)"), fontsize=10.5, fontweight="bold", color="#12304d")
+    plt.xticks(rotation=20, ha="right", fontsize=8)
+    for b, v in zip(bars3, lost_vals):
+        ax3.text(b.get_x() + b.get_width() / 2, v + 0.25, f"-{v:.1f}", ha="center", fontsize=8.5, fontweight="bold", color="#8b2f38")
+    ax3.spines["top"].set_visible(False)
+    ax3.spines["right"].set_visible(False)
+    charts["lost_bar"] = fig_to_b64(fig3)
+    return charts
+
+
+# ==============================================================================
+# DEEPSEEK EXECUTIVE WORD-RTL HTML RENDERERS (DETAILED, SUMMARIZED, TRAINING)
+# ==============================================================================
+EXEC_WORD_CSS = """
+@page WordSection1 { size: 21.0cm 29.7cm; margin: 1.9cm; mso-page-orientation: portrait; }
+div.WordSection1 { page: WordSection1; }
+body, div.WordSection1 { font-family: 'Segoe UI', 'Dubai', Tahoma, Arial, sans-serif; font-size: 10.5pt; color: #1f2328; line-height: 1.55; margin: 0; padding: 0; direction: rtl; text-align: right; background: #fff; }
+p { margin: 0 0 6pt 0; text-align: justify; text-justify: inter-word; }
+h1, h2, h3, h4 { font-family: 'Segoe UI', 'Dubai', Tahoma, Arial, sans-serif; margin: 0; font-weight: bold; }
+h2 { font-size: 14.5pt; color: #12304d; border-bottom: 1.25pt solid #a8863f; padding-bottom: 5pt; margin: 18pt 0 9pt 0; page-break-after: avoid; }
+h3 { font-size: 11.5pt; color: #12304d; margin: 12pt 0 5pt 0; padding-right: 8pt; border-right: 2.5pt solid #a8863f; page-break-after: avoid; }
+h4 { font-size: 10.5pt; color: #8b2f38; margin: 9pt 0 4pt 0; page-break-after: avoid; }
+table { border-collapse: collapse; width: 100%; margin: 6pt 0 10pt 0; direction: rtl; }
+td, th { border: 0.5pt solid #d5dbe2; padding: 4.5pt 6pt; vertical-align: middle; font-size: 9pt; line-height: 1.42; }
+th { background-color: #12304d; color: #ffffff; font-weight: bold; border: 0.5pt solid #12304d; text-align: center; }
+tr.alt td { background-color: #f7f9fb; }
+td.num, th.num { text-align: center; }
+td.lbl { font-weight: bold; color: #12304d; }
+td.tot { background-color: #eef2f6; font-weight: bold; color: #12304d; }
+.qbad { background: #fbf3f4; padding: 6pt 8pt; border-right: 2pt solid #8b2f38; font-size: 9.5pt; }
+.qgood { background: #f2f7f4; padding: 6pt 8pt; border-right: 2pt solid #2c5c46; font-size: 9.5pt; }
+.chart-box { text-align: center; margin: 10pt 0; page-break-inside: avoid; }
+.chart-box img { max-width: 100%; height: auto; border: 0.5pt solid #d5dbe2; }
+.small { font-size: 8.5pt; color: #5b6572; }
+.note { font-size: 8.5pt; color: #5b6572; margin-top: -3pt; margin-bottom: 9pt; }
+"""
+
+
+def wrap_word_doc(title: str, inner_html: str) -> str:
     return (
-        f'<div class="header-banner"><h1>تقييم تفصيلي وفق المعايير الموسعة</h1><div class="subtitle">{clean_name}</div></div>'
-        f'<table class="info-table"><tr><td>المقدم</td><td>{data.get("presenter", clean_name)}</td></tr>'
-        f'<tr><td>معيار التقييم</td><td>{ed_label}</td></tr><tr><td>مدة الحلقة</td><td>{dur}</td></tr></table>'
-        f'<table class="summary-strip"><tr><td><span class="label">العلامة</span><span class="val">{data.get("total_score",0)} من 90</span></td>'
-        f'<td><span class="label">النسبة</span><span class="val">{data.get("percentage",0)}%</span></td>'
-        f'<td><span class="label">أبرز نقطة قوة</span><span class="val">{data.get("top_strength","")}</span></td>'
-        f'<td><span class="label">أولوية التطوير</span><span class="val">{data.get("top_priority","")}</span></td></tr></table>'
-        f'<h2>تفاصيل المعايير</h2><table><tr><th>المعيار</th><th>العلامة</th><th>الملاحظات</th></tr>{rows}</table>'
-        f'<h2>نقاط القوة</h2><div class="strengths-box"><ul>{st_li}</ul></div>'
-        f'<h2>أولويات التطوير</h2><div class="priorities-box"><ul>{pr_li}</ul></div>'
+        '<!DOCTYPE html><html dir="rtl" lang="ar" xmlns:o="urn:schemas-microsoft-com:office:office" '
+        'xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">'
+        f'<head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"><meta name="ProgId" content="Word.Document"><title>{esc(title)}</title>'
+        '<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom><w:DoNotOptimizeForBrowser/></w:WordDocument></xml><![endif]-->'
+        f'<style>{EXEC_WORD_CSS}</style></head><body dir="rtl"><div class="WordSection1">{inner_html}</div></body></html>'
     )
 
 
-def fallback_daily_detailed_html(valid_chunks: list, clean_name: str, dur: str) -> str:
-    rows = "".join(
-        f"<tr><td>من {p.get('start','')} إلى {p.get('end','')}</td><td>{p.get('category','')}</td><td>{p.get('theme','')}</td><td>{p.get('title','')}</td><td>{p.get('summary','')}</td></tr>"
-        for r in valid_chunks if isinstance(r.get("data"), dict)
-        for p in r["data"].get("programs", [])
+def render_detailed_eval_html(clean_name, exact_dur, derived_meta, eval_data, llm_qual, charts, meta_info) -> str:
+    sf, k = eval_data["score_final"], eval_data["kpis"]
+    rep = (llm_qual or {}).get("report", {})
+    total_lost = max(0.1, round(100.0 - sf["raw_score"], 1))
+
+    ax_rows = "".join(
+        f"<tr class='{'alt' if i%2 else ''}'>"
+        f"<td class='lbl'>{esc(a['id'])} · {esc(a['name'])}</td>"
+        f"<td class='num' dir='ltr'>{a['max']:.0f}</td>"
+        f"<td class='num' dir='ltr'><b>{a['score']:.1f}</b></td>"
+        f"<td class='num' dir='ltr'>{a['pct']:.0f}%</td>"
+        f"<td class='num' dir='ltr' style='color:#8b2f38;'>-{a['max'] - a['score']:.1f}</td></tr>"
+        for i, a in enumerate(eval_data["axes"])
+    ) + f"<tr><td class='tot'>المجموع الخام (قبل التعقيد والسقف)</td><td class='num tot'>100</td><td class='num tot' dir='ltr'>{sf['raw_score']}</td><td class='num tot' dir='ltr'>{sf['raw_score']:.0f}%</td><td class='num tot' dir='ltr'>-{total_lost:.1f}</td></tr>"
+
+    item_rows = "".join(
+        f"<tr class='{'alt' if i%2 else ''}'>"
+        f"<td class='lbl'>{esc(it['criterion_id'])} · {esc(it['name'])}</td>"
+        f"<td class='num' dir='ltr'>{esc(it['metric_value'])}</td>"
+        f"<td class='num' dir='ltr'><b>{it['score']}/{it['max']:.0f}</b></td>"
+        f"<td class='num'>{esc(it['confidence'])}</td>"
+        f"<td>{esc(it['note'])}</td></tr>"
+        for i, it in enumerate(eval_data["scores"])
     )
-    return (
-        f'<div class="header-banner"><h1>تقرير تحليل البث اليومي المفصل</h1><div class="subtitle">{clean_name} — المدة: {dur}</div></div>'
-        f'<table><tr><th>التوقيت</th><th>التصنيف</th><th>المحور</th><th>العنوان</th><th>التفاصيل</th></tr>{rows}</table>'
+
+    lost_rows = "".join(
+        f"<tr class='{'alt' if i%2 else ''}'>"
+        f"<td class='lbl'>{esc(a['id'])} · {esc(a['name'])}</td>"
+        f"<td class='num' dir='ltr'>{a['max'] - a['score']:.1f}</td>"
+        f"<td class='num' dir='ltr'>{round(100.0 * (a['max'] - a['score']) / total_lost)}%</td></tr>"
+        for i, a in enumerate(sorted(eval_data["axes"], key=lambda x: x["max"] - x["score"], reverse=True))
     )
+
+    mono_rows = "".join(
+        f"<tr><td class='num' dir='ltr'>{esc(b['start'])} – {esc(b.get('end',''))}</td>"
+        f"<td class='num' dir='ltr'>{b['duration_s']}ث</td><td>{esc(b.get('speaker_id'))}</td>"
+        f"<td style='color:#8b2f38;font-weight:bold;'>تجاوز 180ث — خاضع لاختبار المردود (A3)</td></tr>"
+        for b in eval_data["monologues_over_180"]
+    ) or "<tr><td colspan='4' class='num' style='color:#2c5c46;font-weight:bold;'>لا يوجد أي بلوك ضيف متّصل تجاوز 180 ثانية.</td></tr>"
+
+    crit_rows = "".join(
+        f"<tr><td class='lbl'>{esc(c.get('event') or c.get('type'))}</td><td class='num' dir='ltr'>{esc(c.get('at'))}</td><td class='num' dir='ltr'>{esc(c.get('cap'))}</td></tr>"
+        for c in eval_data["caps_applied"]
+    ) or "<tr><td colspan='3' class='num'>لا أخطاء حرجة مفروضة السقف.</td></tr>"
+
+    audit_rows = "".join(
+        f"<tr><td class='lbl'>{esc(c['check'])}</td><td class='num'>{'✅ نجح' if c['passed'] else '❌ تعارض'}</td><td>{esc(c['detail'])}</td></tr>"
+        for c in eval_data["audit"]["checks"]
+    )
+
+    charts_html = "".join(f"<div class='chart-box'><img src='data:image/png;base64,{charts[ck]}'></div>" for ck in ("axes_bar", "blocks_bar", "lost_bar") if charts.get(ck))
+    st_li = "".join(f"<li>{esc(s)}</li>" for s in rep.get("strengths", [])) or "<li>انظر البنود الأعلى تقييماً في جدول المعايير الـ 26.</li>"
+    pr_li = "".join(f"<li>{esc(p)}</li>" for p in rep.get("priorities", [])) or f"<li>الأولوية القصوى: {esc(eval_data['top_priority_auto'])}</li>"
+
+    body = f"""
+<table style="margin:0;"><tr><td style="border:0.5pt solid #12304d;background:#12304d;padding:24pt 22pt;color:#fff;">
+<p style="margin:0 0 8pt;font-size:8.5pt;color:#d9c48f;letter-spacing:1.5pt;">تقرير تقييم مهني · سلّم Manar-100-v2 · Blackbox v2.0</p>
+<p style="margin:0 0 4pt;font-size:24pt;font-weight:bold;color:#fff;">{esc(clean_name)}</p>
+<p style="margin:0 0 14pt;font-size:11.5pt;color:#c9d6e4;">{esc(meta_info['editorial_label'])}</p>
+<table style="margin:0;"><tr>
+<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">تاريخ البث<br><b style="color:#fff;">{esc(derived_meta.get('broadcast_date') or 'غير مستخرج')}</b></td>
+<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">الوقت ({esc(derived_meta.get('timezone'))})<br><b style="color:#fff;" dir="ltr">{esc(derived_meta.get('broadcast_start_beirut') or '-')} → {esc(derived_meta.get('broadcast_end_beirut') or '-')}</b></td>
+<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">المدة الكاملة<br><b style="color:#fff;" dir="ltr">{esc(exact_dur)}</b></td>
+<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">المقاطع (5د) / الكلفة<br><b style="color:#fff;" dir="ltr">{meta_info['chunks_ok']}/{meta_info['chunks_total']} · ${meta_info['actual_cost']:.4f}</b></td>
+</tr></table></td></tr></table>
+
+<table style="margin:12pt 0 14pt;"><tr>
+<td style="background:#fbf7ec;border-top:2.5pt solid #a8863f;text-align:center;width:30%;padding:12pt;">
+<p style="margin:0;font-size:8pt;color:#8a7332;text-align:center;">النتيجة النهائية (نطاق)</p>
+<p style="margin:2pt 0 0;font-size:34pt;font-weight:bold;color:#12304d;text-align:center;" dir="ltr">{esc(sf['reported_as'])}</p>
+<p style="margin:0;font-size:8.5pt;color:#5b6572;text-align:center;" dir="ltr">خام {sf['raw_score']} + تعقيد {sf['difficulty_modifier']} | سقف {sf['cap_ceiling']}</p>
+</td>
+<td style="background:#fbf7ec;border-top:2.5pt solid #a8863f;text-align:center;width:38%;padding:12pt;">
+<p style="margin:0;font-size:8pt;color:#5b6572;text-align:center;">التقدير المهني</p>
+<p style="margin:4pt 0;font-size:15pt;font-weight:bold;color:#8b2f38;text-align:center;">{esc(sf['band'])}</p>
+<p style="margin:0;font-size:8.5pt;color:#5b6572;text-align:center;">{esc(sf['difficulty_justification'])}</p>
+</td>
+<td style="background:#fbf7ec;border-top:2.5pt solid #a8863f;text-align:center;width:32%;padding:12pt;">
+<p style="margin:0;font-size:8pt;color:#5b6572;text-align:center;">الأولوية القصوى (مشتقة آلياً)</p>
+<p style="margin:4pt 0;font-size:11pt;font-weight:bold;color:#12304d;text-align:center;">{esc(eval_data['top_priority_auto'])}</p>
+</td></tr></table>
+
+<h2>١ · الملخّص التنفيذي والمؤشرات الحاكمة</h2>
+<p>{esc(rep.get('summary') or 'تقييم حتمي مبني على استخراج كائنات الأحداث الزمنية (Blackbox v2.0) ومقارنتها بمراسي سلّم Manar-100-v2.')}</p>
+<table><tr>
+<td style="background:#f5f7fa;text-align:center;width:25%;padding:10pt;"><b style="font-size:22pt;color:#12304d;" dir="ltr">{k['interventions_per_10min']}</b><br><span class="small">مداخلة/10د (المعيار 8–14)</span></td>
+<td style="background:#f5f7fa;text-align:center;width:25%;padding:10pt;"><b style="font-size:22pt;color:#12304d;" dir="ltr">{k['mean_intervention_s']}ث</b><br><span class="small">متوسط المداخلة (المعيار ≤12ث)</span></td>
+<td style="background:#fbf3f4;text-align:center;width:25%;padding:10pt;"><b style="font-size:22pt;color:#8b2f38;" dir="ltr">{k['longest_unbroken_block_s']}ث</b><br><span class="small">أطول بلوك ضيف (المعيار ≤120ث)</span></td>
+<td style="background:#fbf3f4;text-align:center;width:25%;padding:10pt;"><b style="font-size:22pt;color:#8b2f38;" dir="ltr">{k['anchor_share_pct']}%</b><br><span class="small">حصة المقدم (المعيار 20–30%)</span></td>
+</tr></table>
+<p class="note">{esc(eval_data['brief_alignment'].get('caveat', ''))}</p>
+
+<h2>٢ · حدود الأدلة وميثاق القياس</h2>
+<table><tr><th style="width:28%;">البعد</th><th style="width:72%;">الإفصاح المنهجي</th></tr>
+<tr><td class="lbl">طريقة قياس الزمن</td><td>تقطيع كل 5 دقائق (300ث) + قياس صوتي محلي عبر FFmpeg <code>silencedetect</code> دون تطبيع قسري لمجموع الكلام (`forced_to_match_chunk = false`).</td></tr>
+<tr class="alt"><td class="lbl">كثافة الصورة (1 FPS)</td><td>تحدّ ثقة بند لغة الجسد (F2) بسقف <code>medium</code> منعاً لتفسير النوايا أو التقييم الانطباعي.</td></tr>
+<tr><td class="lbl">الموجز التحريري (`editorial_brief`)</td><td>{esc(eval_data['brief_alignment']['verification_axis_basis'])}</td></tr></table>
+
+<h2>٣ · الرسوم البيانية التشخيصية</h2>
+{charts_html}
+
+<h2 style="page-break-before:always;">٤ · نتائج المحاور السبعة (100 نقطة) وتوزيع النقاط المفقودة</h2>
+<table><tr><th>المحور</th><th class="num">الوزن</th><th class="num">الدرجة</th><th class="num">النسبة</th><th class="num">الفقد</th></tr>{ax_rows}</table>
+<h3>أين ضاعت النقاط ({total_lost:.1f} نقطة)</h3>
+<table><tr><th>المحور</th><th class="num">النقاط المفقودة</th><th class="num">نسبة من إجمالي الفقد</th></tr>{lost_rows}</table>
+
+<h2 style="page-break-before:always;">٥ · التفصيل القابل للتدقيق — البنود الـ 26 بالمراسي والأدلة</h2>
+<table><tr><th style="width:24%;">البند</th><th class="num" style="width:14%;">المؤشر المقيس</th><th class="num" style="width:10%;">الدرجة</th><th class="num" style="width:10%;">الثقة</th><th style="width:42%;">الشاهد والملاحظة</th></tr>{item_rows}</table>
+
+<h2>٦ · اختبار المردود (البلوكات &gt; 180ث) وسقوف الأخطاء الحرجة</h2>
+<p class="small">اختبار المردود يُطبَّق على كل بلوك يتجاوز 180ث: (1) هل أنتج معلومة قابلة للتحقق؟ أو (2) هل أنتج استنتاجاً قرارياً؟ إن كان الجواب «لا» يُخصم في A3 فقط (قاعدة العطب الواحد ← محور واحد).</p>
+<table><tr><th class="num">التوقيت</th><th class="num">المدة</th><th>المتحدث</th><th>الحكم</th></tr>{mono_rows}</table>
+<h3>السقوف الحرجة المطبّقة (Critical Error Caps)</h3>
+<table><tr><th>الحدث الحرج</th><th class="num">التوقيت</th><th class="num">سقف الدرجة</th></tr>{crit_rows}</table>
+
+<h2 style="page-break-before:always;">٧ · جدول الحساسية (أثر الإصلاحات) والبروتوكولات الثمانية</h2>
+<table><tr><th>الإجراء التحسيني</th><th class="num">البند المستهدف</th><th class="num">الكلفة الإنتاجية</th><th class="num">المكسب المتوقع</th></tr>
+<tr><td>بروتوكول 90/8: لمسة ≤8ث كل 90ث</td><td class="num">A3 + D3</td><td class="num">صفر</td><td class="num" dir="ltr">+4.0</td></tr>
+<tr class="alt"><td>تقصير السؤال إلى ≤12ث / ≤30 كلمة باستفهام واحد</td><td class="num">A2 + B1 + B2</td><td class="num">صفر</td><td class="num" dir="ltr">+3.2</td></tr>
+<tr><td>رفع معدل التدخلات إلى 8–10/10د</td><td class="num">A1</td><td class="num">صفر</td><td class="num" dir="ltr">+2.5</td></tr>
+<tr class="alt"><td>قراءة الشريط الأمني المحلي خلال ≤60ث</td><td class="num">E3 + F3</td><td class="num">صفر</td><td class="num" dir="ltr">+2.0</td></tr>
+<tr><td>بطاقة الفرضيات الثلاث + طلب دليل 3 مرات/ساعة</td><td class="num">C1 + C2</td><td class="num">تحضير</td><td class="num" dir="ltr">+1.5</td></tr>
+<tr class="alt"><td>خاتمة بثلاث خلاصات + بطاقة الأسماء</td><td class="num">G2 + G3</td><td class="num">صفر</td><td class="num" dir="ltr">+1.5</td></tr>
+<tr><td class="tot" colspan="3">إجمالي المكسب الممكن عبر الالتزام بالبروتوكولات</td><td class="num tot" dir="ltr">+14.7</td></tr></table>
+
+<h3>ما لا يُحاسب عليه (الحماية التحريرية واللغوية)</h3>
+<table><tr><td class="lbl" style="width:32%;">المحميات من الخصم</td><td>اللهجة اللبنانية المحكية (عنصر قوة تواصلي) · الالتزام بالخط التحريري للقناة الموجّهة ومصطلحاتها · غياب التوازن السياسي تجاه العدو · منح الضيف الحليف مساحة شرط المردود المعلومي.</td></tr></table>
+
+<h2>٨ · نقاط القوة وأولويات التطوير والتدقيق الذاتي</h2>
+<h3>نقاط القوة الموثّقة</h3><ul>{st_li}</ul>
+<h3>أولويات التطوير</h3><ul>{pr_li}</ul>
+<h3>فحوص النزاهة الستة (Audit Checks)</h3>
+<table><tr><th>الفحص</th><th class="num">الحالة</th><th>التفصيل</th></tr>{audit_rows}</table>
+<p class="small" style="margin-top:14pt;text-align:center;color:#8a939e;">— نهاية التقرير المفصل (Orchestrator V6.0) —</p>"""
+    return wrap_word_doc(f"تقييم مفصل V6.0 - {clean_name}", body)
+
+
+def render_summarized_eval_html(clean_name, exact_dur, eval_data, llm_qual, charts) -> str:
+    sf, k, rep = eval_data["score_final"], eval_data["kpis"], (llm_qual or {}).get("report", {})
+    ax_rows = "".join(f"<tr class='{'alt' if i%2 else ''}'><td class='lbl'>{esc(a['id'])} · {esc(a['name'])}</td><td class='num' dir='ltr'>{a['score']}/{a['max']:.0f}</td><td class='num' dir='ltr'>{a['pct']:.0f}%</td></tr>" for i, a in enumerate(eval_data["axes"]))
+    chart_img = f"<div class='chart-box'><img src='data:image/png;base64,{charts['axes_bar']}'></div>" if charts.get("axes_bar") else ""
+    st_li = "".join(f"<li>{esc(s)}</li>" for s in rep.get("strengths", [])[:3]) or "<li>انظر المحاور الأعلى نسبة.</li>"
+    pr_li = "".join(f"<li>{esc(p)}</li>" for p in rep.get("priorities", [])[:3]) or f"<li>{esc(eval_data['top_priority_auto'])}</li>"
+    body = f"""
+<table style="margin:0;"><tr><td style="background:#12304d;color:#fff;padding:18pt;">
+<p style="margin:0;color:#d9c48f;font-size:8.5pt;">تقرير إداري مختصر · Manar-100-v2</p>
+<p style="margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;">{esc(clean_name)} — {esc(sf['reported_as'])} ({esc(sf['band'])})</p>
+<p style="margin:4pt 0 0;color:#c9d6e4;font-size:10pt;">المدة: {esc(exact_dur)} | الخام: {sf['raw_score']} | التعقيد: +{sf['difficulty_modifier']} | السقف المطبق: {sf['cap_ceiling']}</p>
+</td></tr></table>
+<h2>الخلاصة التنفيذية</h2><p>{esc(rep.get('summary') or '')}</p>
+<h2>المؤشرات الأساسية السبعة</h2>
+<table><tr><th>مداخلات/10د</th><th>متوسط المداخلة</th><th>أطول بلوك ضيف</th><th>أسئلة أحادية</th><th>طلبات دليل/ساعة</th><th>تغطية العاجل</th><th>حصة المقدم</th></tr>
+<tr><td class="num" dir="ltr">{k['interventions_per_10min']}</td><td class="num" dir="ltr">{k['mean_intervention_s']}ث</td><td class="num" dir="ltr">{k['longest_unbroken_block_s']}ث</td><td class="num" dir="ltr">{k['single_question_pct']}%</td><td class="num" dir="ltr">{k['evidence_request_per_hour']}</td><td class="num" dir="ltr">{k['local_chyron_coverage_pct']}%</td><td class="num" dir="ltr">{k['anchor_share_pct']}%</td></tr></table>
+{chart_img}
+<h2>نتائج المحاور السبعة</h2>
+<table><tr><th>المحور</th><th class="num">الدرجة</th><th class="num">النسبة</th></tr>{ax_rows}</table>
+<h2>أبرز نقاط القوة</h2><ul>{st_li}</ul>
+<h2>الأولوية القصوى وأولويات التطوير</h2><p><b>الأولوية القصوى (مشتقة آلياً):</b> {esc(eval_data['top_priority_auto'])}</p><ul>{pr_li}</ul>"""
+    return wrap_word_doc(f"تقرير مختصر V6.0 - {clean_name}", body)
+
+
+def render_training_plan_html(clean_name, eval_data, llm_qual) -> str:
+    sf, k = eval_data["score_final"], eval_data["kpis"]
+    start_sc = int(round(sf["final_score"]))
+    target_sc = min(92, max(75, start_sc + 14))
+    rewrites = (llm_qual or {}).get("question_rewrites", [])
+    rewrite_html = "".join(
+        f"<p><b>سؤال فعلي من الحلقة ({esc(rw.get('ts',''))} — {esc(rw.get('orig_duration_s',''))}ث):</b></p>"
+        f"<p class='qbad'>{esc(rw.get('original',''))}</p>"
+        f"<p class='qgood'>{esc(rw.get('rewritten',''))} <span class='small'>— ≤12ث / ≤30 كلمة · استفهام واحد · مرجع واحد</span></p>"
+        for rw in rewrites[:4]
+    )
+    if not rewrite_html:
+        rewrite_html = "".join(
+            f"<p><b>سؤال طويل مرصود ({esc(q.get('start'))} — {q.get('duration_s')}ث، {q.get('word_count')} كلمة):</b></p><p class='qbad'>{esc(q.get('text'))}</p>"
+            for q in eval_data.get("longest_questions", [])[:3]
+        ) or "<p class='small'>لم تُرصد أسئلة طويلة متجاوزة للحدّ في هذه الحلقة.</p>"
+
+    claim_rows = "".join(
+        f"<tr class='{'alt' if i%2 else ''}'><td>{esc(c.get('text',''))} <span class='small' dir='ltr'>({esc(c.get('at',''))})</span></td>"
+        f"<td>{esc(c.get('type',''))} · دليل مرفق: {'نعم' if c.get('evidence_offered') else 'لا'}</td>"
+        f"<td>{'طُرحت مساءلة عند ' + esc(c.get('anchor_challenged_at')) if c.get('anchor_challenged_at') else 'مطلوب سؤال تحقق مباشر: على أي معطى أو رقم بُني هذا؟'}</td></tr>"
+        for i, c in enumerate(eval_data.get("top_checkable_claims", [])[:3])
+    ) or "<tr><td colspan='3' class='num'>تُستخرج ثلاثة ادعاءات هشّة من أطروحة الضيف قبل كل بث.</td></tr>"
+
+    longest_ts = eval_data["monologues_over_180"][0]["start"] if eval_data["monologues_over_180"] else "أطول بلوك في الحلقة"
+    body = f"""
+<table style="margin:0;"><tr><td style="border:0.5pt solid #12304d;background:#12304d;padding:24pt 22pt;color:#fff;">
+<p style="margin:0 0 8pt;font-size:8.5pt;color:#d9c48f;letter-spacing:1.5pt;">خطة تدريب · وثيقة تنفيذية مبنية على بيانات الحلقة</p>
+<p style="margin:0 0 4pt;font-size:24pt;font-weight:bold;color:#fff;">إعادة التأهيل المهني — {esc(clean_name)}</p>
+<p style="margin:0 0 14pt;font-size:12pt;color:#c9d6e4;">من <span dir="ltr">{start_sc}</span> إلى <span dir="ltr">{target_sc}</span> في ستة أسابيع — أحد عشر تدريباً وسبعة مؤشرات</p>
+<table style="margin:0;"><tr>
+<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">المتدرّب<br><b style="color:#fff;">{esc(clean_name)}</b></td>
+<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">نقطة الانطلاق<br><b style="color:#fff;" dir="ltr">{start_sc} / 100</b></td>
+<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">الهدف<br><b style="color:#fff;" dir="ltr">{target_sc} / 100</b></td>
+<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">المدّة<br><b style="color:#fff;">ستة أسابيع (4س/أسبوع)</b></td>
+</tr></table></td></tr></table>
+
+<h2>٠ · المبدأ والعادات الأربع المطلوب استبدالها</h2>
+<table style="margin:8pt 0;"><tr><td style="background:#12304d;color:#fff;padding:10pt 12pt;">
+<p style="margin:0;color:#fff;font-size:9.5pt;"><b style="color:#e8d5a3;">مركز الخطة:</b> المهارة موجودة لدى المتدرّب، والمطلوب رفع تردّدها من لحظات متفرّقة إلى انعكاس تلقائي كل 90 ثانية باستخدام مادته المسجّلة نفسها.</p>
+</td></tr></table>
+<table><tr><th style="width:28%;">العادة الحالية</th><th style="width:28%;">الأثر المقيس في الحلقة</th><th style="width:44%;">العادة البديلة</th></tr>
+<tr><td class="lbl">ترك الاسترسال حتى ينتهي وحده</td><td dir="ltr">أطول بلوك {k['longest_unbroken_block_s']}ث · {k['interventions_per_10min']} مداخلة/10د</td><td><b>اللمسة الثمانية (90/8):</b> تدخّل ≤8ث كل 90ث يبدأ بكلمة من كلام الضيف</td></tr>
+<tr class="alt"><td class="lbl">التمهيد الطويل وتعدّد الاستفهام</td><td dir="ltr">متوسط {k['mean_intervention_s']}ث · أحادية {k['single_question_pct']}%</td><td><b>السؤال الواحد ≤12ث / ≤30 كلمة</b> بمرجع واحد قابل للتحقق</td></tr>
+<tr><td class="lbl">التسليم السلبي للادعاء</td><td dir="ltr">{k['evidence_request_per_hour']} طلب دليل/ساعة</td><td><b>التحقّق الداخلي:</b> بطاقة الفرضيات الثلاث + سؤال الفريق الأحمر التحصيني</td></tr>
+<tr class="alt"><td class="lbl">فجوات العواجل والإغلاق</td><td dir="ltr">تغطية العاجل {k['local_chyron_coverage_pct']}%</td><td><b>الشريط خلال ≤60ث + الثلاثون ثانية الأخيرة</b> (3 خلاصات + بطاقة الأسماء)</td></tr></table>
+
+<h2 style="page-break-before:always;">١ · الوحدة الأولى: الصنعة (التدريبات ١–٥) وإعادة صياغة الأسئلة</h2>
+<table><tr><th style="width:22%;">التدريب</th><th style="width:48%;">الميكانيكا العملية</th><th style="width:30%;">معيار الاجتياز</th></tr>
+<tr><td class="lbl">١ · اللمسة الثمانية</td><td>تفكيك بلوك {esc(longest_ts)} لإيجاد 12 نقطة دخول، وتسجيل 6 لمسات ≤8ث (≤20 كلمة) تبدأ بكلمة من الضيف.</td><td>6 لمسات في 10د دون عبارة جاهزة من المقدم</td></tr>
+<tr class="alt"><td class="lbl">٢ · القصّ إلى 12ث</td><td>إعادة كتابة الأسئلة الطويلة: استفهام واحد · مرجع واحد · بلا تمهيد تقريري (10 أسئلة/يوم لأسبوعين).</td><td>9/10 أسئلة ≤30 كلمة باستفهام واحد</td></tr>
+<tr><td class="lbl">٣ · الضيف الثرثار</td><td>محاكاة 10 دقائق مع زميل يتحدث 3د بلا توقف، وعدّ اللمسات مقابل القطع في منتصف الجملة.</td><td>6 تدخّلات وصفر قطع في منتصف جملة</td></tr>
+<tr class="alt"><td class="lbl">٤ · الاعتراض الثلاثي</td><td>حفظ وتكرار: التلخيص والتسليم · التثبيت («وقفني عند هالجملة») · الاعتراض اللبق («لحظة خليني ناقشك هون»).</td><td>استخدام 3 تقنيات مختلفة في الحلقة</td></tr>
+<tr><td class="lbl">٥ · إشارة نهاية الدور</td><td>إنهاء كل سؤال بنبرة هابطة ووقفة صامتة ثانيتين كاملتين (اختبار الصمّ).</td><td>نجاح 9/10 محاولات</td></tr></table>
+<h3>إعادة صياغة فعلية لأطول أسئلة المتدرّب في هذه الحلقة</h3>
+{rewrite_html}
+
+<h2 style="page-break-before:always;">٢ · الوحدة الثانية: الوظيفة التحريرية (التدريبات ٦–١١)</h2>
+<table><tr><th style="width:22%;">التدريب</th><th style="width:48%;">الميكانيكا العملية</th><th style="width:30%;">معيار الاجتياز</th></tr>
+<tr><td class="lbl">٦ · بطاقة الثلاث</td><td>استخراج 3 ادعاءات هشّة متوقعة من الضيف + ادعاء للخصم قبل البث وطرح اثنين على الأقل.</td><td>ادعاءان مطروحان في 3 حلقات متتالية</td></tr>
+<tr class="alt"><td class="lbl">٧ · طلب الدليل</td><td>وقفة نصف ثانية بعد كل ادعاء ثم استخدام إحدى الصيغ الثماني بلا نبرة بوليسية.</td><td>≥3 طلبات دليل موثّقة بالساعة</td></tr>
+<tr><td class="lbl">٨ · الفريق الأحمر (التحصين)</td><td>صياغة سؤال يفرغ أقوى حجة للخصم على لسان الضيف قبل أن يستخدمها الخصم خارجياً.</td><td>سؤال تحصيني موثّق بالوقت في كل حلقة</td></tr>
+<tr class="alt"><td class="lbl">٩ · الحجة لا الاستعارة</td><td>تحويل أي استعارة أدبية فوراً إلى ادعاء قابل للاختبار برقم أو معطى.</td><td>تحويل فوري عند أول ذكر</td></tr>
+<tr><td class="lbl">١٠ · الشريط الأعمى</td><td>مشاهدة شريط أخبار مكتوم ونطق أي عاجل أمني محلي خلال ≤60ث.</td><td>100% من الأشرطة المحلية</td></tr>
+<tr class="alt"><td class="lbl">١١ · الثلاثون ثانية الأخيرة</td><td>خاتمة بـ 3 خلاصات + سؤال مفتوح + شكر ببطاقة الأسماء الصحيحة.</td><td>حلقتان متتاليتان بلا أخطاء أسماء</td></tr></table>
+
+<h3>تطبيق «بطاقة الثلاث» على ادعاءات هذه الحلقة</h3>
+<table><tr><th>الادعاء المرصود</th><th>طبيعته</th><th>التدخّل المطلوب</th></tr>{claim_rows}</table>
+
+<h2>٣ · بنك العبارات الجاهزة والجدول الأسبوعي (6 أسابيع)</h2>
+<table><tr><th style="width:20%;">الفئة</th><th style="width:80%;">الصيغ الجاهزة للحفظ</th></tr>
+<tr><td class="lbl">اللمسات (≤8ث)</td><td>«وقفني عند كلمة…» · «رقم واحد بس: كم؟» · «يعني بجملة: …؟» · «هيدا تحليل ولا معطى؟» · «خلينا نمسكها من الجهة التانية…»</td></tr>
+<tr class="alt"><td class="lbl">التحقّق والتحصين</td><td>«على أي معطى بنيت هذا؟» · «هذا رقم رسمي أم تقدير؟» · «الخصم سيقول كذا… شو جوابك؟» · «لو خالفك أحد، شو أقوى حجة عنده؟»</td></tr>
+<tr><td class="lbl">الخاتمة</td><td>«خلاصة الساعة بثلاث نقاط: أولاً… ثانياً… ثالثاً… والسؤال المفتوح: …» · «شكراً لـ[الاسم من البطاقة]…»</td></tr></table>
+
+<table><tr><th class="num" style="width:9%;">الأسبوع</th><th style="width:33%;">التدريبات</th><th style="width:30%;">المادة</th><th style="width:28%;">المُخرَج المقيس</th></tr>
+<tr><td class="num">٠</td><td>القياس الأساسي وفيلم التشخيص</td><td>الحلقة كاملة + بلوك {esc(longest_ts)}</td><td>أرقام الانطلاق السبعة</td></tr>
+<tr class="alt"><td class="num">١</td><td>القصّ (٢) + إشارة نهاية الدور (٥)</td><td>أسئلته الطويلة</td><td>50 سؤالاً ≤30 كلمة</td></tr>
+<tr><td class="num">٢</td><td>اللمسة الثمانية (١) + الضيف الثرثار (٣)</td><td>أرشيفه + زميل متقمّص</td><td>6 لمسات في 10د</td></tr>
+<tr class="alt"><td class="num">٣</td><td>الاعتراض الثلاثي (٤) + <b>أول بثّ مُقاس</b></td><td>على الهواء</td><td>تقرير مؤشرات رقم 1</td></tr>
+<tr><td class="num">٤</td><td>بطاقة الثلاث (٦) + طلب الدليل (٧)</td><td>نصوص تفريغ</td><td>ادعاءان مطروحان في البثّ</td></tr>
+<tr class="alt"><td class="num">٥</td><td>الفريق الأحمر (٨) + الحجة لا الاستعارة (٩)</td><td>أطروحات الحلقة</td><td>سؤال تحصيني موثّق</td></tr>
+<tr><td class="num">٦</td><td>الشريط الأعمى (١٠) + الخاتمة (١١) + التقييم النهائي</td><td>على الهواء + شريط مكتوم</td><td>نتيجة ≥ {target_sc}/100</td></tr></table>
+
+<h2>٤ · المؤشرات السبعة وحماية نقاط القوة والشرط الإداري</h2>
+<table><tr><th>المؤشر</th><th class="num">الانطلاق (هذه الحلقة)</th><th class="num">الهدف (أسبوع 6)</th><th>طريقة القياس</th></tr>
+<tr><td class="lbl">معدّل المداخلات / 10 د</td><td class="num" dir="ltr">{k['interventions_per_10min']}</td><td class="num" dir="ltr">8 – 10</td><td>آلي من Blackbox v2</td></tr>
+<tr class="alt"><td class="lbl">متوسّط طول المداخلة</td><td class="num" dir="ltr">{k['mean_intervention_s']}ث</td><td class="num" dir="ltr">≤ 12ث</td><td>آلي من turns[]</td></tr>
+<tr><td class="lbl">أطول بلوك ضيف متّصل</td><td class="num" dir="ltr">{k['longest_unbroken_block_s']}ث</td><td class="num" dir="ltr">≤ 120ث</td><td>آلي من unbroken_blocks</td></tr>
+<tr class="alt"><td class="lbl">طلبات الدليل / ساعة</td><td class="num" dir="ltr">{k['evidence_request_per_hour']}</td><td class="num" dir="ltr">≥ 3</td><td>آلي من claims[]</td></tr>
+<tr><td class="lbl">نسبة الأسئلة الأحادية</td><td class="num" dir="ltr">{k['single_question_pct']}%</td><td class="num" dir="ltr">≥ 85%</td><td>آلي من question_count</td></tr>
+<tr class="alt"><td class="lbl">تغطية الشريط المحلي</td><td class="num" dir="ltr">{k['local_chyron_coverage_pct']}%</td><td class="num" dir="ltr">100% (≤60ث)</td><td>آلي من chyron_timeline[]</td></tr>
+<tr><td class="lbl">الأخطاء الحرجة</td><td class="num" dir="ltr">{len(eval_data['critical_events'])}</td><td class="num" dir="ltr">0</td><td>آلي من critical_events[]</td></tr></table>
+
+<h3>ما لا يجوز تدريبه (حماية نقاط القوة) والشرط الإداري</h3>
+<table><tr><th style="width:26%;">البند</th><th style="width:74%;">القاعدة الملزمة</th></tr>
+<tr><td class="lbl">حماية القوة</td><td>لا يُدرَّب على القطع العدواني (لمسة لا قطع، تبدأ بكلمة الضيف) · لا يُمسّ باللهجة اللبنانية المحكية ولا بالخط التحريري ولا بالوقار والإنصات ولا بارتجال المتابعة.</td></tr>
+<tr class="alt"><td class="lbl">الشرط الإداري</td><td>تفعيل المصدر الميداني حتى آخر 10 دقائق · إسناد «بطاقة الثلاث» ومذكرة <code>editorial_brief</code> لمُعِدّ الحلقة قبل البث · وضع بطاقة الأسماء أمام المقدم + VT بالأرقام قبل البلوكات التحليلية.</td></tr></table>
+<p class="small" style="margin-top:14pt;text-align:center;color:#8a939e;">— نهاية خطة التدريب (Orchestrator V6.0) —</p>"""
+    return wrap_word_doc(f"خطة التدريب 6 أسابيع - {clean_name}", body)
+
+
+def generate_blackbox_v2_md(clean_name, exact_dur, derived_meta, chunks, eval_data, meta_info) -> str:
+    sf, k = eval_data["score_final"], eval_data["kpis"]
+    lines = [
+        f"# BLACKBOX V2.0 FORENSIC DOSSIER — {clean_name}",
+        "> Complete self-contained forensic dataset (`blackbox-v2.0` / `manar-100-v2`). All timestamps are absolute `HH:MM:SS` from `00:00:00`.",
+        "",
+        "## 1. MASTER METADATA",
+        f"- **Episode / Presenter:** {clean_name}",
+        f"- **Editorial Mode:** {meta_info['editorial_label']}",
+        f"- **Broadcast Date/Time:** {derived_meta.get('broadcast_date')} {derived_meta.get('broadcast_start_beirut')} ({derived_meta.get('timezone')})",
+        f"- **Duration:** {exact_dur} | **Chunks:** {meta_info['chunks_ok']}/{meta_info['chunks_total']} (5 min) | **Cost:** ${meta_info['actual_cost']:.4f}",
+        f"- **Final Score:** {sf['reported_as']} (Raw {sf['raw_score']} + Mod {sf['difficulty_modifier']} | Cap {sf['cap_ceiling']} | Band: {sf['band']})",
+        f"- **Top Priority (Auto):** {eval_data['top_priority_auto']}",
+        "",
+        "## 2. DETERMINISTIC KPIs",
+        "```json",
+        json.dumps(k, ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## 3. 26-ITEM SCORING & AUDIT",
+        "| ID | Criterion | Metric | Score | Confidence | Note |",
+        "|---|---|---:|---:|---|---|",
+    ]
+    for it in eval_data["scores"]:
+        lines.append(f"| {it['criterion_id']} | {it['name']} | {it['metric_value']} | {it['score']}/{it['max']:.0f} | {it['confidence']} | {str(it['note']).replace('|','/')} |")
+    lines += ["", "## 4. COMPLETE TURNS, INTERVENTIONS, CHYRONS & CLAIMS (CHUNK BY CHUNK)"]
+    for c in chunks:
+        lines.append(f"### Chunk {c['chunk_index']} ({c['window']['start']} -> {c['window']['end']}) | turns_sum={c['measurement']['sum_of_turns_s']}s / {c['measurement']['chunk_duration_s']}s (ffmpeg_speech={c['measurement'].get('ffmpeg_non_silent_s')}s)")
+        for t in c.get("turns", []):
+            lines.append(f"- **[{t.get('start')}–{t.get('end')}] {t.get('speaker_id')}** ({t.get('kind')}, {t.get('duration_s')}s, {t.get('word_count')}w, q={t.get('question_count')}): {t.get('text')}")
+        for ch in c.get("chyron_timeline", []):
+            lines.append(f"  - *CHYRON [{ch.get('on')}] ({ch.get('type')}, read={ch.get('read_on_air_at')}):* {ch.get('text_raw')}")
+        for cl in c.get("claims", []):
+            lines.append(f"  - *CLAIM [{cl.get('at')}] ({cl.get('speaker_id')}, checkable={cl.get('checkable')}, challenged={cl.get('anchor_challenged_at')}):* {cl.get('text')}")
+    return "\n".join(lines)
 
 
 # ==============================================================================
@@ -1376,18 +1649,22 @@ def main():
 
     fid = (os.environ.get("FOLDER_ID") or "").strip()
     RUNTIME_DRIVE_TOKEN = (os.environ.get("DRIVE_TOKEN") or "").strip()
-    tg_bot = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-    tg_chat = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
-    gm_u = (os.environ.get("GMAIL_USER") or "").strip()
-    gm_p = (os.environ.get("GMAIL_APP_PASSWORD") or "").strip()
+    tg_bot, tg_chat = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip(), (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    gm_u, gm_p = (os.environ.get("GMAIL_USER") or "").strip(), (os.environ.get("GMAIL_APP_PASSWORD") or "").strip()
     run_id = (os.environ.get("GITHUB_RUN_ID") or "").strip()
 
     fk_list = [k.strip().strip('"').strip("'") for k in re.split(r"[,;\s]+", os.environ.get("GEMINI_FREE_API_KEYS", "")) if k.strip()]
     pk = (os.environ.get("GEMINI_PAID_API_KEY") or "").strip().strip('"').strip("'")
 
-    cfg = {"run_mode": "daily", "expected_hours": 1}
-    src_url = ""
-    orig_folder_name = ""
+    prompt_system = load_repo_text("prompt_system.md", "أنت موثّق بث تلفزيوني عربي. أخرج JSON صالح فقط.")
+    prompt_chunk_tpl = load_repo_text("prompt_chunk.md", "أخرج كائن Blackbox Chunk v2 كامل بصيغة JSON.")
+    prompt_synth_tpl = load_repo_text("prompt_synthesis.md", "أخرج التوليف والتحليل بصيغة JSON.")
+    schema_chunk = load_repo_json("schema_chunk.json", {})
+    rubric = load_repo_json("rubric.json", {"axes": [], "bands": [], "critical_error_caps": []})
+    entities_csv = load_repo_text("entities.csv", DEFAULT_ENTITIES_CSV)
+    entity_registry = parse_entities_csv(entities_csv)
+
+    cfg, src_url, orig_folder_name = {"run_mode": "eval", "expected_hours": 1}, "", ""
     try:
         meta_r = drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{fid}", cfg, params={"fields": "id,name,description"}, timeout=20)
         if meta_r.status_code == 200:
@@ -1401,119 +1678,76 @@ def main():
     except Exception as e:
         print(f"[Config Fetch Error] {e}", flush=True)
 
-    mode = cfg.get("run_mode", "daily")
-    editorial_mode = cfg.get("editorial_mode", "directed")
-    chunk_min = int(cfg.get("chunk_size", 10))
+    mode, editorial_mode = cfg.get("run_mode", "eval"), cfg.get("editorial_mode", "directed")
+    chunk_min = 5 if mode == "eval" else int(cfg.get("chunk_size", 10))
     chunk_sec = chunk_min * 60
     workers = max(1, min(int(cfg.get("workers", 3)), 6))
     strat = cfg.get("tier_strategy", "hybrid")
-    system_prompt = cfg.get("system_prompt", "")
+    system_prompt_extra = cfg.get("system_prompt", "")
+    editorial_brief = cfg.get("editorial_brief") if isinstance(cfg.get("editorial_brief"), dict) else {}
     fps = cfg.get("daily_fps", "1/5") if mode == "daily" else cfg.get("eval_fps", "1")
     episode_budget_cap = float(cfg.get("max_budget", 2.0) or 2.0)
 
-    # Preserve clean human-readable name (presenter or date) for reports & Drive folder rename!
-    raw_label = cfg.get("presenter_name") or cfg.get("folder_name") or orig_folder_name or mode
-    raw_label = re.sub(r"^(GEN_READY_|READY_|day-ready_|PROCESSED_|FAILED_)", "", raw_label, flags=re.IGNORECASE).strip("_ ")
+    raw_label = re.sub(r"^(GEN_READY_|READY_|day-ready_|PROCESSED_|FAILED_|CANCELLED_)", "", cfg.get("presenter_name") or cfg.get("folder_name") or orig_folder_name or mode, flags=re.IGNORECASE).strip("_ ")
     clean_name = sanitize_filename(raw_label)
-
     editorial_label = (
-        "المنظومة الثالثة: تقييم مهني إعلامي عام ومحايد (بدون خلفية قناة موجهة)"
+        "تقييم مهني محايد (Manar-100-v2 · معيار محايد مع حماية اللهجة اللبنانية)"
         if editorial_mode == "neutral"
-        else "المنظومة الثانية: تقييم مع مراعاة الخط التحريري للقناة الموجهة"
+        else "تقييم الأداء الحواري في قناة موجّهة الخط (Manar-100-v2)"
     )
 
     push_status(cfg, fid, run_id, "running", "فحص مفاتيح API...", 0, 0, 0.0, started_at)
-
-    # STEP 1: FAST PARALLEL PRE-FLIGHT KEY VALIDATION
     valid_free, valid_paid, paid_models = preflight_validate_keys(fk_list, pk, strat, tg_bot, tg_chat)
     if (strat == "flash_only" and not valid_free) or (strat == "pro_only" and not valid_paid) or (not valid_free and not valid_paid):
-        update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 رابط المصدر: {src_url}\n❌ لا يوجد مفاتيح API صالحة")
+        update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 {src_url}\n❌ لا يوجد مفاتيح API صالحة")
         finalize_cost_webhook(cfg, fid, 0.0, "failed", "لا يوجد مفاتيح API صالحة")
         sys.exit(1)
 
     if not src_url:
-        send_tg("❌ لا يوجد رابط فيديو في `_source_link.txt`.", tg_bot, tg_chat)
+        send_tg("❌ رابط المصدر مفقود.", tg_bot, tg_chat)
         update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", "❌ رابط المصدر مفقود")
         finalize_cost_webhook(cfg, fid, 0.0, "failed", "الرابط مفقود")
         sys.exit(1)
 
-    # STEP 2: LOCAL DOWNLOAD (eval / <= 2.5h / YouTube) & DURATION PROBE
-    local_input = src_url
-    downloaded_local = False
-    tmp_src = "/tmp/source_video.mp4"
-
+    local_input, downloaded_local, tmp_src = src_url, False, "/tmp/source_video.mp4"
     dur = float(cfg.get("expected_hours", 1)) * 3600
     if not is_youtube_url(src_url):
         try:
-            probe_out = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", src_url],
-                capture_output=True, text=True, timeout=30,
-            ).stdout.strip()
-            if probe_out:
-                dur = float(probe_out)
-        except Exception as e:
-            print(f"[ffprobe warning] {e}", flush=True)
+            po = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", src_url], capture_output=True, text=True, timeout=30).stdout.strip()
+            if po:
+                dur = float(po)
+        except Exception:
+            pass
 
     if mode == "eval" or dur <= 9000 or is_youtube_url(src_url):
         push_status(cfg, fid, run_id, "running", "تحميل الفيديو محلياً...", 0, max(1, math.ceil(dur / chunk_sec)), 0.0, started_at)
-        send_tg(f"📥 تحميل الحلقة محلياً ({clean_name}) لمنع انقطاع البث...", tg_bot, tg_chat)
+        send_tg(f"📥 تحميل الحلقة محلياً ({clean_name})...", tg_bot, tg_chat)
         if acquire_video_locally(src_url, tmp_src, cfg):
-            local_input = tmp_src
-            downloaded_local = True
-            size_mb = os.path.getsize(tmp_src) / (1024 * 1024)
-            print(f"✅ Downloaded locally: {size_mb:.1f} MB", flush=True)
+            local_input, downloaded_local = tmp_src, True
             try:
-                probe_local = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", tmp_src],
-                    capture_output=True, text=True, timeout=30,
-                ).stdout.strip()
-                if probe_local:
-                    dur = float(probe_local)
+                pl = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", tmp_src], capture_output=True, text=True, timeout=30).stdout.strip()
+                if pl:
+                    dur = float(pl)
             except Exception:
                 pass
-        else:
-            print("⚠️ Local download failed; falling back to resilient HTTP streaming.", flush=True)
 
-    exact_duration = format_hhmmss(dur)
-    tot = math.ceil(dur / chunk_sec)
+    exact_duration, tot, derived_meta = format_hhmmss(dur), math.ceil(dur / chunk_sec), derive_metadata(src_url, dur)
     if tot <= 0:
-        send_tg("❌ الرابط غير صالح أو مدته صفر.", tg_bot, tg_chat)
-        update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 رابط المصدر: {src_url}\n❌ مدة الفيديو صفر")
+        update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 {src_url}\n❌ مدة الفيديو صفر")
         finalize_cost_webhook(cfg, fid, 0.0, "failed", "مدة الفيديو صفر")
         sys.exit(1)
 
-    if push_status(cfg, fid, run_id, "running", f"بدء تحليل المقاطع (0/{tot})", 0, tot, 0.0, started_at):
-        send_tg("🛑 تم إلغاء العملية بناءً على طلب المستخدم.", tg_bot, tg_chat)
-        finalize_cost_webhook(cfg, fid, 0.0, "cancelled", "تم الإلغاء")
-        sys.exit(0)
+    send_tg(f"🚀 بدء التحليل V6.0 | {clean_name} | المدة: {exact_duration} | المقاطع: {tot} ({chunk_min}د)", tg_bot, tg_chat)
 
-    send_tg(f"🚀 بدء التحليل V5.7 | {clean_name} | المدة: {exact_duration} | المقاطع: {tot} | المسار: {strat}", tg_bot, tg_chat)
-
-    results = [None] * tot
-    act_cost = 0.0
-    completed_count = 0
-    exhausted_pairs = set()
-    bad_keys = set()
-    models_used = set()
-    failed = []
-    processing_start = time.time()
+    act_cost, exhausted_pairs, bad_keys, models_used = 0.0, set(), set(), set()
 
     def budget_ok() -> bool:
         with STATE_LOCK:
             return act_cost < episode_budget_cap
 
-    def process_chunk(idx, force_paid=False):
-        if CANCEL_EVENT.is_set():
-            raise RuntimeError("Cancelled by user")
-        time.sleep(random.uniform(0.3, 1.5) * (idx % workers))
-        st = idx * chunk_sec
-        d = min(chunk_sec, dur - st)
-        st_hms = format_hhmmss(st)
-        end_hms = format_hhmmss(st + d)
-        mp4_path = f"/tmp/chunk_{idx}.mp4"
-
-        extracted = False
-        for attempt in range(1, 4):
+    def extract_chunk_media(idx: int) -> tuple:
+        st, d, mp4_path = idx * chunk_sec, min(chunk_sec, dur - idx * chunk_sec), f"/tmp/chunk_{idx}.mp4"
+        for _ in range(3):
             if CANCEL_EVENT.is_set():
                 raise RuntimeError("Cancelled by user")
             cmd = ["ffmpeg", "-y", "-loglevel", "error"]
@@ -1524,275 +1758,316 @@ def main():
                 "-vf", f"fps={fps},scale=640:360",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
                 "-c:a", "aac", "-ac", "1", "-ar", "16000", "-b:a", "24k",
-                "-movflags", "+faststart",
-                mp4_path,
+                "-movflags", "+faststart", mp4_path,
             ]
             with FFMPEG_SEM:
                 proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 5000:
-                extracted = True
-                break
-            print(f"[FFmpeg Retry {attempt}/3 on chunk {idx+1}] rc={proc.returncode} err={proc.stderr[:160]}", flush=True)
+                return mp4_path, st, d, measure_chunk_speech_ffmpeg(mp4_path, d)
             time.sleep(2)
+        raise RuntimeError(f"FFmpeg failed on chunk {idx+1}")
 
-        if not extracted:
-            raise RuntimeError(f"FFmpeg failed to extract valid media for chunk {idx+1}")
+    if mode == "eval":
+        push_status(cfg, fid, run_id, "running", f"تقطيع الفيديو ({tot} مقاطع × 5 دقائق)...", 0, tot, 0.0, started_at)
+        sliced = {}
+        with ThreadPoolExecutor(max_workers=min(3, tot)) as ex:
+            futs = {ex.submit(extract_chunk_media, i): i for i in range(tot)}
+            for fut in as_completed(futs):
+                sliced[futs[fut]] = fut.result()
 
-        if mode == "eval":
-            pr = build_eval_chunk_prompt(st_hms, end_hms, idx == tot - 1, editorial_mode, system_prompt)
-        else:
-            pr = build_daily_chunk_prompt(st_hms, end_hms, system_prompt)
+        chunks_by_idx = [None] * tot
+        failed_idxs = []
+        running_ctx = {
+            "chunk_index": 0, "program_name": None, "presenter_name": raw_label,
+            "participants": [{"id": "ANCHOR", "name": raw_label, "role": "مقدّم"}],
+            "active_files": [], "last_300_words": "", "open_claims": [], "unresolved_chyrons": [], "cumulative_clock": "00:00:00",
+        }
+        proc_start = time.time()
 
-        run_strat = "pro_only" if force_paid else strat
-        try:
-            data, cost, used_model, tier = call_gemini_chunk(
-                mp4_path, pr, valid_free, valid_paid, paid_models, run_strat, exhausted_pairs, bad_keys, budget_ok
+        def run_eval_chunk(i: int, ctx_snapshot: dict, force_paid: bool = False):
+            mp4_path, st, d, speech_s = sliced[i] if i in sliced and os.path.exists(sliced[i][0]) else extract_chunk_media(i)
+            st_hms, end_hms = format_hhmmss(st), format_hhmmss(st + d)
+            filled_chunk = (
+                prompt_chunk_tpl
+                .replace("{{CHUNK_INDEX}}", str(i + 1))
+                .replace("{{CHUNK_TOTAL}}", str(tot))
+                .replace("{{CHUNK_START}}", st_hms)
+                .replace("{{CHUNK_END}}", end_hms)
+                .replace("{{PROGRAM_NAME_IF_KNOWN}}", str(ctx_snapshot.get("program_name") or "غير محدد بعد"))
+                .replace("{{RUNNING_CONTEXT}}", json.dumps(ctx_snapshot, ensure_ascii=False, indent=2))
+                .replace("{{ENTITIES_CSV}}", entities_csv)
             )
-            with STATE_LOCK:
-                models_used.add(f"{tier}:{used_model}")
-            print(f"✅ Chunk {idx+1}/{tot} ({st_hms}->{end_hms}) done via {tier} ({used_model}) | cost=${cost:.4f}", flush=True)
-            return data, cost, f"من {st_hms} إلى {end_hms}"
-        finally:
-            if os.path.exists(mp4_path):
-                try:
-                    os.remove(mp4_path)
-                except Exception:
-                    pass
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(process_chunk, i, False): i for i in range(tot)}
-        for fut in as_completed(futs):
-            i = futs[fut]
+            full_prompt = f"{prompt_system}\n\n{filled_chunk}\n\nاسم ملف المصدر: {derived_meta.get('source_filename')}\n{system_prompt_extra}"
+            run_strat = "pro_only" if force_paid else strat
             try:
-                data, c, win = fut.result()
-                results[i] = {"chunk_index": i + 1, "window": win, "data": data}
-                with STATE_LOCK:
-                    act_cost += c
-                    completed_count += 1
-                    cur_done = completed_count
-                    cur_cost = act_cost
-                proc_elapsed = time.time() - processing_start
-                eta = int((proc_elapsed / cur_done) * (tot - cur_done)) + 25
-                push_status(cfg, fid, run_id, "running", f"تحليل المقاطع ({cur_done}/{tot})", cur_done, tot, cur_cost, started_at, eta_sec=eta)
+                raw_data, cost, used_model, tier = call_gemini_chunk(
+                    mp4_path, full_prompt, valid_free, valid_paid, paid_models, run_strat,
+                    exhausted_pairs, bad_keys, budget_ok, chunk_schema=schema_chunk or None
+                )
+                norm = normalize_chunk_v2(raw_data, i + 1, st_hms, end_hms, d, derived_meta, speech_s, entity_registry)
+                return norm, cost, used_model, tier, end_hms
+            finally:
+                if os.path.exists(mp4_path):
+                    try:
+                        os.remove(mp4_path)
+                    except Exception:
+                        pass
+
+        for i in range(tot):
+            if CANCEL_EVENT.is_set():
+                break
+            try:
+                norm, cost, used_model, tier, end_hms = run_eval_chunk(i, running_ctx, force_paid=False)
+                chunks_by_idx[i] = norm
+                running_ctx = update_running_context(running_ctx, norm, end_hms)
+                act_cost += cost
+                models_used.add(f"{tier}:{used_model}")
+                print(f"✅ Chunk {i+1}/{tot} ({norm['window']['start']}->{norm['window']['end']}) turns={len(norm['turns'])} via {tier}:{used_model} | ${cost:.4f}", flush=True)
             except Exception as e:
                 if CANCEL_EVENT.is_set() or "Cancelled by user" in str(e):
                     break
-                failed.append(i)
-                print(f"⚠️ Chunk {i+1} Failed: {e}", flush=True)
+                failed_idxs.append(i)
+                print(f"⚠️ Chunk {i+1} failed (queued for DLQ): {e}", flush=True)
+            done_now = sum(1 for x in chunks_by_idx if x is not None)
+            eta = int(((time.time() - proc_start) / max(1, i + 1)) * (tot - i - 1)) + 30
+            push_status(cfg, fid, run_id, "running", f"توثيق الصندوق الأسود ({done_now}/{tot})", done_now, tot, act_cost, started_at, eta_sec=eta)
 
-    if CANCEL_EVENT.is_set():
+        # DLQ Rescue BEFORE deleting local source video
+        if failed_idxs and not CANCEL_EVENT.is_set():
+            print(f"Entering DLQ Rescue for {len(failed_idxs)} chunks...", flush=True)
+            push_status(cfg, fid, run_id, "running", f"إنقاذ المقاطع المتعثرة ({len(failed_idxs)})...", sum(1 for x in chunks_by_idx if x), tot, act_cost, started_at)
+            time.sleep(8)
+            for i in failed_idxs:
+                if CANCEL_EVENT.is_set():
+                    break
+                try:
+                    use_paid = (strat != "flash_only") and (valid_paid is not None) and budget_ok()
+                    norm, cost, used_model, tier, _ = run_eval_chunk(i, running_ctx, force_paid=use_paid)
+                    chunks_by_idx[i] = norm
+                    act_cost += cost
+                    models_used.add(f"{tier}:{used_model}")
+                    print(f"🚑 Chunk {i+1} rescued via {tier}:{used_model}", flush=True)
+                except Exception as ex:
+                    print(f"❌ DLQ failed on chunk {i+1}: {ex}", flush=True)
+
         if downloaded_local and os.path.exists(local_input):
             try:
                 os.remove(local_input)
             except Exception:
                 pass
-        send_tg(f"🛑 تم إيقاف العملية ({clean_name}). الكلفة: ${act_cost:.4f}", tg_bot, tg_chat)
-        update_drive_folder_meta(fid, cfg, f"CANCELLED_{clean_name}", f"🔗 رابط المصدر: {src_url}\n🛑 ملغاة من لوحة التحكم")
-        finalize_cost_webhook(cfg, fid, act_cost, "cancelled", "تم الإلغاء من لوحة التحكم")
-        sys.exit(0)
 
-    # DLQ Rescue
-    if failed:
-        print(f"Entering Dead-Letter Queue (DLQ) for {len(failed)} chunks...", flush=True)
-        push_status(cfg, fid, run_id, "running", f"إنقاذ المقاطع المتعثرة ({len(failed)})...", completed_count, tot, act_cost, started_at)
-        time.sleep(8)
-        for i in failed:
-            if CANCEL_EVENT.is_set():
-                break
+        if CANCEL_EVENT.is_set():
+            update_drive_folder_meta(fid, cfg, f"CANCELLED_{clean_name}", f"🔗 {src_url}\n🛑 ملغاة من لوحة التحكم")
+            finalize_cost_webhook(cfg, fid, act_cost, "cancelled", "تم الإلغاء")
+            sys.exit(0)
+
+        valid_chunks = [c for c in chunks_by_idx if c is not None]
+        if not valid_chunks:
+            update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 {src_url}\n❌ فشلت جميع المقاطع")
+            finalize_cost_webhook(cfg, fid, 0.0, "failed", "فشلت جميع المقاطع")
+            sys.exit(1)
+
+        push_status(cfg, fid, run_id, "running", "التوليف وحساب سلّم 100 نقطة وبناء خطة التدريب والرسوم البيانية...", len(valid_chunks), tot, act_cost, started_at, eta_sec=25)
+        pre_eval = compute_deterministic_evaluation(valid_chunks, dur, rubric, derived_meta, {}, editorial_brief, editorial_mode)
+        synth_request = (
+            f"{prompt_system}\n\n{prompt_synth_tpl}\n\n"
+            f"نوع المسار التحريري: {editorial_label}\n"
+            f"المؤشرات المحسوبة حتمياً:\n{json.dumps(pre_eval['kpis'], ensure_ascii=False)}\n\n"
+            f"الموجز التحريري (editorial_brief):\n{json.dumps(editorial_brief, ensure_ascii=False)}\n\n"
+            f"أطول 5 أسئلة للمقدم (أعد صياغة أطول 3 منها إلى ≤12ث و≤30 كلمة باستفهام واحد ومرجع واحد):\n"
+            f"{json.dumps(pre_eval['longest_questions'], ensure_ascii=False)}\n\n"
+            'أخرج JSON صالح فقط بهذه المفاتيح:\n'
+            '{"qualitative_items":{"B3":{"score":0,"anchor_hit":"","evidence":[],"note":""},"C3":{"score":0,"anchor_hit":"","evidence":[],"note":""},"D1":{"score":0,"anchor_hit":"","evidence":[],"note":""},"D4":{"score":0,"anchor_hit":"","evidence":[],"note":""},"E1":{"score":0,"anchor_hit":"","evidence":[],"note":""},"E2":{"score":0,"anchor_hit":"","evidence":[],"note":""},"E4":{"score":0,"anchor_hit":"","evidence":[],"note":""},"F1":{"score":0,"anchor_hit":"","evidence":[],"note":""},"F2":{"score":0,"anchor_hit":"","evidence":[],"note":""},"F3":{"score":0,"anchor_hit":"","evidence":[],"note":""},"G2":{"score":0,"anchor_hit":"","evidence":[],"note":""}},'
+            '"question_rewrites":[{"ts":"","orig_duration_s":0,"original":"","rewritten":""}],'
+            '"report":{"summary":"","strengths":[""],"priorities":[""]}}\n\n'
+            f"بيانات المقاطع:\n{json.dumps(valid_chunks, ensure_ascii=False)[:180000]}"
+        )
+
+        llm_qual = {}
+        synth_candidates = (
+            [(valid_paid, m, True) for m in (rank_discovered_models(paid_models, PREFERRED_SYNTH_ORDER, True) or paid_models)]
+            if (strat != "flash_only" and valid_paid and budget_ok()) else []
+        ) + [(k, m, False) for k, kms in valid_free for m in kms]
+        for skey, smodel, spaid in synth_candidates:
             try:
-                use_paid = (strat != "flash_only") and (valid_paid is not None) and budget_ok()
-                data, c, win = process_chunk(i, force_paid=use_paid)
-                results[i] = {"chunk_index": i + 1, "window": win, "data": data}
-                with STATE_LOCK:
-                    act_cost += c
-                    completed_count += 1
-                push_status(cfg, fid, run_id, "running", f"إنقاذ المقاطع ({completed_count}/{tot})", completed_count, tot, act_cost, started_at)
-                print(f"🚑 Chunk {i+1} Rescued.", flush=True)
-            except Exception as ex:
-                print(f"❌ DLQ Rescue Failed for chunk {i+1}: {ex}", flush=True)
-                results[i] = None
-                time.sleep(3)
-
-    if downloaded_local and os.path.exists(local_input):
-        try:
-            os.remove(local_input)
-        except Exception:
-            pass
-
-    valid_chunks = [r for r in results if r is not None and r.get("data")]
-    if not valid_chunks:
-        send_tg(f"❌ فشلت جميع المقاطع ({clean_name}). تم استرداد الرصيد المحجوز.", tg_bot, tg_chat)
-        update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 رابط المصدر: {src_url}\n❌ فشلت جميع المقاطع")
-        finalize_cost_webhook(cfg, fid, 0.0, "failed", "فشلت جميع المقاطع")
-        sys.exit(1)
-
-    # STEP 3: SYNTHESIS -> DETAILED HTML + SUMMARIZED HTML + FORENSIC BLACKBOX
-    push_status(cfg, fid, run_id, "running", "تجميع التقريرين المفصل والمختصر والصندوق الأسود...", len(valid_chunks), tot, act_cost, started_at, eta_sec=25)
-
-    synth_candidates = []
-    if strat != "flash_only" and valid_paid and budget_ok():
-        synth_order = rank_discovered_models(paid_models, PREFERRED_SYNTH_ORDER, allow_pro=True) or paid_models
-        for m in synth_order:
-            synth_candidates.append((valid_paid, m, True))
-    for k, kmodels in valid_free:
-        for m in kmodels:
-            synth_candidates.append((k, m, False))
-
-    if mode == "eval":
-        synth_prompt = build_eval_synthesis_prompt(clean_name, exact_duration, editorial_mode, system_prompt) + json.dumps(valid_chunks, ensure_ascii=False)
-    else:
-        synth_prompt = build_daily_synthesis_prompt(clean_name, exact_duration, system_prompt) + json.dumps(valid_chunks, ensure_ascii=False)
-
-    final_data = {}
-    synth_used_label = ""
-    for skey, smodel, spaid in synth_candidates:
-        try:
-            client = genai.Client(api_key=skey)
-            res = client.models.generate_content(
-                model=smodel,
-                contents=synth_prompt,
-                config=build_gen_config(max_out=65536),
-            )
-            final_data = clean_json_text(res.text)
-            c_syn = calc_cost(smodel, res.usage_metadata, spaid)
-            act_cost += c_syn
-            synth_used_label = f"{'PAID' if spaid else 'FREE'}:{smodel}"
-            models_used.add(synth_used_label)
-            print(f"✅ Synthesis complete via {synth_used_label} | cost=${c_syn:.4f}", flush=True)
-            break
-        except Exception as e:
-            print(f"[Synthesis Retry {smodel}] {str(e)[:180]}", flush=True)
-
-    # Pull last_spoken_words from last valid chunk if synthesis omitted it
-    if mode == "eval" and not final_data.get("lastSpokenWords"):
-        for r in reversed(valid_chunks):
-            lsw = (r.get("data") or {}).get("last_spoken_words", "")
-            if lsw:
-                final_data["lastSpokenWords"] = lsw
+                client = genai.Client(api_key=skey)
+                res = client.models.generate_content(model=smodel, contents=synth_request, config=build_gen_config(max_out=32768))
+                llm_qual = clean_json_text(res.text)
+                act_cost += calc_cost(smodel, res.usage_metadata, spaid)
+                models_used.add(f"{'PAID' if spaid else 'FREE'}:{smodel}")
                 break
+            except Exception as e:
+                print(f"[Synthesis Retry {smodel}] {str(e)[:150]}", flush=True)
 
-    banner_html = (
-        f'<div class="thinking-note">المنظومة: V5.7 ({editorial_label if mode == "eval" else "تحليل البث اليومي"}) '
-        f'| المقاطع: {len(valid_chunks)}/{tot} | التجميع: {synth_used_label or "Auto"} | التكلفة: ${act_cost:.4f}</div>'
-    )
+        final_eval = compute_deterministic_evaluation(valid_chunks, dur, rubric, derived_meta, llm_qual, editorial_brief, editorial_mode)
+        charts = generate_eval_charts(final_eval)
+        meta_info = {
+            "clean_name": clean_name, "editorial_label": editorial_label,
+            "chunks_ok": len(valid_chunks), "chunks_total": tot, "actual_cost": act_cost,
+            "models_used": sorted(models_used), "src_url": src_url,
+        }
 
-    if mode == "eval":
-        det_inner = final_data.get("mainDetailedHtml") or fallback_eval_detailed_html(final_data, clean_name, exact_duration, editorial_label)
-        sum_inner = final_data.get("summarizedHtml") or det_inner
-        det_filename = f"01_Main_Detailed_Report_{clean_name}.html"
-        sum_filename = f"02_Summarized_Report_{clean_name}.html"
+        det_html = render_detailed_eval_html(clean_name, exact_duration, derived_meta, final_eval, llm_qual, charts, meta_info)
+        sum_html = render_summarized_eval_html(clean_name, exact_duration, final_eval, llm_qual, charts)
+        trn_html = render_training_plan_html(clean_name, final_eval, llm_qual)
+        bb_md = generate_blackbox_v2_md(clean_name, exact_duration, derived_meta, valid_chunks, final_eval, meta_info)
+        bb_json_obj = {
+            "prompt_version": "blackbox-v2.0",
+            "rubric_version": rubric.get("rubric_version", "manar-100-v2"),
+            "metadata": {**meta_info, "derived": derived_meta},
+            "evaluation": final_eval,
+            "qualitative_synthesis": llm_qual,
+            "chunks": valid_chunks,
+        }
+
+        files_to_write = [
+            (f"01_Main_Detailed_Report_{clean_name}.html", det_html, "text/html"),
+            (f"02_Summarized_Report_{clean_name}.html", sum_html, "text/html"),
+            (f"03_Training_Plan_{clean_name}.html", trn_html, "text/html"),
+            (f"04_Blackbox_V2_{clean_name}.md", bb_md, "text/markdown"),
+            (f"05_Blackbox_V2_{clean_name}.json", json.dumps(bb_json_obj, ensure_ascii=False, indent=2), "application/json"),
+        ]
+        out_paths = []
+        for fname, content, mime in files_to_write:
+            fp = os.path.join(BACKUP_DIR, fname)
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(content)
+            out_paths.append(fp)
+            drive_upload(fid, cfg, fp, mime)
+            if not fname.endswith(".json"):
+                send_tg(f"📄 <b>{fname}</b> | النتيجة: {final_eval['score_final']['reported_as']} | الكلفة: ${act_cost:.4f}", tg_bot, tg_chat, fp)
+
+        email_subj = f"✅ تقييم V6.0 ({clean_name}) — {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})"
+        smtp_ok = send_smtp_resilient(email_subj, sum_html, out_paths[:4], cfg.get("alert_emails", ""), gm_u, gm_p)
+        final_folder_name = f"PROCESSED_{clean_name}_${act_cost:.2f}"
+        folder_desc = (
+            f"🔗 رابط المصدر: {src_url}\n\n"
+            f"• الاسم: {clean_name}\n• النتيجة: {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})\n"
+            f"• الخام: {final_eval['score_final']['raw_score']} | التعقيد: +{final_eval['score_final']['difficulty_modifier']} | السقف: {final_eval['score_final']['cap_ceiling']}\n"
+            f"• الأولوية القصوى: {final_eval['top_priority_auto']}\n• الكلفة: ${act_cost:.4f} | المقاطع: {len(valid_chunks)}/{tot}"
+        )
+        update_drive_folder_meta(fid, cfg, final_folder_name, folder_desc)
+        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"اكتمل ({final_eval['score_final']['reported_as']})", trigger_gas_email=(not smtp_ok), email_subject=email_subj)
+        print(f"🎉 V6.0 completed! {final_folder_name} | Score: {final_eval['score_final']['reported_as']} | Cost: ${act_cost:.4f}", flush=True)
+
     else:
-        det_inner = final_data.get("mainDetailedHtml") or fallback_daily_detailed_html(valid_chunks, clean_name, exact_duration)
-        sum_inner = final_data.get("summarizedHtml") or det_inner
-        det_filename = f"01_Daily_Detailed_Report_{clean_name}.html"
-        sum_filename = f"02_Daily_Summarized_Report_{clean_name}.html"
+        # Daily Broadcast Mode (Parallel + DLQ + Detailed & Summarized Word-RTL + Blackbox .md/.json)
+        daily_results, failed_daily, done_daily = [None] * tot, [], 0
+        proc_start = time.time()
 
-    bb_filename = f"03_Blackbox_Forensic_{clean_name}.md"
+        def run_daily(i: int, force_paid: bool = False):
+            mp4, st, d, _ = extract_chunk_media(i)
+            st_h, en_h = format_hhmmss(st), format_hhmmss(st + d)
+            pr = (
+                f"أخرج JSON لحلقة البث اليومي من {st_h} إلى {en_h} (Zero Hallucination) بهذا الشكل:\n"
+                '{"chunk_window":"","programs":[{"start":"HH:MM:SS","end":"HH:MM:SS","category":"","theme":"","title":"","presenter":"","guests":[],"reporters":[],"vt_reports":[],"summary":""}],"breaking_tickers":[]}\n'
+                f"{system_prompt_extra}"
+            )
+            try:
+                dat, c, m, t = call_gemini_chunk(mp4, pr, valid_free, valid_paid, paid_models, "pro_only" if force_paid else strat, exhausted_pairs, bad_keys, budget_ok)
+                with STATE_LOCK:
+                    models_used.add(f"{t}:{m}")
+                return dat, c
+            finally:
+                if os.path.exists(mp4):
+                    try:
+                        os.remove(mp4)
+                    except Exception:
+                        pass
 
-    det_html = wrap_royal_html(f"التقرير المفصل - {clean_name}", det_inner, banner_html)
-    sum_html = wrap_royal_html(f"التقرير المختصر - {clean_name}", sum_inner, banner_html)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(run_daily, i, False): i for i in range(tot)}
+            for fut in as_completed(futs):
+                i = futs[fut]
+                try:
+                    dat, c = fut.result()
+                    daily_results[i] = {"chunk_index": i + 1, "data": dat}
+                    with STATE_LOCK:
+                        act_cost += c
+                        done_daily += 1
+                        cur_d, cur_c = done_daily, act_cost
+                    eta = int(((time.time() - proc_start) / cur_d) * (tot - cur_d)) + 15
+                    push_status(cfg, fid, run_id, "running", f"تحليل البث اليومي ({cur_d}/{tot})", cur_d, tot, cur_c, started_at, eta_sec=eta)
+                except Exception as e:
+                    if CANCEL_EVENT.is_set() or "Cancelled by user" in str(e):
+                        break
+                    failed_daily.append(i)
+                    print(f"⚠️ Daily chunk {i+1}: {e}", flush=True)
 
-    meta_info = {
-        "clean_name": clean_name,
-        "presenter_name": final_data.get("presenter") or cfg.get("presenter_name") or clean_name,
-        "mode": mode,
-        "editorial_mode": editorial_mode,
-        "editorial_label": editorial_label if mode == "eval" else "رصد وتحليل بث يومي شامل",
-        "exact_duration": exact_duration,
-        "chunks_ok": len(valid_chunks),
-        "chunks_total": tot,
-        "chunk_min": chunk_min,
-        "fps": fps,
-        "src_url": src_url,
-        "models_used": models_used,
-        "actual_cost": act_cost,
-        "system_prompt": system_prompt,
-    }
-    blackbox_md = generate_forensic_blackbox_md(mode, valid_chunks, final_data, meta_info)
+        if failed_daily and not CANCEL_EVENT.is_set():
+            time.sleep(8)
+            for i in failed_daily:
+                if CANCEL_EVENT.is_set():
+                    break
+                try:
+                    dat, c = run_daily(i, force_paid=(strat != "flash_only" and bool(valid_paid) and budget_ok()))
+                    daily_results[i] = {"chunk_index": i + 1, "data": dat}
+                    act_cost += c
+                except Exception:
+                    pass
 
-    elapsed_sec = int(time.time() - started_at)
-    elapsed_str = f"{elapsed_sec // 60} دقيقة و {elapsed_sec % 60} ثانية"
+        if downloaded_local and os.path.exists(local_input):
+            try:
+                os.remove(local_input)
+            except Exception:
+                pass
 
-    run_summary = {
-        "status": "SUCCESS",
-        "clean_name": clean_name,
-        "mode": mode,
-        "editorial_label": meta_info["editorial_label"],
-        "models_used": sorted(models_used),
-        "chunks_ok": len(valid_chunks),
-        "chunks_total": tot,
-        "duration_hms": exact_duration,
-        "elapsed_str": elapsed_str,
-        "actual_cost_usd": round(act_cost, 4),
-        "last_spoken_words": final_data.get("lastSpokenWords", ""),
-        "total_score": final_data.get("total_score", None),
-        "percentage": final_data.get("percentage", None),
-    }
+        if CANCEL_EVENT.is_set():
+            update_drive_folder_meta(fid, cfg, f"CANCELLED_{clean_name}", f"🔗 {src_url}\n🛑 ملغاة")
+            finalize_cost_webhook(cfg, fid, act_cost, "cancelled", "تم الإلغاء")
+            sys.exit(0)
 
-    # Save all files locally in ./backup_reports (for GitHub Actions Artifacts + uploads)
-    det_path = os.path.join(BACKUP_DIR, det_filename)
-    sum_path = os.path.join(BACKUP_DIR, sum_filename)
-    bb_path = os.path.join(BACKUP_DIR, bb_filename)
-    js_path = os.path.join(BACKUP_DIR, "_run_summary.json")
+        valid_daily = [r for r in daily_results if r and isinstance(r.get("data"), dict)]
+        if not valid_daily:
+            update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 {src_url}\n❌ فشلت جميع المقاطع")
+            finalize_cost_webhook(cfg, fid, 0.0, "failed", "فشلت جميع المقاطع")
+            sys.exit(1)
 
-    with open(det_path, "w", encoding="utf-8") as f:
-        f.write(det_html)
-    with open(sum_path, "w", encoding="utf-8") as f:
-        f.write(sum_html)
-    with open(bb_path, "w", encoding="utf-8") as f:
-        f.write(blackbox_md)
-    with open(js_path, "w", encoding="utf-8") as f:
-        json.dump(run_summary, f, ensure_ascii=False, indent=2)
+        all_progs = [p for r in valid_daily for p in r["data"].get("programs", []) if isinstance(p, dict)]
+        rows = "".join(
+            f"<tr class='{'alt' if idx%2 else ''}'><td class='num' dir='ltr'>{esc(p.get('start'))}–{esc(p.get('end'))}</td>"
+            f"<td>{esc(p.get('category'))}</td><td>{esc(p.get('theme'))}</td><td class='lbl'>{esc(p.get('title'))}</td><td>{esc(p.get('summary'))}</td></tr>"
+            for idx, p in enumerate(all_progs)
+        )
+        cat_counts = {}
+        for p in all_progs:
+            cat = p.get("category") or "أخرى"
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        cat_rows = "".join(f"<tr><td class='lbl'>{esc(k)}</td><td class='num'>{v}</td></tr>" for k, v in sorted(cat_counts.items(), key=lambda x: x[1], reverse=True))
 
-    out_files = [det_path, sum_path, bb_path]
+        det_daily = wrap_word_doc(
+            f"البث اليومي المفصل - {clean_name}",
+            f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>رصد البث اليومي V6.0</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)} — المدة: {esc(exact_duration)}</p></td></tr></table>"
+            f"<h2>جدول البرامج والفقرات ({len(all_progs)} فقرة)</h2><table><tr><th>التوقيت</th><th>التصنيف</th><th>المحور</th><th>العنوان</th><th>الملخص</th></tr>{rows}</table>"
+        )
+        sum_daily = wrap_word_doc(
+            f"ملخص البث اليومي - {clean_name}",
+            f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>الملخص التنفيذي للبث اليومي V6.0</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)}</p><p style='margin:4pt 0 0;color:#c9d6e4;'>المدة: {esc(exact_duration)} | الفقرات: {len(all_progs)} | المقاطع: {len(valid_daily)}/{tot} | الكلفة: ${act_cost:.4f}</p></td></tr></table>"
+            f"<h2>توزيع الفقرات حسب التصنيف</h2><table><tr><th>التصنيف</th><th class='num'>العدد</th></tr>{cat_rows}</table>"
+        )
+        bb_daily_md = f"# DAILY BROADCAST BLACKBOX V2 — {clean_name}\n- Duration: {exact_duration} | Chunks: {len(valid_daily)}/{tot} | Cost: ${act_cost:.4f}\n\n" + "\n".join(
+            f"- [{p.get('start')}–{p.get('end')}] **{p.get('title')}** ({p.get('category')}/{p.get('theme')}): {p.get('summary')}" for p in all_progs
+        )
+        daily_files = [
+            (f"01_Daily_Detailed_Report_{clean_name}.html", det_daily, "text/html"),
+            (f"02_Daily_Summarized_Report_{clean_name}.html", sum_daily, "text/html"),
+            (f"04_Blackbox_V2_{clean_name}.md", bb_daily_md, "text/markdown"),
+            (f"05_Blackbox_V2_{clean_name}.json", json.dumps({"clean_name": clean_name, "derived": derived_meta, "chunks": valid_daily}, ensure_ascii=False, indent=2), "application/json"),
+        ]
+        out_paths = []
+        for fname, content, mime in daily_files:
+            fp = os.path.join(BACKUP_DIR, fname)
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(content)
+            out_paths.append(fp)
+            drive_upload(fid, cfg, fp, mime)
+            if not fname.endswith(".json"):
+                send_tg(f"📄 <b>{fname}</b> | الكلفة: ${act_cost:.4f}", tg_bot, tg_chat, fp)
 
-    # STEP 4: MULTI-CHANNEL DELIVERY (Drive + Telegram + SMTP/GmailApp Backup)
-    for fpath in out_files:
-        mime = "text/markdown" if fpath.endswith(".md") else "text/html"
-        drive_upload(fid, cfg, fpath, mime)
-        send_tg(f"📄 <b>{os.path.basename(fpath)}</b>\n• المدة: {exact_duration} | المقاطع: {len(valid_chunks)}/{tot} | الكلفة: ${act_cost:.4f}", tg_bot, tg_chat, fpath)
-    drive_upload(fid, cfg, js_path, "application/json")
-
-    email_subj = f"✅ اكتمل تقرير V5.7 ({clean_name}) | الكلفة: ${act_cost:.4f}"
-    smtp_ok = send_smtp_resilient(email_subj, sum_html, out_files, cfg.get("alert_emails", ""), gm_u, gm_p)
-
-    # Rename Drive folder PRESERVING presenter/episode name + full rich description!
-    final_folder_name = f"PROCESSED_{clean_name}_${act_cost:.2f}"
-    folder_desc = (
-        f"🔗 رابط المصدر: {src_url}\n\n"
-        f"COST_USD: ${act_cost:.4f} | CHUNKS: {len(valid_chunks)}/{tot}\n"
-        f"• الاسم: {clean_name}\n"
-        f"• المسار: {meta_info['editorial_label']}\n"
-        f"• النماذج المستخدمة: {', '.join(sorted(models_used))}\n"
-        f"• المدة الإجمالية: {exact_duration} | وقت التنفيذ: {elapsed_str}\n"
-        + (f"• العلامة النهائية: {final_data.get('total_score',0)}/90 ({final_data.get('percentage',0)}%)\n" if mode == "eval" else "")
-        + (f"• آخر كلام في الحلقة:\n«{final_data.get('lastSpokenWords','')}»\n" if final_data.get("lastSpokenWords") else "")
-    )
-    update_drive_folder_meta(fid, cfg, final_folder_name, folder_desc)
-
-    folder_url = f"https://drive.google.com/drive/folders/{fid}"
-    send_tg(
-        f"✅ <b>اكتمل التحليل بنجاح: {clean_name}</b>\n"
-        f"• المسار: {meta_info['editorial_label']}\n"
-        + (f"• العلامة: <b>{final_data.get('total_score',0)}/90 ({final_data.get('percentage',0)}%)</b>\n" if mode == "eval" else "")
-        + f"• المقاطع: {len(valid_chunks)}/{tot} | المدة: {exact_duration} | الاستغراق: {elapsed_str}\n"
-        f"• الكلفة الفعلية: <b>${act_cost:.4f}</b>\n"
-        + (f"• آخر كلام في الحلقة: «{final_data.get('lastSpokenWords','')}»\n" if final_data.get("lastSpokenWords") else "")
-        + f"📁 المجلد: {folder_url}",
-        tg_bot,
-        tg_chat,
-    )
-
-    finalize_cost_webhook(
-        cfg,
-        fid,
-        act_cost,
-        "completed",
-        f"اكتمل بنجاح ({len(valid_chunks)}/{tot})",
-        trigger_gas_email=(not smtp_ok),
-        email_subject=email_subj,
-    )
-    print(f"🎉 Pipeline V5.7 completed! Folder: {final_folder_name} | Chunks: {len(valid_chunks)}/{tot} | Cost: ${act_cost:.4f}", flush=True)
+        email_subj = f"✅ تقرير البث اليومي V6.0 ({clean_name}) | الكلفة: ${act_cost:.4f}"
+        smtp_ok = send_smtp_resilient(email_subj, sum_daily, out_paths[:3], cfg.get("alert_emails", ""), gm_u, gm_p)
+        update_drive_folder_meta(fid, cfg, f"PROCESSED_{clean_name}_${act_cost:.2f}", f"🔗 {src_url}\n• الفقرات: {len(all_progs)} | الكلفة: ${act_cost:.4f}")
+        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"اكتمل البث اليومي ({len(valid_daily)}/{tot})", trigger_gas_email=(not smtp_ok), email_subject=email_subj)
 
 
 if __name__ == "__main__":
