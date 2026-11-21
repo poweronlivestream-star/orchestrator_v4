@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V6.1 - Blackbox v2.0 + Manar-100-v2 Deterministic Engine
+Master Orchestrator V7.0 - Blackbox v2.0 + Manar-100-v2 Deterministic Engine
 - Default 5-minute (300s) eval chunks with sequential running_context.json & entities.csv resolution.
 - Reads prompt_system.md, prompt_chunk.md, prompt_synthesis.md, schema_chunk.json, rubric.json, entities.csv from repo root.
 - Official google-genai SDK with fast parallel pre-flight validation, smart error classification, round-robin free keys, and paid fallback.
@@ -94,6 +94,66 @@ MAX_FREE_KEYS_PER_CHUNK = 2
 FREE_RR_COUNTER = 0
 RUNTIME_DRIVE_TOKEN = ""
 STATUS_FILE_DRIVE_ID = None
+MODEL_COOLDOWN_UNTIL = {}   # model_name -> epoch timestamp (for 503 spikes)
+PAIR_COOLDOWN_UNTIL = {}    # (api_key, model_name) -> epoch timestamp (for 1st 429 RPM)
+PAIR_429_COUNT = {}         # (api_key, model_name) -> count of 429 hits
+KEY_HEALTH_STATS = {}       # masked_key -> {tier, ok, err_429, err_503, err_timeout, err_other}
+DRIVE_AUTH_MODE = "token"   # service_account | refresh_token | token
+RUN_START_MONO = time.time()
+
+
+def record_key_stat(api_key: str, is_paid: bool, outcome: str):
+    mk = mask_key(api_key)
+    with STATE_LOCK:
+        st = KEY_HEALTH_STATS.setdefault(mk, {"key": mk, "tier": "PAID" if is_paid else "FREE", "ok": 0, "err_429": 0, "err_503": 0, "err_timeout": 0, "err_other": 0})
+        if outcome in st:
+            st[outcome] += 1
+
+
+def get_key_health_snapshot() -> list:
+    with STATE_LOCK:
+        return [dict(v) for v in KEY_HEALTH_STATS.values()]
+
+
+def log(msg: str):
+    """Timestamped unbuffered logger for GitHub Actions diagnostics."""
+    now_str = datetime.now(BEIRUT_TZ).strftime("%H:%M:%S")
+    el = int(time.time() - RUN_START_MONO)
+    em, es = divmod(el, 60)
+    eh, em = divmod(em, 60)
+    el_str = f"{eh:02d}:{em:02d}:{es:02d}" if eh else f"{em:02d}:{es:02d}"
+    print(f"[{now_str} | +{el_str}] {msg}", flush=True)
+
+
+def run_with_hard_timeout(fn, timeout_sec: float, label: str):
+    """Runs blocking SDK/network calls inside a daemon thread so stalled TCP sockets NEVER hang the job."""
+    box = {"done": False, "val": None, "err": None}
+
+    def _target():
+        try:
+            box["val"] = fn()
+        except BaseException as exc:
+            box["err"] = exc
+        finally:
+            box["done"] = True
+
+    th = threading.Thread(target=_target, daemon=True)
+    th.start()
+    th.join(timeout=timeout_sec)
+    if not box["done"]:
+        raise TimeoutError(f"Hard watchdog timeout ({int(timeout_sec)}s) exceeded during: {label}")
+    if box["err"] is not None:
+        raise box["err"]
+    return box["val"]
+
+
+def make_genai_client(api_key: str, timeout_ms: int = 180_000):
+    """Creates google-genai Client with explicit HTTP timeout (milliseconds) when supported."""
+    try:
+        http_opts = types.HttpOptions(timeout=timeout_ms)
+        return genai.Client(api_key=api_key, http_options=http_opts)
+    except Exception:
+        return genai.Client(api_key=api_key)
 
 DEFAULT_ENTITIES_CSV = (
     "id,type,canonical_ar,aliases_ar,role,notes\n"
@@ -193,13 +253,24 @@ def clean_json_text(text: str) -> dict:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         raw = "\n".join(lines).strip()
+    parsed = None
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except Exception:
         start, end = raw.find("{"), raw.rfind("}")
         if start != -1 and end > start:
-            return json.loads(raw[start : end + 1])
-        raise
+            parsed = json.loads(raw[start : end + 1])
+        else:
+            raise
+    # Unwrap accidental single-element list wrapping (e.g., [{...}])
+    if isinstance(parsed, list):
+        for elem in parsed:
+            if isinstance(elem, dict):
+                return elem
+        raise ValueError(f"Expected JSON object, got list of length {len(parsed)}")
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Expected JSON object, got {type(parsed).__name__}")
+    return parsed
 
 
 AXIS_AR_CODE = {"A": "أ", "B": "ب", "C": "ج", "D": "د", "E": "هـ", "F": "و", "G": "ز"}
@@ -443,55 +514,103 @@ def send_tg(msg, token, chat, file_path=None):
 
 
 def send_smtp_resilient(subject, html_body, files, emails, user, pwd) -> bool:
+    from email.message import EmailMessage
     user = (user or "").strip()
     pwd = re.sub(r"\s+", "", (pwd or "").strip())
-    recips = [e.strip() for e in re.split(r"[,;]", emails or "") if e.strip()]
+    recips = [e.strip() for e in re.split(r"[,;\s\n\r]+", emails or "") if "@" in e.strip()]
     if user and user not in recips:
         recips.insert(0, user)
     if not (user and pwd and recips):
         return False
 
-    def build_msg(recipient):
-        msg = MIMEMultipart()
+    def build_msg(recipient, attach_files):
+        msg = EmailMessage()
         msg["From"] = user
         msg["To"] = recipient
         msg["Subject"] = subject
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-        for pf in files:
+        msg.set_content("يرجى فتح التقرير المرفق بصيغة HTML.", subtype="plain", charset="utf-8")
+        msg.add_alternative(html_body, subtype="html", charset="utf-8")
+        for pf in attach_files:
             if pf and os.path.exists(pf):
                 with open(pf, "rb") as f:
-                    p = MIMEBase("application", "octet-stream")
-                    p.set_payload(f.read())
-                encoders.encode_base64(p)
-                p.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(pf)}"')
-                msg.attach(p)
+                    raw = f.read()
+                fn = os.path.basename(pf)
+                sub = "html" if fn.endswith(".html") else ("markdown" if fn.endswith(".md") else "octet-stream")
+                main_t = "text" if sub in ("html", "markdown") else "application"
+                msg.add_attachment(raw, maintype=main_t, subtype=sub, filename=fn)
         return msg
 
-    for port, use_ssl in ((465, True), (587, False)):
+    # Try full attachments on 465 & 587, then body-only fallback if connection drops on size
+    for attach_set, label in ((files, "with attachments"), ([], "summary only")):
+        for port, use_ssl in ((465, True), (587, False)):
+            try:
+                if use_ssl:
+                    with smtplib.SMTP_SSL("smtp.gmail.com", port, timeout=60) as s:
+                        s.ehlo()
+                        s.login(user, pwd)
+                        for rec in recips:
+                            s.send_message(build_msg(rec, attach_set))
+                else:
+                    with smtplib.SMTP("smtp.gmail.com", port, timeout=60) as s:
+                        s.ehlo()
+                        s.starttls()
+                        s.ehlo()
+                        s.login(user, pwd)
+                        for rec in recips:
+                            s.send_message(build_msg(rec, attach_set))
+                print(f"✅ SMTP ({port}, {label}) sent to: {recips}", flush=True)
+                return True
+            except Exception as e:
+                print(f"[SMTP {port} {label} Warning] {e}", flush=True)
+                time.sleep(2)
+    return False
+
+
+def init_or_refresh_permanent_drive_token() -> bool:
+    """Acquires/refreshes a Google Drive OAuth token without 60-min expiration via Service Account or Refresh Token."""
+    global RUNTIME_DRIVE_TOKEN, DRIVE_AUTH_MODE
+    sa_json = (os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON") or "").strip()
+    if sa_json:
         try:
-            if use_ssl:
-                with smtplib.SMTP_SSL("smtp.gmail.com", port, timeout=25) as s:
-                    s.ehlo()
-                    s.login(user, pwd)
-                    for rec in recips:
-                        s.sendmail(user, [rec], build_msg(rec).as_string())
-            else:
-                with smtplib.SMTP("smtp.gmail.com", port, timeout=25) as s:
-                    s.ehlo()
-                    s.starttls()
-                    s.ehlo()
-                    s.login(user, pwd)
-                    for rec in recips:
-                        s.sendmail(user, [rec], build_msg(rec).as_string())
-            print(f"✅ SMTP ({port}) sent to: {recips}", flush=True)
-            return True
+            from google.oauth2 import service_account
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+            info = json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+            creds.refresh(GoogleAuthRequest())
+            if creds.token:
+                with DRIVE_TOKEN_LOCK:
+                    RUNTIME_DRIVE_TOKEN = creds.token
+                DRIVE_AUTH_MODE = "service_account"
+                log("🔐 Authenticated Google Drive via Permanent Service Account.")
+                return True
         except Exception as e:
-            print(f"[SMTP {port} Warning] {e}", flush=True)
+            log(f"⚠️ Service Account Drive Auth failed (falling back): {e}")
+
+    rtok = (os.environ.get("GDRIVE_REFRESH_TOKEN") or "").strip()
+    cid = (os.environ.get("GDRIVE_CLIENT_ID") or "").strip()
+    csec = (os.environ.get("GDRIVE_CLIENT_SECRET") or "").strip()
+    if rtok and cid and csec:
+        try:
+            r = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={"client_id": cid, "client_secret": csec, "refresh_token": rtok, "grant_type": "refresh_token"},
+                timeout=15,
+            )
+            if r.status_code == 200 and r.json().get("access_token"):
+                with DRIVE_TOKEN_LOCK:
+                    RUNTIME_DRIVE_TOKEN = r.json()["access_token"].strip()
+                DRIVE_AUTH_MODE = "refresh_token"
+                log("🔐 Refreshed Google Drive OAuth token via permanent Refresh Token.")
+                return True
+        except Exception as e:
+            log(f"⚠️ OAuth Refresh Token failed (falling back): {e}")
     return False
 
 
 def refresh_drive_token_via_webhook(cfg) -> bool:
     global RUNTIME_DRIVE_TOKEN
+    if init_or_refresh_permanent_drive_token():
+        return True
     webhook, secret = cfg.get("webhook_url"), cfg.get("webhook_secret", "")
     if not (webhook and secret):
         return False
@@ -500,10 +619,10 @@ def refresh_drive_token_via_webhook(cfg) -> bool:
         if r.status_code == 200 and r.json().get("drive_token"):
             with DRIVE_TOKEN_LOCK:
                 RUNTIME_DRIVE_TOKEN = r.json()["drive_token"].strip()
-            print("🔄 Refreshed Google Drive OAuth token.", flush=True)
+            log("🔄 Refreshed Google Drive OAuth token via Apps Script webhook.")
             return True
     except Exception as e:
-        print(f"[Token Refresh Warning] {e}", flush=True)
+        log(f"[Token Refresh Warning] {e}")
     return False
 
 
@@ -540,6 +659,64 @@ def drive_upload(folder_id, cfg, filepath, mimetype) -> bool:
     except Exception as e:
         print(f"[Drive Upload Warning] {filename}: {e}", flush=True)
         return False
+
+
+def drive_upload_json_blob(folder_id, cfg, filename: str, obj) -> bool:
+    tmp_p = os.path.join("/tmp", f"ckpt_{os.getpid()}_{filename}")
+    try:
+        with open(tmp_p, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        return drive_upload(folder_id, cfg, tmp_p, "application/json")
+    except Exception as e:
+        log(f"[Checkpoint Save Warning] {filename}: {e}")
+        return False
+    finally:
+        if os.path.exists(tmp_p):
+            try:
+                os.remove(tmp_p)
+            except Exception:
+                pass
+
+
+def load_drive_checkpoints(folder_id, cfg) -> tuple:
+    """Loads any previously saved _ckpt_chunk_<idx>.json and _ckpt_ctx.json from Drive for seamless Resume."""
+    chunks_map, saved_ctx = {}, None
+    if not folder_id:
+        return chunks_map, saved_ctx
+    try:
+        q = f"'{folder_id}' in parents and name contains '_ckpt_' and trashed=false"
+        r = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": q, "fields": "files(id,name)", "pageSize": 500}, timeout=25)
+        if r.status_code != 200:
+            return chunks_map, saved_ctx
+        for f in r.json().get("files", []):
+            fn = f.get("name", "")
+            if fn == "_ckpt_ctx.json":
+                rr = drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media", cfg, timeout=20)
+                if rr.status_code == 200:
+                    saved_ctx = rr.json()
+            else:
+                m = re.match(r"^_ckpt_chunk_(\d+)\.json$", fn)
+                if m:
+                    rr = drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media", cfg, timeout=20)
+                    if rr.status_code == 200:
+                        chunks_map[int(m.group(1))] = rr.json()
+    except Exception as e:
+        log(f"[Checkpoint Load Warning] {e}")
+    return chunks_map, saved_ctx
+
+
+def cleanup_drive_checkpoints(folder_id, cfg):
+    """Removes temporary _ckpt_*.json files once a run completes cleanly."""
+    if not folder_id:
+        return
+    try:
+        q = f"'{folder_id}' in parents and name contains '_ckpt_' and trashed=false"
+        r = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": q, "fields": "files(id,name)", "pageSize": 500}, timeout=20)
+        if r.status_code == 200:
+            for f in r.json().get("files", []):
+                drive_request("DELETE", f"https://www.googleapis.com/drive/v3/files/{f['id']}", cfg, timeout=15)
+    except Exception:
+        pass
 
 
 def update_drive_folder_meta(folder_id, cfg, new_name, description_text=""):
@@ -583,15 +760,36 @@ def write_drive_status_and_check_cancel(folder_id, cfg, payload):
     return CANCEL_EVENT.is_set()
 
 
+def estimate_initial_eta_sec(cfg: dict, total_chunks: int) -> int:
+    if total_chunks <= 0:
+        return 0
+    mode = cfg.get("run_mode", "eval")
+    strat = cfg.get("tier_strategy", "hybrid")
+    workers = max(1, min(int(cfg.get("workers", 3) or 3), 6))
+    if mode == "eval":
+        # Sequential chunks (running_context): realistic per-chunk time including upload + ACTIVE + API + retries
+        sec_per_chunk = 95 if strat == "flash_only" else (65 if strat == "hybrid" else 45)
+        return int(total_chunks * sec_per_chunk + 75)
+    batches = math.ceil(total_chunks / workers)
+    sec_per_batch = 115 if strat == "flash_only" else (75 if strat == "hybrid" else 45)
+    return int(batches * sec_per_batch + 60)
+
+
 def push_status(cfg, folder_id, run_id, status, phase, completed, total, act_cost, started_at, eta_sec=None, message=""):
     elapsed = int(time.time() - started_at)
     if eta_sec is None:
-        eta_sec = int((elapsed / completed) * (total - completed)) if (completed > 0 and total > completed) else (int(total * 30) if status == "running" else 0)
+        if completed > 0 and total > completed:
+            eta_sec = int((elapsed / completed) * (total - completed)) + 45
+        elif status == "running":
+            eta_sec = estimate_initial_eta_sec(cfg, total)
+        else:
+            eta_sec = 0
     payload = {
         "action": "update_status", "job_id": folder_id, "run_id": str(run_id or ""),
         "status": status, "phase": phase, "completed_chunks": int(completed),
         "total_chunks": int(total), "elapsed_sec": elapsed, "eta_sec": max(0, int(eta_sec)),
         "actual_cost": round(float(act_cost), 4), "message": message, "updated_at_epoch": int(time.time()),
+        "key_health": get_key_health_snapshot(),
     }
     write_drive_status_and_check_cancel(folder_id, cfg, payload)
     webhook = cfg.get("webhook_url")
@@ -606,21 +804,33 @@ def push_status(cfg, folder_id, run_id, status, phase, completed, total, act_cos
     return CANCEL_EVENT.is_set()
 
 
-def finalize_cost_webhook(cfg, folder_id, actual_cost: float, final_status="completed", message="", trigger_gas_email=False, email_subject=""):
-    write_drive_status_and_check_cancel(folder_id, cfg, {
+def finalize_cost_webhook(cfg, folder_id, actual_cost: float, final_status="completed", message="", trigger_gas_email=False, email_subject="", completed_chunks=None, total_chunks=None, kpi_summary=None):
+    kh = get_key_health_snapshot()
+    st_payload = {
         "job_id": folder_id, "run_id": str(os.environ.get("GITHUB_RUN_ID", "")),
         "status": final_status, "phase": message or final_status, "eta_sec": 0,
         "actual_cost": round(float(actual_cost), 4), "message": message, "updated_at_epoch": int(time.time()),
-    })
+        "key_health": kh,
+    }
+    if completed_chunks is not None:
+        st_payload["completed_chunks"] = int(completed_chunks)
+    if total_chunks is not None:
+        st_payload["total_chunks"] = int(total_chunks)
+    write_drive_status_and_check_cancel(folder_id, cfg, st_payload)
     if cfg.get("webhook_url"):
         try:
-            requests.post(cfg["webhook_url"], json={
+            wh_body = {
                 "action": "finalize_cost", "webhook_secret": cfg.get("webhook_secret", ""),
                 "job_id": folder_id, "status": final_status,
                 "estimated_cost": cfg.get("pre_authorized_cost", 0), "actual_cost": round(float(actual_cost), 4),
                 "message": message, "send_backup_email": trigger_gas_email,
                 "email_subject": email_subject, "alert_emails": cfg.get("alert_emails", ""),
-            }, timeout=20)
+                "completed_chunks": completed_chunks, "total_chunks": total_chunks,
+                "key_health": kh,
+            }
+            if kpi_summary:
+                wh_body["kpi_summary"] = kpi_summary
+            requests.post(cfg["webhook_url"], json=wh_body, timeout=25)
         except Exception:
             pass
 
@@ -708,20 +918,23 @@ def build_gen_config(max_out: int = 32768):
     )
 
 
-def wait_file_active(client, uploaded_file, timeout_sec=120):
+def wait_file_active(client, uploaded_file, timeout_sec=90, tag=""):
     t0, f = time.time(), uploaded_file
+    polls = 0
     while True:
         if CANCEL_EVENT.is_set():
             raise RuntimeError("Cancelled by user")
         st = str(getattr(f, "state", "")).upper()
         if "ACTIVE" in st:
+            log(f"  ✅ {tag}File ACTIVE ({f.name}) in {time.time() - t0:.1f}s ({polls} polls)")
             return f
         if "FAILED" in st:
             raise ValueError(f"Google File API processing failed for {f.name}")
         if time.time() - t0 > timeout_sec:
-            raise TimeoutError(f"Timed out waiting for {f.name}")
+            raise TimeoutError(f"Timed out waiting {timeout_sec}s for {f.name} (state={st})")
         time.sleep(2)
-        f = client.files.get(name=f.name)
+        polls += 1
+        f = run_with_hard_timeout(lambda: client.files.get(name=f.name), 25, f"{tag}files.get({f.name})")
 
 
 def calc_cost(model_name: str, usage, is_paid: bool) -> float:
@@ -734,75 +947,142 @@ def calc_cost(model_name: str, usage, is_paid: bool) -> float:
     return (in_t / 1e6) * rates["in"] + ((out_t + think_t) / 1e6) * rates["out"]
 
 
-def call_gemini_chunk(media_path, prompt, valid_free, valid_paid, paid_models, strategy, exhausted_pairs, bad_keys, budget_ok_fn, chunk_schema=None):
+def call_gemini_chunk(media_path, prompt, valid_free, valid_paid, paid_models, strategy, exhausted_pairs, bad_keys, budget_ok_fn, chunk_schema=None, chunk_tag=""):
     global FREE_RR_COUNTER
     last_err = ""
     config = build_gen_config(max_out=32768)
+    tag = f"[{chunk_tag}] " if chunk_tag else ""
+    chunk_t0 = time.time()
+    file_mb = (os.path.getsize(media_path) / (1024 * 1024)) if os.path.exists(media_path) else 0.0
 
     def run_with_key(api_key, model_candidates, is_paid):
         nonlocal last_err
+        tier_lbl = "PAID" if is_paid else "FREE"
         if CANCEL_EVENT.is_set():
             raise RuntimeError("Cancelled by user")
+        if time.time() - chunk_t0 > 480:
+            last_err = "Chunk wall-clock limit (480s) reached"
+            log(f"  ⏰ {tag}{last_err} — aborting chunk to DLQ")
+            return None
         if is_paid and not budget_ok_fn():
             last_err = "Episode budget ceiling reached"
+            log(f"  💰 {tag}Skipped PAID key — episode budget cap reached")
             return None
         with STATE_LOCK:
             if api_key in bad_keys:
                 return None
-            models_to_try = [m for m in model_candidates if (api_key, m) not in exhausted_pairs]
+            now_ts = time.time()
+            avail_m = [m for m in model_candidates if (api_key, m) not in exhausted_pairs]
+            # Prefer models neither in 503 model-cooldown nor in 429 pair-cooldown
+            warm_m = [m for m in avail_m if MODEL_COOLDOWN_UNTIL.get(m, 0) <= now_ts and PAIR_COOLDOWN_UNTIL.get((api_key, m), 0) <= now_ts]
+            cool_m = [m for m in avail_m if m not in warm_m]
+            models_to_try = warm_m + cool_m
         if not models_to_try:
+            log(f"  ⏭️ {tag}Skipping {tier_lbl} {mask_key(api_key)} — all models exhausted")
             return None
 
-        client = genai.Client(api_key=api_key)
+        client = make_genai_client(api_key, timeout_ms=180_000)
         uploaded = None
         try:
-            uploaded = wait_file_active(client, client.files.upload(file=media_path))
+            t_up = time.time()
+            log(f"  ⬆️ {tag}Uploading {file_mb:.2f} MB to {tier_lbl} {mask_key(api_key)} (models={models_to_try})...")
+            raw_up = run_with_hard_timeout(lambda: client.files.upload(file=media_path), 90, f"{tag}files.upload({mask_key(api_key)})")
+            log(f"  ⏳ {tag}Uploaded ({raw_up.name}) in {time.time() - t_up:.1f}s — waiting for ACTIVE...")
+            uploaded = wait_file_active(client, raw_up, timeout_sec=90, tag=tag)
+
             for model_name in models_to_try:
                 if CANCEL_EVENT.is_set():
                     raise RuntimeError("Cancelled by user")
+                if time.time() - chunk_t0 > 480:
+                    last_err = "Chunk wall-clock limit (480s) reached"
+                    log(f"  ⏰ {tag}{last_err}")
+                    return None
                 try:
-                    res = client.models.generate_content(model=model_name, contents=[uploaded, prompt], config=config)
-                    data = clean_json_text(res.text)
+                    t_gen = time.time()
+                    log(f"  🤖 {tag}Calling {tier_lbl} {mask_key(api_key)} / {model_name} (timeout=180s)...")
+                    res = run_with_hard_timeout(
+                        lambda: client.models.generate_content(model=model_name, contents=[uploaded, prompt], config=config),
+                        180,
+                        f"{tag}generate_content({model_name})",
+                    )
+                    resp_text = getattr(res, "text", "") or ""
+                    log(f"  📥 {tag}Response from {model_name} in {time.time() - t_gen:.1f}s ({len(resp_text)} chars)")
+                    data = clean_json_text(resp_text)
                     cost = calc_cost(model_name, res.usage_metadata, is_paid)
                     if chunk_schema:
                         try:
                             jsonschema.validate(instance=data, schema=chunk_schema)
+                            log(f"  🔍 {tag}Schema validation PASSED (turns={len(data.get('turns', []))}, claims={len(data.get('claims', []))})")
                         except jsonschema.ValidationError as ve:
+                            log(f"  🛠️ {tag}Schema mismatch ({ve.message[:100]}) — running 90s JSON repair...")
                             repair_prompt = (
                                 f"المخرج JSON السابق خالف المخطط schema_chunk.json بسبب: {ve.message}\n"
                                 f"صحّح الخطأ فقط وأعد إخراج JSON صالح مطابق تماماً للمخطط:\n"
                                 f"{json.dumps(data, ensure_ascii=False)[:24000]}"
                             )
                             try:
-                                r2 = client.models.generate_content(model=model_name, contents=repair_prompt, config=config)
+                                r2 = run_with_hard_timeout(
+                                    lambda: client.models.generate_content(model=model_name, contents=repair_prompt, config=config),
+                                    90,
+                                    f"{tag}schema_repair({model_name})",
+                                )
                                 data = clean_json_text(r2.text)
                                 cost += calc_cost(model_name, r2.usage_metadata, is_paid)
-                            except Exception:
-                                pass
-                    return data, cost, model_name, ("PAID" if is_paid else "FREE")
+                                log(f"  ✅ {tag}Schema repair completed")
+                            except Exception as rep_e:
+                                log(f"  ⚠️ {tag}Schema repair skipped ({str(rep_e)[:100]}) — continuing with normalized output")
+                    record_key_stat(api_key, is_paid, "ok")
+                    return data, cost, model_name, tier_lbl
+                except TimeoutError as te:
+                    last_err = f"[{model_name}] {te}"
+                    log(f"  ⏰ {tag}{te} -> cooling {model_name} 90s & rotating!")
+                    with STATE_LOCK:
+                        MODEL_COOLDOWN_UNTIL[model_name] = time.time() + 90
+                    record_key_stat(api_key, is_paid, "err_timeout")
+                    continue
                 except Exception as e:
                     err, low = str(e), str(e).lower()
                     last_err = f"[{model_name}] {err[:220]}"
-                    print(f"API Error ({'PAID' if is_paid else 'FREE'} {mask_key(api_key)} / {model_name}): {err[:180]}", flush=True)
+                    log(f"  ⚠️ {tag}API Error ({tier_lbl} {mask_key(api_key)} / {model_name}): {err[:180]}")
                     if any(t in low for t in ("api_key_invalid", "access_token_type_unsupported", "401", "403")):
                         with STATE_LOCK:
                             bad_keys.add(api_key)
+                        log(f"  🚫 {tag}Marked {tier_lbl} {mask_key(api_key)} as invalid")
                         return None
-                    if any(t in low for t in ("429", "resource_exhausted", "quota", "404", "not_found", "no longer available")):
+                    if any(t in low for t in ("404", "not_found", "no longer available")):
                         with STATE_LOCK:
                             exhausted_pairs.add((api_key, model_name))
+                        continue
+                    if any(t in low for t in ("429", "resource_exhausted", "quota")):
+                        with STATE_LOCK:
+                            cnt = PAIR_429_COUNT.get((api_key, model_name), 0) + 1
+                            PAIR_429_COUNT[(api_key, model_name)] = cnt
+                            record_key_stat(api_key, is_paid, "err_429")
+                            if cnt >= 2 or "per day" in low or "daily" in low:
+                                exhausted_pairs.add((api_key, model_name))
+                                log(f"  🛑 {tag}Quota exhausted on {mask_key(api_key)}/{model_name} (hit #{cnt})")
+                            else:
+                                PAIR_COOLDOWN_UNTIL[(api_key, model_name)] = time.time() + 65
+                                log(f"  🧊 {tag}RPM spike on {mask_key(api_key)}/{model_name} — 65s cooldown (hit #1)")
+                        continue
+                    if any(t in low for t in ("503", "unavailable", "high demand", "overloaded")):
+                        with STATE_LOCK:
+                            MODEL_COOLDOWN_UNTIL[model_name] = time.time() + 90
+                        record_key_stat(api_key, is_paid, "err_503")
+                        log(f"  🧊 {tag}503 High Demand on {model_name} — 90s model cooldown")
                         continue
                     time.sleep(random.uniform(1.5, 3.0))
         except Exception as e:
             err, low = str(e), str(e).lower()
             last_err = f"[UPLOAD] {err[:220]}"
+            log(f"  ⚠️ {tag}Upload/Active Error ({tier_lbl} {mask_key(api_key)}): {err[:180]}")
             if any(t in low for t in ("api_key_invalid", "401", "403")):
                 with STATE_LOCK:
                     bad_keys.add(api_key)
         finally:
             if uploaded is not None:
                 try:
-                    client.files.delete(name=uploaded.name)
+                    run_with_hard_timeout(lambda: client.files.delete(name=uploaded.name), 15, f"{tag}files.delete")
                 except Exception:
                     pass
         return None
@@ -856,7 +1136,7 @@ def acquire_video_locally(url: str, dest: str, cfg: dict) -> bool:
             "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
             "--merge-output-format", "mp4", "-o", dest, url,
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         return res.returncode == 0 and os.path.exists(dest) and os.path.getsize(dest) > 50_000
     # Build candidate download attempts: (target_url, verify_ssl)
     dl_targets = [(url, True)]
@@ -902,7 +1182,7 @@ def acquire_video_locally(url: str, dest: str, cfg: dict) -> bool:
 # CHUNK NORMALIZATION, ENTITY RESOLUTION & RUNNING CONTEXT
 # ==============================================================================
 def normalize_chunk_v2(data: dict, idx: int, st_hms: str, end_hms: str, chunk_dur_s: float, derived_meta: dict, measured_speech_s: float, entity_registry: dict, locked_presenter: str = '') -> dict:
-    d = dict(data or {})
+    d = dict(data) if isinstance(data, dict) else (dict(data[0]) if isinstance(data, list) and data and isinstance(data[0], dict) else {})
     d["chunk_index"] = idx
     d["window"] = {"start": st_hms, "end": end_hms}
     d["prompt_version"] = "blackbox-v2.0"
@@ -1298,6 +1578,11 @@ def compute_deterministic_evaluation(chunks: list, duration_sec: float, rubric: 
     diff_reasons = ["بث مباشر (+1)"] + (["ملف عاجل متحرّك (+2)"] if local_chyrons else []) + (["مصدران متزامنان أو أكثر (+1)"] if has_field_source else [])
     diff_mod = min(int(rubric.get("difficulty_modifier", {}).get("max", 5)), 1 + (2 if local_chyrons else 0) + (1 if has_field_source else 0))
     pre_cap_score = min(100.0, round(raw_score + diff_mod, 1))
+
+    # Apply optional human_overrides (e.g., waived/ignored critical events)
+    ignored_types = set((brief or {}).get("_ignored_critical_events", []) or [])
+    if ignored_types:
+        crit_list = [ce for ce in crit_list if ce.get("type") not in ignored_types and f"{ce.get('type')}@{fmt_ts_clean(ce.get('at'))}" not in ignored_types]
 
     # Critical error caps strictly from rubric.json
     caps_applied, cap_ceiling, distinct_crit = [], 100.0, set()
@@ -1926,7 +2211,7 @@ def render_detailed_eval_html(display_name, exact_dur, derived_meta, eval_data, 
 
 <h2>٨ · تقرير التدقيق الذاتي للنزاهة (6 فحوص آلية)</h2>
 <table><tr><th>الفحص المنهجي</th><th class="num">الحالة</th><th>النتيجة الموثّقة</th></tr>{audit_rows}</table>
-<p class="small" style="margin-top:12pt;text-align:center;color:#8a939e;">— نهاية التقرير المفصّل (Orchestrator V6.1) —</p>"""
+<p class="small" style="margin-top:12pt;text-align:center;color:#8a939e;">— نهاية التقرير المفصّل (Orchestrator V7.0) —</p>"""
     return wrap_word_doc(f"تقييم مفصل - {display_name}", body)
 
 
@@ -2059,7 +2344,7 @@ def render_training_plan_html(display_name, eval_data, llm_qual) -> str:
 <table><tr><th style="width:24%;">البند</th><th style="width:76%;">القاعدة الملزمة</th></tr>
 <tr><td class="lbl">حماية نقاط القوة</td><td>لا يُدرَّب على القطع العدواني (لمسة لا قطع، تبدأ بكلمة من كلام الضيف) · لا يُمسّ باللهجة اللبنانية المحكية ولا بالخط التحريري ولا بالوقار والإنصات ولا بمرونة المتابعة.</td></tr>
 <tr class="alt"><td class="lbl">الشرط الإداري</td><td>تفعيل المصدر الميداني حتى آخر 10 دقائق · إسناد «بطاقة الثلاث» ومذكرة غرفة التحرير لمُعِدّ الحلقة قبل البث · وضع بطاقة الأسماء أمام المقدّم مع تقارير قصيرة بالأرقام قبل البلوكات التحليلية.</td></tr></table>
-<p class="small" style="margin-top:12pt;text-align:center;color:#8a939e;">— نهاية خطة التدريب (Orchestrator V6.1) —</p>"""
+<p class="small" style="margin-top:12pt;text-align:center;color:#8a939e;">— نهاية خطة التدريب (Orchestrator V7.0) —</p>"""
     return wrap_word_doc(f"خطة التدريب 6 أسابيع - {display_name}", body)
 
 
@@ -2111,6 +2396,7 @@ def main():
 
     fid = (os.environ.get("FOLDER_ID") or "").strip()
     RUNTIME_DRIVE_TOKEN = (os.environ.get("DRIVE_TOKEN") or "").strip()
+    init_or_refresh_permanent_drive_token()
     tg_bot, tg_chat = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip(), (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
     gm_u, gm_p = (os.environ.get("GMAIL_USER") or "").strip(), (os.environ.get("GMAIL_APP_PASSWORD") or "").strip()
     run_id = (os.environ.get("GITHUB_RUN_ID") or "").strip()
@@ -2158,6 +2444,98 @@ def main():
         if editorial_mode == "neutral"
         else "تقييم الأداء الحواري في قناة موجّهة الخط (Manar-100-v2)"
     )
+
+    # === V7.0 ZERO-COST RE-RENDER MODE (from existing 05_Blackbox_V2_*.json + human_overrides) ===
+    if mode == "rerender":
+        log(f"♻️ Starting Zero-Cost Re-Render Mode for folder {fid} ({display_name})...")
+        push_status(cfg, fid, run_id, "running", "إعادة توليد التقارير والرسوم من الصندوق الأسود ($0.00)...", 0, 1, 0.0, started_at, eta_sec=15)
+        bb_file_id = None
+        try:
+            rf2 = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": f"'{fid}' in parents and trashed=false", "fields": "files(id,name)"}, timeout=20).json()
+            for f in rf2.get("files", []):
+                if f["name"].startswith("05_Blackbox_V2_") and f["name"].endswith(".json"):
+                    bb_file_id = f["id"]
+                    break
+        except Exception as e:
+            log(f"❌ Failed scanning folder for Blackbox JSON: {e}")
+        if not bb_file_id:
+            finalize_cost_webhook(cfg, fid, 0.0, "failed", "لم يتم العثور على ملف الصندوق الأسود JSON لإعادة التوليد")
+            sys.exit(1)
+
+        bb_obj = drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{bb_file_id}?alt=media", cfg, timeout=45).json()
+        overrides = cfg.get("human_overrides") if isinstance(cfg.get("human_overrides"), dict) else {}
+        if overrides.get("presenter_name"):
+            display_name = clean_display_name(overrides["presenter_name"])
+            clean_name = sanitize_filename(overrides["presenter_name"])
+        if overrides.get("editorial_mode") in ("directed", "neutral"):
+            editorial_mode = overrides["editorial_mode"]
+            editorial_label = (
+                "تقييم مهني محايد (Manar-100-v2 · معيار محايد مع حماية اللهجة اللبنانية)"
+                if editorial_mode == "neutral"
+                else "تقييم الأداء الحواري في قناة موجّهة الخط (Manar-100-v2)"
+            )
+        if isinstance(overrides.get("editorial_brief"), dict) and any(overrides["editorial_brief"].values()):
+            editorial_brief = overrides["editorial_brief"]
+        if overrides.get("ignored_critical_events"):
+            editorial_brief = dict(editorial_brief or {})
+            editorial_brief["_ignored_critical_events"] = list(overrides["ignored_critical_events"])
+
+        valid_chunks = bb_obj.get("chunks", [])
+        llm_qual = bb_obj.get("qualitative_synthesis", {})
+        if overrides.get("custom_summary"):
+            llm_qual = dict(llm_qual or {})
+            rep_d = dict(llm_qual.get("report") or {})
+            rep_d["summary"] = overrides["custom_summary"]
+            llm_qual["report"] = rep_d
+
+        old_meta = bb_obj.get("metadata") or {}
+        derived_meta = old_meta.get("derived") or derive_metadata(src_url or old_meta.get("src_url", ""), 3600)
+        tot_chunks = int(old_meta.get("chunks_total") or len(valid_chunks) or 1)
+        dur = sum(float((c.get("measurement") or {}).get("chunk_duration_s", 300)) for c in valid_chunks) or 3600.0
+        exact_duration = format_hhmmss(dur)
+
+        final_eval = compute_deterministic_evaluation(valid_chunks, dur, rubric, derived_meta, llm_qual, editorial_brief, editorial_mode)
+        charts = generate_eval_charts(final_eval)
+        meta_info = {
+            "clean_name": clean_name, "editorial_label": editorial_label,
+            "chunks_ok": len(valid_chunks), "chunks_total": tot_chunks, "actual_cost": 0.0,
+            "models_used": old_meta.get("models_used", ["RERENDER:$0"]), "src_url": src_url or old_meta.get("src_url", ""),
+            "human_overrides": overrides,
+        }
+        det_html = render_detailed_eval_html(display_name, exact_duration, derived_meta, final_eval, llm_qual, charts, meta_info)
+        sum_html = render_summarized_eval_html(display_name, exact_duration, final_eval, llm_qual, charts)
+        trn_html = render_training_plan_html(display_name, final_eval, llm_qual)
+        bb_md = generate_blackbox_v2_md(display_name, exact_duration, derived_meta, valid_chunks, final_eval, meta_info)
+        bb_obj["metadata"] = {**meta_info, "derived": derived_meta}
+        bb_obj["evaluation"] = final_eval
+        bb_obj["qualitative_synthesis"] = llm_qual
+
+        files_to_write = [
+            (f"01_Main_Detailed_Report_{clean_name}.html", det_html, "text/html"),
+            (f"02_Summarized_Report_{clean_name}.html", sum_html, "text/html"),
+            (f"03_Training_Plan_{clean_name}.html", trn_html, "text/html"),
+            (f"04_Blackbox_V2_{clean_name}.md", bb_md, "text/markdown"),
+            (f"05_Blackbox_V2_{clean_name}.json", json.dumps(bb_obj, ensure_ascii=False, indent=2), "application/json"),
+        ]
+        for fname, content, mime in files_to_write:
+            fp = os.path.join(BACKUP_DIR, fname)
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(content)
+            up_ok = drive_upload(fid, cfg, fp, mime)
+            log(f"  ☁️ Re-render upload {fname}: {'✅ OK' if up_ok else '❌ FAILED'}")
+
+        kpi_sum = {
+            "folder_id": fid, "presenter": display_name, "date": derived_meta.get("broadcast_date") or datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d"),
+            "duration": exact_duration, "final_score": final_eval["score_final"]["final_score"], "raw_score": final_eval["score_final"]["raw_score"],
+            "reported_as": final_eval["score_final"]["reported_as"], "band": final_eval["score_final"]["band"],
+            "axes": {a["id"]: a["pct"] for a in final_eval["axes"]}, "kpis": final_eval["kpis"],
+            "critical_events": [e.get("type") for e in final_eval["critical_events"]], "src_url": meta_info["src_url"],
+        }
+        update_drive_folder_meta(fid, cfg, f"PROCESSED_{clean_name}_$0.00", f"🔗 رابط المصدر: {meta_info['src_url']}\n• الاسم: {display_name}\n• النتيجة (مُعاد توليدها): {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})")
+        finalize_cost_webhook(cfg, fid, 0.0, "completed", f"تمت إعادة التوليد ({final_eval['score_final']['reported_as']})", completed_chunks=len(valid_chunks), total_chunks=tot_chunks, kpi_summary=kpi_sum)
+        send_tg(f"♻️ <b>تمت إعادة توليد تقارير {display_name} بنجاح ($0.00)</b>\n• النتيجة الجديدة: {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})", tg_bot, tg_chat)
+        log("🎉 Re-Render V7.0 completed in $0.00!")
+        sys.exit(0)
 
     push_status(cfg, fid, run_id, "running", "فحص مفاتيح API...", 0, 0, 0.0, started_at)
     valid_free, valid_paid, paid_models = preflight_validate_keys(fk_list, pk, strat, tg_bot, tg_chat)
@@ -2209,7 +2587,7 @@ def main():
         finalize_cost_webhook(cfg, fid, 0.0, "failed", "مدة الفيديو صفر")
         sys.exit(1)
 
-    send_tg(f"🚀 بدء التحليل V6.1 | {clean_name} | المدة: {exact_duration} | المقاطع: {tot} ({chunk_min}د)", tg_bot, tg_chat)
+    send_tg(f"🚀 بدء التحليل V7.0 | {clean_name} | المدة: {exact_duration} | المقاطع: {tot} ({chunk_min}د)", tg_bot, tg_chat)
 
     act_cost, exhausted_pairs, bad_keys, models_used = 0.0, set(), set(), set()
 
@@ -2238,30 +2616,48 @@ def main():
                 "-c:a", "aac", "-ac", "1", "-ar", "16000", "-b:a", "24k",
                 "-movflags", "+faststart", mp4_path,
             ]
+            t_ff = time.time()
             with FFMPEG_SEM:
-                proc = subprocess.run(cmd, capture_output=True, text=True)
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
             if proc.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 5000:
-                return mp4_path, st, d, measure_chunk_speech_ffmpeg(mp4_path, d)
+                sp_s = measure_chunk_speech_ffmpeg(mp4_path, d)
+                mb = os.path.getsize(mp4_path) / (1024 * 1024)
+                log(f"🎞️ Sliced chunk {idx+1}/{tot} ({format_hhmmss(st)}->{format_hhmmss(st+d)}) | {mb:.2f} MB | speech={sp_s}s | {time.time()-t_ff:.1f}s")
+                return mp4_path, st, d, sp_s
             last_ff_err = (proc.stderr or "").strip()[:240]
             print(f"[FFmpeg Retry {attempt}/3 chunk {idx+1}] rc={proc.returncode} err={last_ff_err}", flush=True)
             time.sleep(2)
         raise RuntimeError(f"FFmpeg failed on chunk {idx+1}: {last_ff_err}")
 
     if mode == "eval":
-        push_status(cfg, fid, run_id, "running", f"تقطيع الفيديو ({tot} مقاطع × 5 دقائق)...", 0, tot, 0.0, started_at)
-        sliced = {}
-        with ThreadPoolExecutor(max_workers=min(3, tot)) as ex:
-            futs = {ex.submit(extract_chunk_media, i): i for i in range(tot)}
-            for fut in as_completed(futs):
-                sliced[futs[fut]] = fut.result()
-
+        saved_ckpts, saved_ctx = load_drive_checkpoints(fid, cfg)
         chunks_by_idx = [None] * tot
+        for ci, cobj in saved_ckpts.items():
+            if 0 <= ci < tot and isinstance(cobj, dict):
+                chunks_by_idx[ci] = cobj
+        resumed_cnt = sum(1 for x in chunks_by_idx if x is not None)
+        if resumed_cnt > 0:
+            log(f"♻️ RESUME ACTIVE: Restored {resumed_cnt}/{tot} completed chunks from Drive checkpoints!")
+            send_tg(f"♻️ <b>استكمال التقييم ({display_name})</b>: تم استعادة {resumed_cnt}/{tot} مقطع من نقاط الحفظ.", tg_bot, tg_chat)
+
+        missing_idxs = [i for i in range(tot) if chunks_by_idx[i] is None]
+        push_status(cfg, fid, run_id, "running", f"تقطيع المقاطع المطلوبة ({len(missing_idxs)}/{tot} × 5 دقائق)...", resumed_cnt, tot, 0.0, started_at)
+        sliced = {}
+        if missing_idxs:
+            with ThreadPoolExecutor(max_workers=min(3, len(missing_idxs))) as ex:
+                futs = {ex.submit(extract_chunk_media, i): i for i in missing_idxs}
+                for fut in as_completed(futs):
+                    sliced[futs[fut]] = fut.result()
+
         failed_idxs = []
-        running_ctx = {
+        running_ctx = saved_ctx if isinstance(saved_ctx, dict) else {
             "chunk_index": 0, "program_name": None, "presenter_name": display_name,
             "participants": [{"id": "ANCHOR", "name": display_name, "role": "مقدّم"}],
             "active_files": [], "last_300_words": "", "open_claims": [], "unresolved_chyrons": [], "cumulative_clock": "00:00:00",
         }
+        for i in range(tot):
+            if chunks_by_idx[i] is not None:
+                running_ctx = update_running_context(running_ctx, chunks_by_idx[i], chunks_by_idx[i].get("window", {}).get("end", format_hhmmss((i + 1) * chunk_sec)))
         proc_start = time.time()
 
         def run_eval_chunk(i: int, ctx_snapshot: dict, force_paid: bool = False):
@@ -2284,9 +2680,11 @@ def main():
             )
             run_strat = "pro_only" if force_paid else strat
             try:
+                log(f"▶️ [Chunk {i+1}/{tot} {st_hms}->{end_hms}] Starting analysis (strategy={run_strat}, dlq={force_paid})...")
                 raw_data, cost, used_model, tier = call_gemini_chunk(
                     mp4_path, full_prompt, valid_free, valid_paid, paid_models, run_strat,
-                    exhausted_pairs, bad_keys, budget_ok, chunk_schema=schema_chunk or None
+                    exhausted_pairs, bad_keys, budget_ok, chunk_schema=schema_chunk or None,
+                    chunk_tag=f"Chunk {i+1}/{tot}"
                 )
                 norm = normalize_chunk_v2(raw_data, i + 1, st_hms, end_hms, d, derived_meta, speech_s, entity_registry, locked_presenter=display_name)
                 return norm, cost, used_model, tier, end_hms
@@ -2300,25 +2698,32 @@ def main():
         for i in range(tot):
             if CANCEL_EVENT.is_set():
                 break
+            if chunks_by_idx[i] is not None:
+                log(f"⏭️ Skipping chunk {i+1}/{tot} (already restored from checkpoint)")
+                continue
             try:
                 norm, cost, used_model, tier, end_hms = run_eval_chunk(i, running_ctx, force_paid=False)
                 chunks_by_idx[i] = norm
                 running_ctx = update_running_context(running_ctx, norm, end_hms)
                 act_cost += cost
                 models_used.add(f"{tier}:{used_model}")
-                print(f"✅ Chunk {i+1}/{tot} ({norm['window']['start']}->{norm['window']['end']}) turns={len(norm['turns'])} via {tier}:{used_model} | ${cost:.4f}", flush=True)
+                drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", norm)
+                drive_upload_json_blob(fid, cfg, "_ckpt_ctx.json", running_ctx)
+                log(f"✅ Chunk {i+1}/{tot} ({norm['window']['start']}->{norm['window']['end']}) turns={len(norm['turns'])} chyrons={len(norm['chyron_timeline'])} claims={len(norm['claims'])} via {tier}:{used_model} | ${cost:.4f}")
             except Exception as e:
                 if CANCEL_EVENT.is_set() or "Cancelled by user" in str(e):
                     break
                 failed_idxs.append(i)
-                print(f"⚠️ Chunk {i+1} failed (queued for DLQ): {e}", flush=True)
+                log(f"⚠️ Chunk {i+1}/{tot} failed (queued for DLQ): {e}")
             done_now = sum(1 for x in chunks_by_idx if x is not None)
-            eta = int(((time.time() - proc_start) / max(1, i + 1)) * (tot - i - 1)) + 30
+            avg_per_chunk = (time.time() - proc_start) / max(1, i + 1)
+            eta = int(avg_per_chunk * (tot - i - 1)) + (len(failed_idxs) * 60) + 60
+            log(f"📡 Progress {done_now}/{tot} | failed_dlq={len(failed_idxs)} | avg={avg_per_chunk:.1f}s/chunk | ETA={format_hhmmss(eta)}")
             push_status(cfg, fid, run_id, "running", f"توثيق الصندوق الأسود ({done_now}/{tot})", done_now, tot, act_cost, started_at, eta_sec=eta)
 
         # DLQ Rescue BEFORE deleting local source video
         if failed_idxs and not CANCEL_EVENT.is_set():
-            print(f"Entering DLQ Rescue for {len(failed_idxs)} chunks...", flush=True)
+            log(f"🚑 Entering DLQ Rescue for {len(failed_idxs)} chunks...", flush=True)
             push_status(cfg, fid, run_id, "running", f"إنقاذ المقاطع المتعثرة ({len(failed_idxs)})...", sum(1 for x in chunks_by_idx if x), tot, act_cost, started_at)
             time.sleep(8)
             for i in failed_idxs:
@@ -2330,9 +2735,12 @@ def main():
                     chunks_by_idx[i] = norm
                     act_cost += cost
                     models_used.add(f"{tier}:{used_model}")
-                    print(f"🚑 Chunk {i+1} rescued via {tier}:{used_model}", flush=True)
+                    drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", norm)
+                    log(f"🚑 Chunk {i+1} rescued via {tier}:{used_model}")
+                    done_now = sum(1 for x in chunks_by_idx if x is not None)
+                    push_status(cfg, fid, run_id, "running", f"إنقاذ المقاطع المتعثرة ({done_now}/{tot})", done_now, tot, act_cost, started_at, eta_sec=25)
                 except Exception as ex:
-                    print(f"❌ DLQ failed on chunk {i+1}: {ex}", flush=True)
+                    log(f"❌ DLQ failed on chunk {i+1}: {ex}")
 
         if downloaded_local and os.path.exists(local_input):
             try:
@@ -2379,20 +2787,32 @@ def main():
         )
 
         llm_qual = {}
-        synth_candidates = (
+        now_ts = time.time()
+        raw_synth = (
             [(valid_paid, m, True) for m in (rank_discovered_models(paid_models, PREFERRED_SYNTH_ORDER, True) or paid_models)]
             if (strat != "flash_only" and valid_paid and budget_ok()) else []
         ) + [(k, m, False) for k, kms in valid_free for m in kms]
+        synth_candidates = [x for x in raw_synth if MODEL_COOLDOWN_UNTIL.get(x[1], 0) <= now_ts] + [x for x in raw_synth if MODEL_COOLDOWN_UNTIL.get(x[1], 0) > now_ts]
+        log(f"🧠 Starting Synthesis stage ({len(valid_chunks)}/{tot} valid chunks, {len(synth_candidates)} model candidates)...")
         for skey, smodel, spaid in synth_candidates:
+            s_tier = "PAID" if spaid else "FREE"
             try:
-                client = genai.Client(api_key=skey)
-                res = client.models.generate_content(model=smodel, contents=synth_request, config=build_gen_config(max_out=32768))
+                t_syn = time.time()
+                log(f"  🤖 [Synthesis] Calling {s_tier} {mask_key(skey)} / {smodel} (timeout=240s)...")
+                client = make_genai_client(skey, timeout_ms=240_000)
+                res = run_with_hard_timeout(
+                    lambda: client.models.generate_content(model=smodel, contents=synth_request, config=build_gen_config(max_out=32768)),
+                    240,
+                    f"synthesis({smodel})",
+                )
                 llm_qual = clean_json_text(res.text)
-                act_cost += calc_cost(smodel, res.usage_metadata, spaid)
-                models_used.add(f"{'PAID' if spaid else 'FREE'}:{smodel}")
+                s_cost = calc_cost(smodel, res.usage_metadata, spaid)
+                act_cost += s_cost
+                models_used.add(f"{s_tier}:{smodel}")
+                log(f"✅ Synthesis completed via {s_tier}:{smodel} in {time.time() - t_syn:.1f}s | ${s_cost:.4f}")
                 break
             except Exception as e:
-                print(f"[Synthesis Retry {smodel}] {str(e)[:150]}", flush=True)
+                log(f"  ⚠️ [Synthesis Retry {s_tier} {mask_key(skey)} / {smodel}] {str(e)[:180]}")
 
         final_eval = compute_deterministic_evaluation(valid_chunks, dur, rubric, derived_meta, llm_qual, editorial_brief, editorial_mode)
         charts = generate_eval_charts(final_eval)
@@ -2409,7 +2829,7 @@ def main():
         bb_json_obj = {
             "prompt_version": "blackbox-v2.0",
             "rubric_version": rubric.get("rubric_version", "manar-100-v2"),
-            "metadata": {**meta_info, "derived": derived_meta},
+            "metadata": {**meta_info, "derived": derived_meta, "key_health": get_key_health_snapshot()},
             "evaluation": final_eval,
             "qualitative_synthesis": llm_qual,
             "chunks": valid_chunks,
@@ -2423,31 +2843,52 @@ def main():
             (f"05_Blackbox_V2_{clean_name}.json", json.dumps(bb_json_obj, ensure_ascii=False, indent=2), "application/json"),
         ]
         out_paths = []
+        log(f"📊 Scoring & 3 RTL charts complete: {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']}) | Uploading 5 outputs...")
         for fname, content, mime in files_to_write:
             fp = os.path.join(BACKUP_DIR, fname)
             with open(fp, "w", encoding="utf-8") as f:
                 f.write(content)
             out_paths.append(fp)
-            drive_upload(fid, cfg, fp, mime)
+            up_ok = drive_upload(fid, cfg, fp, mime)
+            log(f"  ☁️ Drive upload {fname} ({os.path.getsize(fp)//1024} KB): {'✅ OK' if up_ok else '❌ FAILED'}")
             if not fname.endswith(".json"):
                 send_tg(f"📄 <b>{fname}</b> | النتيجة: {final_eval['score_final']['reported_as']} | الكلفة: ${act_cost:.4f}", tg_bot, tg_chat, fp)
 
-        email_subj = f"✅ تقييم V6.1 ({clean_name}) — {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})"
+        email_subj = f"✅ تقييم V7.0 ({clean_name}) — {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})"
         smtp_ok = send_smtp_resilient(email_subj, sum_html, out_paths[:4], cfg.get("alert_emails", ""), gm_u, gm_p)
+        if smtp_ok:
+            rec_list = [e.strip() for e in re.split(r"[,;\s\n\r]+", cfg.get("alert_emails", "") or "") if "@" in e.strip()]
+            send_tg(f"📧 تم إرسال التقارير بالبريد إلى: {', '.join(rec_list) or gm_u}", tg_bot, tg_chat)
+        cleanup_drive_checkpoints(fid, cfg)
         final_folder_name = f"PROCESSED_{clean_name}_${act_cost:.2f}"
         folder_desc = (
             f"🔗 رابط المصدر: {src_url}\n\n"
-            f"• الاسم: {clean_name}\n• النتيجة: {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})\n"
+            f"• الاسم: {display_name}\n• النتيجة: {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})\n"
             f"• الخام: {final_eval['score_final']['raw_score']} | التعقيد: +{final_eval['score_final']['difficulty_modifier']} | السقف: {final_eval['score_final']['cap_ceiling']}\n"
             f"• الأولوية القصوى: {final_eval['top_priority_auto']}\n• الكلفة: ${act_cost:.4f} | المقاطع: {len(valid_chunks)}/{tot}"
         )
         update_drive_folder_meta(fid, cfg, final_folder_name, folder_desc)
-        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"اكتمل ({final_eval['score_final']['reported_as']})", trigger_gas_email=(not smtp_ok), email_subject=email_subj)
-        print(f"🎉 V6.1 completed! {final_folder_name} | Score: {final_eval['score_final']['reported_as']} | Cost: ${act_cost:.4f}", flush=True)
+        kpi_sum = {
+            "folder_id": fid, "presenter": display_name, "date": derived_meta.get("broadcast_date") or datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d"),
+            "duration": exact_duration, "final_score": final_eval["score_final"]["final_score"], "raw_score": final_eval["score_final"]["raw_score"],
+            "reported_as": final_eval["score_final"]["reported_as"], "band": final_eval["score_final"]["band"],
+            "axes": {a["id"]: a["pct"] for a in final_eval["axes"]}, "kpis": final_eval["kpis"],
+            "critical_events": [e.get("type") for e in final_eval["critical_events"]], "src_url": src_url,
+        }
+        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"اكتمل ({final_eval['score_final']['reported_as']})", trigger_gas_email=(not smtp_ok), email_subject=email_subj, completed_chunks=len(valid_chunks), total_chunks=tot, kpi_summary=kpi_sum)
+        log(f"🎉 V7.0 completed! {final_folder_name} | Score: {final_eval['score_final']['reported_as']} | Cost: ${act_cost:.4f}")
 
     else:
-        # Daily Broadcast Mode (Parallel + DLQ + Detailed & Summarized Word-RTL + Blackbox .md/.json)
-        daily_results, failed_daily, done_daily = [None] * tot, [], 0
+        # Daily Broadcast Mode (Parallel + Checkpoint/Resume + DLQ + Detailed & Summarized Word-RTL + Blackbox .md/.json)
+        saved_ckpts, _ = load_drive_checkpoints(fid, cfg)
+        daily_results, failed_daily = [None] * tot, []
+        for ci, cobj in saved_ckpts.items():
+            if 0 <= ci < tot and isinstance(cobj, dict):
+                daily_results[ci] = cobj
+        done_daily = sum(1 for x in daily_results if x is not None)
+        if done_daily > 0:
+            log(f"♻️ DAILY RESUME ACTIVE: Restored {done_daily}/{tot} chunks from Drive checkpoints!")
+            send_tg(f"♻️ <b>استكمال البث اليومي ({clean_name})</b>: تم استعادة {done_daily}/{tot} مقطع.", tg_bot, tg_chat)
         proc_start = time.time()
 
         def run_daily(i: int, force_paid: bool = False):
@@ -2459,7 +2900,8 @@ def main():
                 f"{system_prompt_extra}"
             )
             try:
-                dat, c, m, t = call_gemini_chunk(mp4, pr, valid_free, valid_paid, paid_models, "pro_only" if force_paid else strat, exhausted_pairs, bad_keys, budget_ok)
+                log(f"▶️ [Daily {i+1}/{tot} {st_h}->{en_h}] Starting analysis...")
+                dat, c, m, t = call_gemini_chunk(mp4, pr, valid_free, valid_paid, paid_models, "pro_only" if force_paid else strat, exhausted_pairs, bad_keys, budget_ok, chunk_tag=f"Daily {i+1}/{tot}")
                 with STATE_LOCK:
                     models_used.add(f"{t}:{m}")
                 return dat, c
@@ -2470,13 +2912,16 @@ def main():
                     except Exception:
                         pass
 
+        daily_todo = [i for i in range(tot) if daily_results[i] is None]
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(run_daily, i, False): i for i in range(tot)}
+            futs = {ex.submit(run_daily, i, False): i for i in daily_todo}
             for fut in as_completed(futs):
                 i = futs[fut]
                 try:
                     dat, c = fut.result()
-                    daily_results[i] = {"chunk_index": i + 1, "data": dat}
+                    obj_d = {"chunk_index": i + 1, "data": dat}
+                    daily_results[i] = obj_d
+                    drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", obj_d)
                     with STATE_LOCK:
                         act_cost += c
                         done_daily += 1
@@ -2496,7 +2941,9 @@ def main():
                     break
                 try:
                     dat, c = run_daily(i, force_paid=(strat != "flash_only" and bool(valid_paid) and budget_ok()))
-                    daily_results[i] = {"chunk_index": i + 1, "data": dat}
+                    obj_d = {"chunk_index": i + 1, "data": dat}
+                    daily_results[i] = obj_d
+                    drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", obj_d)
                     act_cost += c
                 except Exception:
                     pass
@@ -2532,12 +2979,12 @@ def main():
 
         det_daily = wrap_word_doc(
             f"البث اليومي المفصل - {clean_name}",
-            f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>رصد البث اليومي V6.1</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)} — المدة: {esc(exact_duration)}</p></td></tr></table>"
+            f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>رصد البث اليومي V7.0</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)} — المدة: {esc(exact_duration)}</p></td></tr></table>"
             f"<h2>جدول البرامج والفقرات ({len(all_progs)} فقرة)</h2><table><tr><th>التوقيت</th><th>التصنيف</th><th>المحور</th><th>العنوان</th><th>الملخص</th></tr>{rows}</table>"
         )
         sum_daily = wrap_word_doc(
             f"ملخص البث اليومي - {clean_name}",
-            f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>الملخص التنفيذي للبث اليومي V6.1</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)}</p><p style='margin:4pt 0 0;color:#c9d6e4;'>المدة: {esc(exact_duration)} | الفقرات: {len(all_progs)} | المقاطع: {len(valid_daily)}/{tot} | الكلفة: ${act_cost:.4f}</p></td></tr></table>"
+            f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>الملخص التنفيذي للبث اليومي V7.0</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)}</p><p style='margin:4pt 0 0;color:#c9d6e4;'>المدة: {esc(exact_duration)} | الفقرات: {len(all_progs)} | المقاطع: {len(valid_daily)}/{tot} | الكلفة: ${act_cost:.4f}</p></td></tr></table>"
             f"<h2>توزيع الفقرات حسب التصنيف</h2><table><tr><th>التصنيف</th><th class='num'>العدد</th></tr>{cat_rows}</table>"
         )
         bb_daily_md = f"# DAILY BROADCAST BLACKBOX V2 — {clean_name}\n- Duration: {exact_duration} | Chunks: {len(valid_daily)}/{tot} | Cost: ${act_cost:.4f}\n\n" + "\n".join(
@@ -2559,10 +3006,11 @@ def main():
             if not fname.endswith(".json"):
                 send_tg(f"📄 <b>{fname}</b> | الكلفة: ${act_cost:.4f}", tg_bot, tg_chat, fp)
 
-        email_subj = f"✅ تقرير البث اليومي V6.1 ({clean_name}) | الكلفة: ${act_cost:.4f}"
+        email_subj = f"✅ تقرير البث اليومي V7.0 ({clean_name}) | الكلفة: ${act_cost:.4f}"
         smtp_ok = send_smtp_resilient(email_subj, sum_daily, out_paths[:3], cfg.get("alert_emails", ""), gm_u, gm_p)
+        cleanup_drive_checkpoints(fid, cfg)
         update_drive_folder_meta(fid, cfg, f"PROCESSED_{clean_name}_${act_cost:.2f}", f"🔗 {src_url}\n• الفقرات: {len(all_progs)} | الكلفة: ${act_cost:.4f}")
-        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"اكتمل البث اليومي ({len(valid_daily)}/{tot})", trigger_gas_email=(not smtp_ok), email_subject=email_subj)
+        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"اكتمل البث اليومي ({len(valid_daily)}/{tot})", trigger_gas_email=(not smtp_ok), email_subject=email_subj, completed_chunks=len(valid_daily), total_chunks=tot)
 
 
 if __name__ == "__main__":
