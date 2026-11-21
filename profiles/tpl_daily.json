@@ -1,0 +1,66 @@
+{
+  "id": "tpl_daily",
+  "name": "جرد البث اليومي (18 ساعة)",
+  "engine": "structured_inventory",
+  "target_entity": "daily",
+  "core": true,
+  "enabled": true,
+  "version": "1.0",
+  "updated_at": "2026-11-21",
+  "updated_by": "system",
+  "change_reason": "الإصدار التأسيسي V8.0 لجرد البث اليومي بقواعد قابلة للتعديل من شاشة الأدمن",
+  "categories": [
+    "نشرة إخبارية",
+    "تغطية مباشرة",
+    "برنامج حواري سياسي",
+    "برنامج صباحي / اجتماعي",
+    "تقرير ميداني / VT",
+    "برنامج ثقافي / ديني",
+    "إعادة / أرشيف",
+    "فاصل ترويجي / إعلان"
+  ],
+  "columns": [
+    {
+      "key": "start_end",
+      "label": "التوقيت"
+    },
+    {
+      "key": "broadcast_type",
+      "label": "النوع (مباشر/إعادة)"
+    },
+    {
+      "key": "category",
+      "label": "التصنيف"
+    },
+    {
+      "key": "theme",
+      "label": "المحور"
+    },
+    {
+      "key": "title",
+      "label": "العنوان"
+    },
+    {
+      "key": "presenter",
+      "label": "المقدّم"
+    },
+    {
+      "key": "guests_reporters",
+      "label": "الضيوف والمراسلون"
+    },
+    {
+      "key": "summary",
+      "label": "الملخّص التنفيذي"
+    }
+  ],
+  "filters": {
+    "distinguish_live_vs_replay": true,
+    "exclude_short_promos_under_s": 0,
+    "capture_red_breaking_tickers": true
+  },
+  "admin_rules": [
+    "ميّز بدقة بين البث المباشر والإعادة والأرشيف والفواصل الترويجية.",
+    "استخرج أسماء المقدمين والضيوف والمراسلين والتقارير المصورة (VT) بدقة دون أي تخمين.",
+    "ارصد العواجل الحمراء المهمة في قسم مستقل بآخر التقرير."
+  ]
+}

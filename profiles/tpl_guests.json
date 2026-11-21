@@ -1,0 +1,196 @@
+{
+  "id": "tpl_guests",
+  "name": "تقييم الضيوف",
+  "engine": "scored_evaluation",
+  "target_entity": "guest",
+  "core": true,
+  "enabled": true,
+  "version": "1.0",
+  "updated_at": "2026-11-21",
+  "updated_by": "system",
+  "change_reason": "الإصدار التأسيسي V8.0 لتقييم كل ضيف مستقلاً مع توصية إعادة الاستضافة والمقارنة التاريخية",
+  "generate_training_plan": false,
+  "policy": {
+    "per_guest_cards": true,
+    "ignore_connection_glitches_for_phone": true
+  },
+  "difficulty_modifier": {
+    "max": 0,
+    "rules": []
+  },
+  "critical_error_caps": [
+    {
+      "event": "factual_error_uncorrected",
+      "label": "معلومة خاطئة جوهرية دون تصحيح",
+      "cap": 70,
+      "env": "all",
+      "enabled": true
+    },
+    {
+      "event": "monologue_over_180s",
+      "label": "استرسال مطوّل غير منضبط (>180ث)",
+      "cap": 82,
+      "env": "all",
+      "enabled": true
+    }
+  ],
+  "bands": [
+    {
+      "min": 85,
+      "max": 100,
+      "label": "أولوية عالية لإعادة الاستضافة (A)"
+    },
+    {
+      "min": 70,
+      "max": 84.9,
+      "label": "مناسب لملفات محددة (B)"
+    },
+    {
+      "min": 0,
+      "max": 69.9,
+      "label": "مُستنزَف / يحتاج استراحة أو مراجعة (C)"
+    }
+  ],
+  "axes": [
+    {
+      "id": "GA",
+      "name": "القيمة المعرفية والجديد",
+      "items": [
+        {
+          "id": "GA1",
+          "name": "تقديم معطيات أو زوايا تحليلية جديدة",
+          "max": 15,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "إضافة معلومة أو قراءة نوعية غير مكرّرة"
+        },
+        {
+          "id": "GA2",
+          "name": "الابتعاد عن الإنشائية والتكرار",
+          "max": 10,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "كثافة المضمون مقابل الحشو الكلامي"
+        }
+      ]
+    },
+    {
+      "id": "GB",
+      "name": "التدعيم بالأدلة والدقّة",
+      "items": [
+        {
+          "id": "GB1",
+          "name": "نسبة الادعاءات المسنودة بأرقام ومصادر",
+          "max": 12,
+          "enabled": true,
+          "env": "all",
+          "scoring": "metric",
+          "metric_key": "guest_evidence_pct",
+          "direction": "higher_better",
+          "anchors": {
+            "full": 75,
+            "half": 40,
+            "zero": 0
+          },
+          "unit": "percent",
+          "guidance": "استشهاد بأرقام أو وقائع موثّقة"
+        },
+        {
+          "id": "GB2",
+          "name": "دقّة المعلومات وتماسك الحجة",
+          "max": 8,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "سلامة الربط المنطقي وعدم التناقض"
+        }
+      ]
+    },
+    {
+      "id": "GC",
+      "name": "الانضباط الحواري والإيجاز",
+      "items": [
+        {
+          "id": "GC1",
+          "name": "الإجابة المباشرة على أسئلة المقدّم",
+          "max": 10,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "عدم الالتفاف على السؤال المطروح"
+        },
+        {
+          "id": "GC2",
+          "name": "الانضباط الزمني والتجاوب مع لمسات المقدّم",
+          "max": 10,
+          "enabled": true,
+          "env": "all",
+          "scoring": "metric",
+          "metric_key": "guest_longest_block_s",
+          "direction": "lower_better",
+          "anchors": {
+            "full": 120,
+            "half": 180,
+            "zero": 300
+          },
+          "unit": "seconds",
+          "guidance": "تجنب الاسترسال المطوّل والاستجابة لتوجيه المذيع"
+        }
+      ]
+    },
+    {
+      "id": "GD",
+      "name": "الحضور التلفزيوني والجاذبية",
+      "items": [
+        {
+          "id": "GD1",
+          "name": "وضوح الإلقاء والقوّة الإقناعية",
+          "max": 12,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "كاريزما الشاشة، الهدوء، والوضوح اللغوي"
+        },
+        {
+          "id": "GD2",
+          "name": "إنتاج جُمل قوية قابلة للتداول (Quotability)",
+          "max": 8,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "عبارات مكثّفة تصلح لمقاطع السوشال ميديا والعناوين"
+        }
+      ]
+    },
+    {
+      "id": "GE",
+      "name": "الالتزام بالمحور والجاهزية",
+      "items": [
+        {
+          "id": "GE1",
+          "name": "الالتزام بعنوان الحلقة وسياقها",
+          "max": 8,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "خدمة محور الحلقة دون تشتيت"
+        },
+        {
+          "id": "GE2",
+          "name": "الجاهزية التحضيرية ومواكبة التطوّرات",
+          "max": 7,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "معرفة أحدث المعطيات الميدانية والسياسية"
+        }
+      ]
+    }
+  ],
+  "admin_rules": [
+    "افصل بين الأعطال التقنية لضيوف الهاتف/الإنترنت وبين تقييم أدائهم الفكري والحواري.",
+    "استخرج لكل ضيف 3 إلى 5 أفكار رئيسية طرحها وجُمله الأقوى لتمكين المقارنة التاريخية وكشف التكرار مستقبلاً."
+  ]
+}

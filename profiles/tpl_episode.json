@@ -1,0 +1,168 @@
+{
+  "id": "tpl_episode",
+  "name": "تقييم الحلقة ككل",
+  "engine": "scored_evaluation",
+  "target_entity": "episode",
+  "core": true,
+  "enabled": true,
+  "version": "1.0",
+  "updated_at": "2026-11-21",
+  "updated_by": "system",
+  "change_reason": "الإصدار التأسيسي V8.0 لتقييم القيمة التحريرية والإنتاجية الشاملة للحلقة",
+  "generate_training_plan": false,
+  "policy": {},
+  "difficulty_modifier": {
+    "max": 3,
+    "rules": [
+      "حدث عاجل متسارع (+2)",
+      "تعدّد محاور وجبهات (+1)"
+    ]
+  },
+  "critical_error_caps": [
+    {
+      "event": "duplicate_file",
+      "label": "تكرار ملف كامل بلا قيمة جديدة",
+      "cap": 78,
+      "env": "all",
+      "enabled": true
+    }
+  ],
+  "bands": [
+    {
+      "min": 88,
+      "max": 100,
+      "label": "حلقة مرجعية ممتازة"
+    },
+    {
+      "min": 75,
+      "max": 87.9,
+      "label": "حلقة قوية وناجحة"
+    },
+    {
+      "min": 60,
+      "max": 74.9,
+      "label": "حلقة متوسطة تحتاج تطوير تحريري"
+    },
+    {
+      "min": 0,
+      "max": 59.9,
+      "label": "حلقة ضعيفة الأثر"
+    }
+  ],
+  "axes": [
+    {
+      "id": "EA",
+      "name": "راهنية الموضوع والزاوية التحريرية",
+      "items": [
+        {
+          "id": "EA1",
+          "name": "أهمية العنوان ومواكبته للحدث",
+          "max": 15,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "ملامسة اهتمام الجمهور وتوقيت الحدث"
+        },
+        {
+          "id": "EA2",
+          "name": "وضوح الزاوية التحريرية وتماسك الرسالة",
+          "max": 10,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "وجود خيط ناظم واضح للحلقة من بدايتها لختامها"
+        }
+      ]
+    },
+    {
+      "id": "EB",
+      "name": "اختيار الضيوف وتنوّع المصادر",
+      "items": [
+        {
+          "id": "EB1",
+          "name": "ثقل الضيوف وتكامل اختصاصاتهم",
+          "max": 12,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "تجنب تكرار نفس الرأي وتأمين قيمة مضافة حقيقية"
+        },
+        {
+          "id": "EB2",
+          "name": "تفعيل المراسلين والمصادر الميدانية",
+          "max": 8,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "إسناد الحوار بالتغطية الحية من الميدان"
+        }
+      ]
+    },
+    {
+      "id": "EC",
+      "name": "التحضير والتقارير المصوّرة (VT)",
+      "items": [
+        {
+          "id": "EC1",
+          "name": "جودة التقارير المصوّرة والوثائق والأرقام",
+          "max": 12,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "تطعيم الحوار بمواد بصرية ومعلوماتية محضّرة مسبقاً"
+        },
+        {
+          "id": "EC2",
+          "name": "تغطية الأسئلة الجوهرية للجمهور",
+          "max": 8,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "عدم إغفال السؤال الأهم في الحدث"
+        }
+      ]
+    },
+    {
+      "id": "ED",
+      "name": "القوس الدرامي وإدارة الوقت",
+      "items": [
+        {
+          "id": "ED1",
+          "name": "توازن توزيع الوقت بين المحاور",
+          "max": 12,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "عدم حرق الوقت في المحور الأول على حساب الختام"
+        },
+        {
+          "id": "ED2",
+          "name": "قوّة الافتتاح والتصعيد والخاتمة",
+          "max": 8,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "إيقاع متماسك يمنع الملل"
+        }
+      ]
+    },
+    {
+      "id": "EE",
+      "name": "التكامل بين التقديم والإخراج",
+      "items": [
+        {
+          "id": "EE1",
+          "name": "الانسجام العام وتكامل الصورة والمحتوى",
+          "max": 15,
+          "enabled": true,
+          "env": "all",
+          "scoring": "qualitative",
+          "guidance": "شعور المشاهد بوحدة المنتج التلفزيوني وجودته النهائية"
+        }
+      ]
+    }
+  ],
+  "admin_rules": [
+    "حدّد بوضوح في الخلاصة ما إذا كانت نقطة الضعف الأساسية في الحلقة تعود للإعداد أم للتقديم أم للضيوف أم للإخراج."
+  ]
+}

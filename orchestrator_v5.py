@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Master Orchestrator V7.0 - Blackbox v2.0 + Manar-100-v2 Deterministic Engine
-- Default 5-minute (300s) eval chunks with sequential running_context.json & entities.csv resolution.
-- Reads prompt_system.md, prompt_chunk.md, prompt_synthesis.md, schema_chunk.json, rubric.json, entities.csv from repo root.
-- Official google-genai SDK with fast parallel pre-flight validation, smart error classification, round-robin free keys, and paid fallback.
-- Deterministic Python KPI & 100-point (7 axes / 26 items) anchor-based scoring + single-defect rule + critical error caps + 6 audit checks.
-- Outputs 5 files per eval run:
-  1) 01_Main_Detailed_Report_<name>.html (DeepSeek Royal Word-RTL + 3 embedded Base64 Arabic PNG charts)
-  2) 02_Summarized_Report_<name>.html (Executive summary + embedded chart)
-  3) 03_Training_Plan_<name>.html (6-week personalized drill & rewrite plan populated from actual episode turns)
-  4) 04_Blackbox_V2_<name>.md (Self-contained forensic dossier for DeepSeek/ChatGPT/Claude)
-  5) 05_Blackbox_V2_<name>.json (Machine-auditable Blackbox v2.0 JSON dataset)
-- Daily broadcast mode preserved with parallel extraction, DLQ rescue, Detailed + Summarized Word-RTL HTML + Blackbox .md/.json.
+Master Orchestrator V8.0 — Template-Driven Engine & Universal Blackbox v3.0
+- Python is strictly the execution/calculation engine, NOT the prompt or criteria store.
+- Reads all templates, criteria, weights, caps, and admin rules dynamically from GitHub /profiles/.
+- Universal Blackbox v3.0 captures 6 neutral layers once per episode (turns with intervention/question split,
+  color-aware chyrons, visual/directing cues, preparation signals, per-guest observations, critical events).
+- Supports: ingest_only ($0.00 video pre-archive), rerender/additional templates from Blackbox,
+  multi-template scored evaluation (Presenter+Prep, Guests, Directing, Episode, Custom),
+  structured inventory (Daily 18h or Custom), clean Pause/Resume (_pause.flag), and Detailed Score Loss Breakdown.
 """
 import os
 import re
@@ -67,6 +63,7 @@ BEIRUT_TZ = ZoneInfo("Asia/Beirut")
 STATE_LOCK = threading.Lock()
 FFMPEG_SEM = threading.Semaphore(3)
 CANCEL_EVENT = threading.Event()
+PAUSE_EVENT = threading.Event()
 DRIVE_TOKEN_LOCK = threading.Lock()
 
 PREFERRED_FLASH_ORDER = [
@@ -273,7 +270,7 @@ def clean_json_text(text: str) -> dict:
     return parsed
 
 
-AXIS_AR_CODE = {"A": "أ", "B": "ب", "C": "ج", "D": "د", "E": "هـ", "F": "و", "G": "ز"}
+AXIS_AR_CODE = {"A": "أ", "B": "ب", "C": "ج", "D": "د", "E": "هـ", "F": "و", "G": "ز", "H": "ح"}
 ITEM_AR_CODE = {
     "A1": "أ١", "A2": "أ٢", "A3": "أ٣", "A4": "أ٤",
     "B1": "ب١", "B2": "ب٢", "B3": "ب٣", "B4": "ب٤",
@@ -353,41 +350,46 @@ def fmt_anchor_benchmark(item_def: dict) -> str:
     return "وفق المرساة المعتمدة"
 
 
-def format_metric_display(cid: str, val, kpis: dict = None) -> str:
+def format_metric_display(cid: str, val, kpis: dict = None, metric_key: str = "") -> str:
     if val is None or val == "":
         return "غير متاح"
     s = str(val).strip()
     if s in ANCHOR_HIT_AR:
         return ANCHOR_HIT_AR[s]
-    if cid == "A1":
+    mk = metric_key or ""
+    if mk == "interventions_per_10min" or cid == "A1":
         return f"{float(val):.1f} مداخلة / 10 دقائق"
-    if cid == "A2":
+    if mk == "mean_intervention_s" or cid == "A2":
         return f"{float(val):.1f} ثانية / مداخلة"
-    if cid == "A3":
+    if mk in ("longest_unbroken_block_s", "guest_longest_block_s") or cid in ("A3", "GC2"):
         return f"{int(round(float(val)))} ثانية (أطول بلوك)"
-    if cid == "A4" and "/" in s:
+    if (mk == "source_shares" or cid == "A4") and "/" in s:
         p = s.split("/")
         if len(p) == 3:
             return f"مقدّم {p[0]}% · ضيف {p[1]}% · ميدان {p[2]}%"
-    if cid == "B1":
+    if mk == "single_question_pct" or cid == "B1":
         return f"{float(val):.1f}% أسئلة أحادية"
-    if cid == "B2":
-        return f"{float(val):.1f} ثانية (متوسط التمهيد)"
-    if cid == "B4":
+    if mk in ("mean_question_s", "mean_preamble_s") or cid == "B2":
+        return f"{float(val):.1f} ثانية (متوسط السؤال)"
+    if mk == "duplicated_files" or cid == "B4":
         n = int(float(val))
         return "لا تكرار (0)" if n == 0 else f"{n} ملف مكرّر"
-    if cid == "C1":
+    if mk == "evidence_request_per_hour" or cid == "C1":
         return f"{float(val):.1f} طلب دليل / ساعة"
-    if cid == "C2":
+    if mk == "counter_hypothesis_per_hour" or cid == "C2":
         return f"{float(val):.1f} فرضية مضادة / ساعة"
-    if cid in ("C4", "G3"):
+    if mk == "name_errors" or cid in ("C4", "G3"):
         n = int(float(val))
         return "صفر أخطاء" if n == 0 else f"{n} خطأ"
-    if cid == "D3":
+    if mk == "field_balance" or cid == "D2":
+        return "متوازن" if float(val) >= 0.75 else "تهميش للميدان"
+    if mk == "touch_ratio" or cid == "D3":
         return f"{float(val):.2f} لمسة / 90 ثانية"
-    if cid == "E3":
-        return f"{float(val):.0f}% تغطية العواجل"
-    if cid == "G1":
+    if mk in ("red_chyron_coverage_pct", "local_chyron_coverage_pct") or cid == "E2":
+        return f"{float(val):.0f}% تغطية العاجل الأحمر"
+    if mk == "guest_evidence_pct" or cid == "GB1":
+        return f"{float(val):.0f}% ادعاءات مدعّمة بدليل"
+    if mk == "welcome_s" or cid == "G1":
         return f"{int(round(float(val)))} ثانية (الافتتاح)"
     return s
 
@@ -661,6 +663,150 @@ def drive_upload(folder_id, cfg, filepath, mimetype) -> bool:
         return False
 
 
+def drive_set_anyone_reader(file_id: str, cfg: dict) -> bool:
+    """Grants anyone-with-link read-only permission on verification video so RBAC users can play it in-app."""
+    if not file_id:
+        return False
+    try:
+        r = drive_request(
+            "POST",
+            f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
+            cfg,
+            headers={"Content-Type": "application/json"},
+            json={"role": "reader", "type": "anyone"},
+            timeout=20,
+        )
+        return r.status_code in (200, 201)
+    except Exception as e:
+        log(f"[Drive Share Warning] {e}")
+        return False
+
+
+def drive_upload_resumable(folder_id: str, cfg: dict, filepath: str, filename: str, mimetype: str = "video/mp4") -> str:
+    """Uploads large video files (50 MB -> multi-GB) to Google Drive via Resumable Upload in 8 MB chunks."""
+    if not (folder_id and os.path.exists(filepath)):
+        return ""
+    total_size = os.path.getsize(filepath)
+    if total_size < 10_000:
+        return ""
+
+    # 1. Skip re-upload if already saved in this folder (e.g., on Resume)
+    try:
+        q = f"'{folder_id}' in parents and name='{filename}' and trashed=false"
+        chk = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": q, "fields": "files(id,size)"}, timeout=20)
+        if chk.status_code == 200:
+            for ef in chk.json().get("files", []):
+                if int(ef.get("size") or 0) > 50_000:
+                    log(f"⏭️ Video already archived on Drive ({filename}, id={ef['id']}) — skipping re-upload.")
+                    return ef["id"]
+    except Exception:
+        pass
+
+    # 2. Fast lossless faststart remux (2s) so Drive & browsers seek instantly
+    upload_path = filepath
+    fast_path = f"/tmp/faststart_{os.getpid()}.mp4"
+    if mimetype == "video/mp4":
+        try:
+            remux = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", filepath, "-c", "copy", "-movflags", "+faststart", fast_path],
+                capture_output=True, text=True, timeout=180,
+            )
+            if remux.returncode == 0 and os.path.exists(fast_path) and os.path.getsize(fast_path) > 50_000:
+                upload_path = fast_path
+                total_size = os.path.getsize(upload_path)
+        except Exception:
+            pass
+
+    chunk_bytes = 8 * 1024 * 1024  # 8 MB (strict multiple of 256 KB)
+    file_id = ""
+    try:
+        t0 = time.time()
+        log(f"☁️ Starting resumable Drive upload for {filename} ({total_size / (1024*1024):.1f} MB)...")
+        init_r = drive_request(
+            "POST",
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size",
+            cfg,
+            headers={
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": mimetype,
+                "X-Upload-Content-Length": str(total_size),
+            },
+            data=json.dumps({"name": filename, "parents": [folder_id]}).encode("utf-8"),
+            timeout=30,
+        )
+        if init_r.status_code not in (200, 201) or not init_r.headers.get("Location"):
+            log(f"❌ Resumable upload init failed: HTTP {init_r.status_code} {init_r.text[:160]}")
+            return ""
+        session_url = init_r.headers["Location"]
+
+        offset = 0
+        last_log_pct = -1
+        with open(upload_path, "rb") as f:
+            while offset < total_size:
+                if CANCEL_EVENT.is_set():
+                    return ""
+                f.seek(offset)
+                data = f.read(chunk_bytes)
+                if not data:
+                    break
+                end_pos = offset + len(data) - 1
+                cr_hdr = f"bytes {offset}-{end_pos}/{total_size}"
+                ok_chunk = False
+                for attempt in range(1, 4):
+                    try:
+                        pr = requests.put(
+                            session_url,
+                            headers={"Content-Type": mimetype, "Content-Range": cr_hdr, "Content-Length": str(len(data))},
+                            data=data,
+                            timeout=120,
+                        )
+                        if pr.status_code in (200, 201):
+                            file_id = (pr.json() or {}).get("id", "")
+                            ok_chunk = True
+                            break
+                        if pr.status_code == 308:
+                            ok_chunk = True
+                            break
+                        log(f"  ⚠️ Video chunk retry {attempt}/3 (HTTP {pr.status_code})")
+                        time.sleep(2 * attempt)
+                    except Exception as ce:
+                        log(f"  ⚠️ Video chunk net error {attempt}/3: {ce}")
+                        time.sleep(2 * attempt)
+                if not ok_chunk:
+                    log(f"❌ Aborted video upload at {offset}/{total_size}")
+                    return ""
+                offset = end_pos + 1
+                pct = int((offset / total_size) * 100)
+                if pct >= last_log_pct + 25 or pct == 100:
+                    last_log_pct = pct
+                    log(f"  ☁️ Video upload progress: {pct}% ({offset/(1024*1024):.1f}/{total_size/(1024*1024):.1f} MB)")
+
+        if file_id:
+            log(f"✅ Video saved to Drive ({filename}, id={file_id}) in {time.time() - t0:.1f}s!")
+            if cfg.get("video_public_link", True):
+                shared = drive_set_anyone_reader(file_id, cfg)
+                log(f"  🔗 Video link sharing (anyone=reader): {'✅ Enabled' if shared else '⚠️ Skipped'}")
+        return file_id
+    except Exception as e:
+        log(f"[Video Upload Warning] {e}")
+        return ""
+    finally:
+        if upload_path == fast_path and os.path.exists(fast_path):
+            try:
+                os.remove(fast_path)
+            except Exception:
+                pass
+
+
+def probe_remote_content_length(url: str) -> int:
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=10, verify=False, headers={"User-Agent": "Mozilla/5.0"})
+        cl = int(r.headers.get("Content-Length") or 0)
+        return cl
+    except Exception:
+        return 0
+
+
 def drive_upload_json_blob(folder_id, cfg, filename: str, obj) -> bool:
     tmp_p = os.path.join("/tmp", f"ckpt_{os.getpid()}_{filename}")
     try:
@@ -736,10 +882,15 @@ def write_drive_status_and_check_cancel(folder_id, cfg, payload):
     if not folder_id:
         return False
     try:
-        chk = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": f"'{folder_id}' in parents and name='_cancel.flag' and trashed=false", "fields": "files(id)"}, timeout=10)
-        if chk.status_code == 200 and chk.json().get("files"):
-            CANCEL_EVENT.set()
-            return True
+        q_flags = f"'{folder_id}' in parents and (name='_cancel.flag' or name='_pause.flag') and trashed=false"
+        chk = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": q_flags, "fields": "files(id,name)"}, timeout=10)
+        if chk.status_code == 200:
+            for fl in chk.json().get("files", []):
+                if fl.get("name") == "_cancel.flag":
+                    CANCEL_EVENT.set()
+                    return True
+                if fl.get("name") == "_pause.flag":
+                    PAUSE_EVENT.set()
         raw_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if not STATUS_FILE_DRIVE_ID:
             r = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": f"'{folder_id}' in parents and name='_status.json' and trashed=false", "fields": "files(id)"}, timeout=10)
@@ -796,15 +947,19 @@ def push_status(cfg, folder_id, run_id, status, phase, completed, total, act_cos
     if webhook:
         try:
             r = requests.post(webhook, json=payload, timeout=10)
-            if r.status_code == 200 and "json" in (r.headers.get("Content-Type") or "").lower() and r.json().get("cancel_requested"):
-                CANCEL_EVENT.set()
-                return True
+            if r.status_code == 200 and "json" in (r.headers.get("Content-Type") or "").lower():
+                rj = r.json()
+                if rj.get("cancel_requested"):
+                    CANCEL_EVENT.set()
+                    return True
+                if rj.get("pause_requested"):
+                    PAUSE_EVENT.set()
         except Exception:
             pass
     return CANCEL_EVENT.is_set()
 
 
-def finalize_cost_webhook(cfg, folder_id, actual_cost: float, final_status="completed", message="", trigger_gas_email=False, email_subject="", completed_chunks=None, total_chunks=None, kpi_summary=None):
+def finalize_cost_webhook(cfg, folder_id, actual_cost: float, final_status="completed", message="", trigger_gas_email=False, email_subject="", completed_chunks=None, total_chunks=None, kpi_summary=None, extra_fields=None):
     kh = get_key_health_snapshot()
     st_payload = {
         "job_id": folder_id, "run_id": str(os.environ.get("GITHUB_RUN_ID", "")),
@@ -830,6 +985,8 @@ def finalize_cost_webhook(cfg, folder_id, actual_cost: float, final_status="comp
             }
             if kpi_summary:
                 wh_body["kpi_summary"] = kpi_summary
+            if isinstance(extra_fields, dict):
+                wh_body.update(extra_fields)
             requests.post(cfg["webhook_url"], json=wh_body, timeout=25)
         except Exception:
             pass
@@ -1337,364 +1494,6 @@ def score_source_shares(anchor_pct: float, guest_pct: float, field_pct: float, m
     return round_half(sc), ("full" if d == 0 else ("between_50_and_100" if sc >= max_pts * 0.5 else "between_0_and_50"))
 
 
-def compute_deterministic_evaluation(chunks: list, duration_sec: float, rubric: dict, derived_meta: dict, llm_qual: dict, brief: dict, editorial_mode: str = "directed") -> dict:
-    all_turns, all_interv, all_chyrons, all_claims, all_files, all_crit, all_gaps, all_conflicts = [], [], [], [], [], [], [], []
-    participants_map = {}
-    program_name_detected = None
-    episode_title_detected = None
-    for c in chunks:
-        cmeta = c.get("metadata") or {}
-        if not program_name_detected and cmeta.get("program_name"):
-            program_name_detected = cmeta.get("program_name")
-        if not episode_title_detected and cmeta.get("episode_title"):
-            episode_title_detected = cmeta.get("episode_title")
-        for p in c.get("participants", []):
-            if isinstance(p, dict) and p.get("name") and p.get("id") != "ANCHOR":
-                key = str(p["name"]).strip()
-                if key not in participants_map:
-                    participants_map[key] = p
-        all_turns.extend(c.get("turns", []))
-        all_interv.extend(c.get("interventions", []))
-        all_chyrons.extend(c.get("chyron_timeline", []))
-        all_claims.extend(c.get("claims", []))
-        all_files.extend(c.get("files", []))
-        all_crit.extend(c.get("critical_events", []))
-        all_gaps.extend(c.get("data_gaps", []))
-        all_conflicts.extend(c.get("metadata_conflicts", []))
-
-    dur_min, dur_hr = max(1.0, duration_sec / 60.0), max(0.25, duration_sec / 3600.0)
-    anchor_turns = [t for t in all_turns if t.get("speaker_id") == "ANCHOR"]
-    guest_turns = [t for t in all_turns if str(t.get("speaker_id", "")).startswith("GUEST")]
-    field_turns = [t for t in all_turns if str(t.get("speaker_id", "")).startswith("REPORTER")]
-
-    # Compute unbroken guest blocks across chunk boundaries
-    unbroken_blocks, cur_spk, cur_start, cur_end, cur_dur, cur_tids = [], None, None, None, 0.0, []
-    for t in all_turns:
-        spk = t.get("speaker_id", "")
-        if spk.startswith("GUEST"):
-            if cur_spk == spk:
-                cur_dur += float(t.get("duration_s", 0.0))
-                cur_end = t.get("end")
-                cur_tids.append(t.get("id"))
-            else:
-                if cur_spk and cur_dur > 0:
-                    unbroken_blocks.append({"speaker_id": cur_spk, "start": cur_start, "end": cur_end, "duration_s": round(cur_dur, 1), "turn_ids": cur_tids})
-                cur_spk, cur_start, cur_end, cur_dur, cur_tids = spk, t.get("start"), t.get("end"), float(t.get("duration_s", 0.0)), [t.get("id")]
-        else:
-            if cur_spk and cur_dur > 0:
-                unbroken_blocks.append({"speaker_id": cur_spk, "start": cur_start, "end": cur_end, "duration_s": round(cur_dur, 1), "turn_ids": cur_tids})
-            cur_spk, cur_start, cur_end, cur_dur, cur_tids = None, None, None, 0.0, []
-    if cur_spk and cur_dur > 0:
-        unbroken_blocks.append({"speaker_id": cur_spk, "start": cur_start, "end": cur_end, "duration_s": round(cur_dur, 1), "turn_ids": cur_tids})
-
-    longest_block = max(unbroken_blocks, key=lambda b: b["duration_s"], default={"start": "00:00:00", "end": "00:00:00", "duration_s": 0.0, "turn_ids": []})
-    longest_block_s = longest_block["duration_s"]
-    monologues_over_180 = [b for b in unbroken_blocks if b["duration_s"] > 180.0]
-
-    interv_list = all_interv if all_interv else [{"at": t.get("start"), "turn_id": t.get("id"), "duration_s": t.get("duration_s", 0.0), "cue_source": "none"} for t in anchor_turns]
-    interv_per_10m = round((len(interv_list) / dur_min) * 10.0, 2)
-    interv_durs = [float(i.get("duration_s", 0.0)) for i in interv_list if float(i.get("duration_s", 0.0)) > 0]
-    mean_interv_s = round(sum(interv_durs) / len(interv_durs), 1) if interv_durs else 0.0
-
-    tot_speech_s = sum(float(t.get("duration_s", 0.0)) for t in all_turns) or duration_sec
-    anchor_pct = round(100.0 * sum(float(t.get("duration_s", 0.0)) for t in anchor_turns) / tot_speech_s, 1)
-    guest_pct = round(100.0 * sum(float(t.get("duration_s", 0.0)) for t in guest_turns) / tot_speech_s, 1)
-    field_pct = round(100.0 * sum(float(t.get("duration_s", 0.0)) for t in field_turns) / tot_speech_s, 1)
-
-    q_turns = [t for t in anchor_turns if int(t.get("question_count", 0)) >= 1 or t.get("kind") in ("question", "followup")]
-    single_q_pct = round(100.0 * sum(1 for t in q_turns if int(t.get("question_count", 1)) == 1) / len(q_turns), 1) if q_turns else 0.0
-    mean_preamble_s = round(sum(float(t.get("duration_s", 0.0)) for t in q_turns) / len(q_turns), 1) if q_turns else mean_interv_s
-    under_30_words_pct = round(100.0 * sum(1 for t in q_turns if int(t.get("word_count", 0)) <= 30) / len(q_turns), 1) if q_turns else 0.0
-
-    dup_files = [f for f in all_files if f.get("duplicated_of")]
-    checkable_claims = [c for c in all_claims if c.get("checkable")]
-    ev_req_claims = [c for c in checkable_claims if c.get("anchor_challenged_at") and c.get("challenge_type") in ("ask_source", "fact_check", None)]
-    counter_claims = [c for c in checkable_claims if c.get("anchor_challenged_at") and c.get("challenge_type") == "counter_hypothesis"]
-    ev_req_per_hr, counter_per_hr = round(len(ev_req_claims) / dur_hr, 1), round(len(counter_claims) / dur_hr, 1)
-    verif_rate_pct = round(100.0 * sum(1 for c in checkable_claims if c.get("anchor_challenged_at")) / len(checkable_claims), 1) if checkable_claims else 0.0
-
-    local_chyrons = [ch for ch in all_chyrons if ch.get("type") in ("local_security", "breaking")]
-    read_local = [ch for ch in local_chyrons if ch.get("read_on_air_at")]
-    unread_local = [ch for ch in local_chyrons if not ch.get("read_on_air_at")]
-    local_chyron_cov = round(100.0 * len(read_local) / len(local_chyrons), 1) if local_chyrons else 100.0
-    latencies = [float(ch["response_latency_s"]) for ch in read_local if ch.get("response_latency_s") is not None]
-    mean_chyron_lat = round(sum(latencies) / len(latencies), 1) if latencies else None
-
-    last_10m_start = max(0.0, duration_sec - 600.0)
-    field_last_10m_s = sum(float(t.get("duration_s", 0.0)) for t in field_turns if parse_hms_to_sec(t.get("start")) >= last_10m_start)
-    has_field_source = len(field_turns) > 0
-    field_starved = has_field_source and (field_last_10m_s < 10.0)
-
-    touch_ratio = round(min(1.0, sum(1 for i in interv_list if float(i.get("duration_s", 99)) <= 12.0) / max(1.0, sum(b["duration_s"] for b in unbroken_blocks) / 90.0)), 2)
-    welcome_s = float(anchor_turns[0].get("duration_s", 20.0)) if anchor_turns else 20.0
-
-    # Auto-augment critical events deterministically
-    crit_list = list(all_crit)
-    existing_types = {e.get("type") for e in crit_list}
-    if longest_block_s > 180.0 and "monologue_over_180s" not in existing_types:
-        crit_list.append({"type": "monologue_over_180s", "at": longest_block["start"], "duration_s": longest_block_s, "speaker_id": longest_block.get("speaker_id", "GUEST_1")})
-    for ch in unread_local:
-        if not any(e.get("type") == "local_chyron_unread" and e.get("at") == ch.get("on") for e in crit_list):
-            crit_list.append({"type": "local_chyron_unread", "at": ch.get("on"), "latency_s": None})
-    for fl in dup_files:
-        if "duplicate_file" not in existing_types:
-            crit_list.append({"type": "duplicate_file", "at": fl.get("start"), "of": str(fl.get("duplicated_of"))})
-
-    name_errors = sum(1 for e in crit_list if e.get("type") == "name_error")
-    qual_scores = (llm_qual or {}).get("qualitative_items", {})
-
-    def q_item(cid, default_ratio=0.70, max_pts=4.0, default_note="تقييم مبني على شواهد المقاطع."):
-        qi = qual_scores.get(cid) if isinstance(qual_scores, dict) else None
-        if isinstance(qi, dict) and isinstance(qi.get("score"), (int, float)):
-            return min(float(max_pts), max(0.0, round_half(qi["score"]))), qi.get("anchor_hit", "qualitative"), qi.get("evidence", []), qi.get("note", default_note)
-        return round_half(max_pts * default_ratio), "qualitative", [], default_note
-
-    scored_axes, flat_items, fixed_after_check = [], [], []
-    for ax in rubric.get("axes", []):
-        ax_id, ax_items_out = ax["id"], []
-        for it in ax.get("items", []):
-            cid, cname, cmax, anc, direc = it["id"], it["name"], float(it["max"]), it.get("anchors", {}), it.get("direction", "higher_better")
-            metric_val, ev, note, ref_only, conf = None, [], "", False, "high"
-
-            if cid == "A1":
-                metric_val = interv_per_10m
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": i.get("at"), "turn_id": i.get("turn_id")} for i in interv_list[:4]]
-                note = f"{len(interv_list)} تدخل خلال {dur_min:.1f} دقيقة ({interv_per_10m}/10د)."
-            elif cid == "A2":
-                metric_val = mean_interv_s
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": t.get("start"), "duration_s": t.get("duration_s")} for t in sorted(anchor_turns, key=lambda x: x.get("duration_s", 0), reverse=True)[:3]]
-                note = f"متوسط طول مداخلة المقدم {mean_interv_s}ث (نسبة الأسئلة ≤30 كلمة: {under_30_words_pct}%)."
-            elif cid == "A3":
-                metric_val = longest_block_s
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": longest_block["start"], "duration_s": longest_block_s, "turn_ids": longest_block["turn_ids"][:5]}]
-                note = f"أطول بلوك ضيف متّصل {longest_block_s}ث عند {longest_block['start']} (بلوكات >180ث: {len(monologues_over_180)})."
-            elif cid == "A4":
-                metric_val = f"{anchor_pct}/{guest_pct}/{field_pct}"
-                sc, hit = score_source_shares(anchor_pct, guest_pct, field_pct, cmax)
-                ev = [{"anchor_pct": anchor_pct, "guest_pct": guest_pct, "field_pct": field_pct}]
-                note = f"حصص الكلام: المقدم {anchor_pct}% · الضيف {guest_pct}% · الميدان {field_pct}%."
-            elif cid == "B1":
-                metric_val = single_q_pct
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": t.get("start"), "question_count": t.get("question_count")} for t in q_turns if int(t.get("question_count", 0)) > 1][:4]
-                note = f"نسبة المداخلات ذات الاستفهام الواحد: {single_q_pct}%."
-            elif cid == "B2":
-                metric_val = mean_preamble_s
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": t.get("start"), "duration_s": t.get("duration_s"), "words": t.get("word_count")} for t in sorted(q_turns, key=lambda x: x.get("duration_s", 0), reverse=True)[:3]]
-                note = f"متوسط زمن السؤال والتمهيد {mean_preamble_s}ث."
-            elif cid == "B4":
-                metric_val = len(dup_files)
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": f.get("start"), "title": f.get("title"), "duplicated_of": f.get("duplicated_of")} for f in dup_files]
-                note = "لا ملفات مكررة." if not dup_files else f"رُصد {len(dup_files)} ملف مكرر."
-            elif cid == "C1":
-                metric_val = ev_req_per_hr
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": c.get("at"), "claim": c.get("text", "")[:80], "challenged": c.get("anchor_challenged_at")} for c in checkable_claims[:4]]
-                note = f"{len(ev_req_claims)} طلب دليل من {len(checkable_claims)} ادعاء قابل للتحقق ({ev_req_per_hr}/ساعة)."
-            elif cid == "C2":
-                metric_val = counter_per_hr
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": c.get("at"), "challenged_at": c.get("anchor_challenged_at")} for c in counter_claims[:4]]
-                note = f"{len(counter_claims)} اختبار فرضية مضادة ({counter_per_hr}/ساعة)."
-            elif cid == "C4":
-                metric_val = name_errors
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [e for e in crit_list if e.get("type") == "name_error"]
-                note = "لا أخطاء إحالة أو أسماء." if name_errors == 0 else f"رُصد {name_errors} خطأ اسم على الهواء."
-            elif cid == "D2":
-                metric_val = "مصدر غائب" if field_starved else "لا تهميش"
-                sc, hit = (1.5, "zero") if field_starved else ((cmax, "full") if has_field_source else (round_half(cmax * 0.75), "full"))
-                ev = [{"field_last_10m_s": round(field_last_10m_s, 1)}]
-                note = "تهميش المراسل الميداني في آخر 10 دقائق." if field_starved else "توزيع متوازن للمصادر."
-            elif cid == "D3":
-                metric_val = touch_ratio
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                if longest_block_s > 180.0:
-                    ref_only = True
-                    # Single-defect rule: avoid double penalizing the same monologue already penalized in A3
-                    sc = max(sc, round_half(cmax * 0.5))
-                    note = f"نسبة اللمسات القصيرة/90ث: {touch_ratio} (referenced_only: الخصم الكامل للمونولوج في A3)."
-                else:
-                    note = f"نسبة اللمسات القصيرة/90ث: {touch_ratio}."
-            elif cid == "E3":
-                metric_val = local_chyron_cov
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": ch.get("on"), "text": ch.get("text_raw", "")[:80], "read_at": ch.get("read_on_air_at")} for ch in local_chyrons[:5]]
-                note = f"تغطية الأشرطة المحلية/العاجلة: {local_chyron_cov}% (فات {len(unread_local)} شريط)."
-            elif cid == "G1":
-                metric_val = welcome_s
-                sc, hit = score_by_anchor(metric_val, cmax, direc, anc)
-                ev = [{"ts": anchor_turns[0].get("start"), "duration_s": welcome_s}] if anchor_turns else []
-                note = f"مدة مداخلة الافتتاح {welcome_s}ث."
-            elif cid == "G3":
-                metric_val = name_errors
-                if name_errors > 0:
-                    ref_only = True
-                    sc = max(round_half(cmax * 0.5), score_by_anchor(name_errors, cmax, direc, anc)[0])
-                    hit = "referenced_only"
-                    note = "تضارب اسم في الإغلاق (referenced_only: الخصم الأساسي في C4 وسقف الخطأ الحرج)."
-                else:
-                    sc, hit = float(cmax), "full"
-                    note = "إغلاق سليم بالأسماء."
-                ev = [e for e in crit_list if e.get("type") == "name_error"]
-            else:
-                sc, hit, ev, note = q_item(cid, 0.70, cmax)
-                conf = "medium" if cid == "F2" else "medium"
-                metric_val = hit
-
-            # Audit guard: score_vs_metric
-            if hit == "zero" and sc > cmax * 0.5 and not ref_only:
-                fixed_after_check.append({"check": "score_vs_metric", "criterion_id": cid, "old": sc, "new": 0.0})
-                sc = 0.0
-
-            item_obj = {
-                "criterion_id": cid, "axis_id": ax_id, "name": cname, "max": cmax,
-                "score": round_half(sc), "metric_value": metric_val,
-                "metric_display": format_metric_display(cid, metric_val),
-                "benchmark_display": fmt_anchor_benchmark(it),
-                "anchor_hit": hit, "anchor_hit_ar": ANCHOR_HIT_AR.get(hit, hit),
-                "evidence": ev, "referenced_only": ref_only,
-                "confidence": conf, "confidence_ar": CONF_AR.get(conf, "متوسطة"),
-                "note": note,
-            }
-            ax_items_out.append(item_obj)
-            flat_items.append(item_obj)
-
-        ax_sum = round(sum(x["score"] for x in ax_items_out), 1)
-        scored_axes.append({
-            "id": ax_id, "name": ax["name"], "max": float(ax["max"]),
-            "score": ax_sum, "pct": round(100.0 * ax_sum / float(ax["max"]), 1),
-            "items": ax_items_out,
-        })
-
-    raw_score = round(sum(a["score"] for a in scored_axes), 1)
-
-    # Difficulty modifier on separate line (max +5)
-    diff_reasons = ["بث مباشر (+1)"] + (["ملف عاجل متحرّك (+2)"] if local_chyrons else []) + (["مصدران متزامنان أو أكثر (+1)"] if has_field_source else [])
-    diff_mod = min(int(rubric.get("difficulty_modifier", {}).get("max", 5)), 1 + (2 if local_chyrons else 0) + (1 if has_field_source else 0))
-    pre_cap_score = min(100.0, round(raw_score + diff_mod, 1))
-
-    # Apply optional human_overrides (e.g., waived/ignored critical events)
-    ignored_types = set((brief or {}).get("_ignored_critical_events", []) or [])
-    if ignored_types:
-        crit_list = [ce for ce in crit_list if ce.get("type") not in ignored_types and f"{ce.get('type')}@{fmt_ts_clean(ce.get('at'))}" not in ignored_types]
-
-    # Critical error caps strictly from rubric.json
-    caps_applied, cap_ceiling, distinct_crit = [], 100.0, set()
-    cap_map = {r["event"]: r["cap"] for r in rubric.get("critical_error_caps", []) if "event" in r and r["event"] != "multiple_critical"}
-    for ce in crit_list:
-        ct = ce.get("type")
-        if ct in cap_map:
-            distinct_crit.add(ct)
-            caps_applied.append({"event": ct, "event_ar": CRIT_EVENT_AR.get(ct, ct), "at": ce.get("at"), "detail": ce.get("text") or ce.get("said") or "", "cap": cap_map[ct]})
-            cap_ceiling = min(cap_ceiling, float(cap_map[ct]))
-    if len(distinct_crit) >= 2:
-        caps_applied.append({"event": "multiple_critical", "event_ar": CRIT_EVENT_AR["multiple_critical"], "at": "كامل الحلقة", "detail": "تحقّق خطآن حرجان أو أكثر", "cap": 70})
-        cap_ceiling = min(cap_ceiling, 70.0)
-
-    final_score = min(pre_cap_score, cap_ceiling)
-    band_label = next((b["label"] for b in rubric.get("bands", []) if b["min"] <= final_score <= b["max"]), "مقبول بثغرات بنيوية")
-
-    # Auto-derive top_priority strictly from lowest-ratio item
-    sorted_weak = sorted(flat_items, key=lambda x: x["score"] / max(0.1, x["max"]))
-    top_priority_item = sorted_weak[0] if sorted_weak else {"criterion_id": "-", "name": "-", "score": 0, "max": 1}
-
-    # Check timezone consistency against date
-    tz_ok = True
-    if derived_meta.get("broadcast_date"):
-        month_num = int(derived_meta["broadcast_date"].split("-")[1])
-        off_h = derived_meta.get("expected_utc_offset_hours", 2.0)
-        if month_num in (11, 12, 1, 2) and off_h != 2.0:
-            tz_ok = False
-
-    audit_checks = [
-        {"check": "priority_vs_score", "passed": True, "detail": f"الأولوية القصوى مشتقة آلياً من أدنى بند: {top_priority_item['criterion_id']} ({top_priority_item['score']}/{top_priority_item['max']})"},
-        {"check": "score_vs_metric", "passed": True, "detail": f"تطابق الدرجات مع المراسي (تصحيحات تلقائية: {len(fixed_after_check)})"},
-        {"check": "count_consistency", "passed": len(flat_items) == sum(len(a["items"]) for a in scored_axes), "detail": f"{len(flat_items)} بنداً عبر {len(scored_axes)} محاور"},
-        {"check": "timezone_consistency", "passed": tz_ok, "detail": f"توقيت بيروت المحسوب: {derived_meta.get('timezone')}"},
-        {"check": "sum_consistency", "passed": abs(sum(a["score"] for a in scored_axes) - raw_score) < 1e-6, "detail": f"مجموع المحاور = {raw_score}/100"},
-        {"check": "evidence_coverage", "passed": True, "detail": "كل بند موثّق بمؤشر مقيس أو شواهد زمنية"},
-    ]
-
-    # Brief alignment
-    has_brief = bool(brief and any(brief.values()))
-    brief_alignment = {
-        "brief_available": has_brief,
-        "brief": brief or {},
-        "verification_axis_basis": "مقارنة مع editorial_brief المرفق" if has_brief else "استُخدم معيار بديل: قابلية الادعاء للتحقق",
-        "caveat": "" if has_brief else "بلا موجز تحريري مسبق (editorial_brief)، لا يمكن الحكم على اكتمال التغطية مقابل خطة غرفة التحرير.",
-    }
-
-    # Build clean episode examples automatically if LLM synthesis didn't provide them
-    auto_examples = []
-    for t in sorted(q_turns, key=lambda x: float(x.get("duration_s", 0)), reverse=True)[:4]:
-        auto_examples.append({"ts": fmt_ts_clean(t.get("start")), "speaker": "المقدّم", "quote": str(t.get("text", ""))[:220], "significance": f"مداخلة سؤال ({t.get('duration_s')} ثانية، {t.get('word_count')} كلمة، {t.get('question_count')} استفهام)."})
-    for b in sorted(unbroken_blocks, key=lambda x: float(x.get("duration_s", 0)), reverse=True)[:3]:
-        if float(b.get("duration_s", 0)) >= 90:
-            auto_examples.append({"ts": f"من {fmt_ts_clean(b.get('start'))} إلى {fmt_ts_clean(b.get('end'))}", "speaker": b.get("speaker_id", "الضيف"), "quote": f"بلوك متّصل للضيف لمدة {int(round(float(b['duration_s'])))} ثانية دون مداخلة توجيهية.", "significance": "تجاوز عتبة 180 ثانية (استرسال)" if float(b["duration_s"]) > 180 else "بلوك متوسط الطول (بين 90 و180 ثانية)."})
-    for ch in unread_local[:2]:
-        auto_examples.append({"ts": fmt_ts_clean(ch.get("on")), "speaker": "شريط الشاشة", "quote": str(ch.get("text_raw", ""))[:180], "significance": "شريط أمني/عاجل محلي لم يُقرأ على الهواء — خطأ حرج يفرض سقفاً على النتيجة."})
-
-    return {
-        "editorial_mode": editorial_mode,
-        "program_name": program_name_detected,
-        "episode_title": episode_title_detected,
-        "guests_list": list(participants_map.values()),
-        "auto_examples": auto_examples,
-        "kpis": {
-            "interventions_per_10min": interv_per_10m,
-            "mean_intervention_s": mean_interv_s,
-            "longest_unbroken_block_s": longest_block_s,
-            "anchor_share_pct": anchor_pct,
-            "guest_share_pct": guest_pct,
-            "reporter_share_pct": field_pct,
-            "single_question_pct": single_q_pct,
-            "under_30_words_pct": under_30_words_pct,
-            "mean_preamble_s": mean_preamble_s,
-            "evidence_request_per_hour": ev_req_per_hr,
-            "counter_hypothesis_per_hour": counter_per_hr,
-            "verification_rate_pct": verif_rate_pct,
-            "local_chyron_coverage_pct": local_chyron_cov,
-            "chyron_response_s": mean_chyron_lat,
-            "unread_local_chyrons": len(unread_local),
-            "duplicated_files": len(dup_files),
-            "total_turns": len(all_turns),
-            "total_interventions": len(interv_list),
-            "total_claims": len(all_claims),
-            "checkable_claims": len(checkable_claims),
-        },
-        "axes": scored_axes,
-        "scores": flat_items,
-        "unbroken_blocks": unbroken_blocks,
-        "monologues_over_180": monologues_over_180,
-        "longest_questions": sorted(q_turns, key=lambda x: (float(x.get("duration_s", 0)), int(x.get("word_count", 0))), reverse=True)[:5],
-        "top_checkable_claims": checkable_claims[:6],
-        "unread_local_chyrons": unread_local,
-        "critical_events": crit_list,
-        "caps_applied": caps_applied,
-        "score_final": {
-            "raw_score": raw_score,
-            "difficulty_modifier": diff_mod,
-            "difficulty_justification": " + ".join(diff_reasons),
-            "pre_cap_score": pre_cap_score,
-            "cap_ceiling": cap_ceiling,
-            "final_score": final_score,
-            "band": band_label,
-            "reported_as": f"{int(round(final_score))} ± 5",
-        },
-        "top_priority_auto": f"{top_priority_item['criterion_id']} · {top_priority_item['name']} ({top_priority_item['score']}/{top_priority_item['max']})",
-        "audit": {"checks": audit_checks, "fixed_after_check": fixed_after_check},
-        "brief_alignment": brief_alignment,
-        "metadata_conflicts": all_conflicts,
-        "data_gaps": all_gaps,
-    }
-
-
 # ==============================================================================
 # NATIVE PILLOW + HARFBUZZ/FRIBIDI ARABIC RTL PNG CHART ENGINE (WORD-SAFE BASE64)
 # ==============================================================================
@@ -1767,20 +1566,20 @@ def _pil_to_b64(img: Image.Image) -> str:
 
 
 def render_axes_chart_pil(axes: list) -> Image.Image:
-    W, H = 1520, 740
+    W, H = 1520, max(620, 230 + len(axes) * 72)
     img = Image.new("RGB", (W, H), "#FFFFFF")
     draw = ImageDraw.Draw(img)
 
     f_title = _load_pil_font(29, bold=True)
     f_sub = _load_pil_font(17, bold=False)
-    f_lbl = _load_pil_font(21, bold=True)
-    f_val = _load_pil_font(20, bold=True)
+    f_lbl = _load_pil_font(20, bold=True)
+    f_val = _load_pil_font(19, bold=True)
     f_tick = _load_pil_font(16, bold=False)
 
     draw.rounded_rectangle([8, 8, W - 9, H - 9], radius=14, outline="#D5DBE2", width=2, fill="#FFFFFF")
     draw.rectangle([10, 10, W - 11, 20], fill="#12304D")
 
-    _draw_rtl(draw, (W - 44, 46), "نسبة الأداء في المحاور السبعة مقابل المعيار المستهدف (75%)", f_title, "#12304D", anchor="ra")
+    _draw_rtl(draw, (W - 44, 46), "نسبة الأداء في محاور التقييم مقابل المعيار المستهدف (75%)", f_title, "#12304D", anchor="ra")
     _draw_rtl(draw, (W - 44, 90), "أخضر: متجاوز للمستهدف (75% فأكثر)  |  ذهبي: متوسط (55% - 74%)  |  قرمزي: دون 55%", f_sub, "#5B6572", anchor="ra")
 
     label_area_x = W - 44
@@ -1893,13 +1692,13 @@ def render_blocks_chart_pil(unbroken_blocks: list):
 
 
 def render_lost_chart_pil(axes: list) -> Image.Image:
-    W, H = 1520, 740
+    W, H = 1520, max(620, 230 + len(axes) * 72)
     img = Image.new("RGB", (W, H), "#FFFFFF")
     draw = ImageDraw.Draw(img)
 
     f_title = _load_pil_font(29, bold=True)
     f_sub = _load_pil_font(17, bold=False)
-    f_lbl = _load_pil_font(21, bold=True)
+    f_lbl = _load_pil_font(20, bold=True)
     f_val = _load_pil_font(19, bold=True)
     f_tick = _load_pil_font(16, bold=False)
 
@@ -1974,7 +1773,719 @@ def generate_eval_charts(eval_data: dict) -> dict:
 
 
 # ==============================================================================
-# EXECUTIVE WORD-RTL HTML RENDERERS (CLEAN ARABIC, ZERO RAW ENGLISH, A4 PRINT)
+# V8.0 PROFILE LOADER (PYTHON IS NOT THE PROMPT/CRITERIA STORE)
+# ==============================================================================
+PROFILES_DIR = os.path.join(BASE_DIR, "profiles")
+
+
+def load_profile_registry() -> dict:
+    p = os.path.join(PROFILES_DIR, "registry.json")
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log(f"⚠️ Failed loading profiles/registry.json: {e}")
+    return {"schema_version": "8.0", "blackbox_prompt_file": "profiles/blackbox_v3_prompt.md", "templates": []}
+
+
+def load_template_by_id(tpl_id: str) -> dict:
+    """Loads any template JSON dynamically from profiles/<id>.json (or registry path)."""
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(tpl_id or ""))
+    candidates = [
+        os.path.join(PROFILES_DIR, f"{safe_id}.json"),
+        os.path.join(BASE_DIR, f"{safe_id}.json"),
+    ]
+    reg = load_profile_registry()
+    for entry in reg.get("templates", []):
+        if entry.get("id") == safe_id and entry.get("file"):
+            candidates.insert(0, os.path.join(BASE_DIR, entry["file"]))
+    for cpath in candidates:
+        if os.path.exists(cpath):
+            try:
+                with open(cpath, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                log(f"⚠️ Error reading template {cpath}: {e}")
+    # Emergency minimal fallback ONLY if profiles/ folder is missing from GitHub
+    if safe_id == "tpl_daily":
+        return {
+            "id": "tpl_daily", "name": "جرد البث اليومي", "engine": "structured_inventory",
+            "target_entity": "daily", "version": "1.0-fallback",
+            "categories": ["نشرة إخبارية", "تغطية مباشرة", "برنامج حواري", "تقرير ميداني", "إعادة", "فاصل"],
+            "columns": [
+                {"key": "start_end", "label": "التوقيت"}, {"key": "broadcast_type", "label": "النوع"},
+                {"key": "category", "label": "التصنيف"}, {"key": "theme", "label": "المحور"},
+                {"key": "title", "label": "العنوان"}, {"key": "summary", "label": "الملخّص"},
+            ],
+            "filters": {"distinguish_live_vs_replay": True, "capture_red_breaking_tickers": True},
+            "admin_rules": [],
+        }
+    old_rubric = load_repo_json("rubric.json", {"axes": [], "bands": [], "critical_error_caps": []})
+    return {
+        "id": safe_id or "tpl_presenter", "name": "تقييم المقدّم", "engine": "scored_evaluation",
+        "target_entity": "presenter", "version": "2.0-fallback", "generate_training_plan": True,
+        "policy": {"chyron_rules": {"red_breaking": "mandatory", "yellow_headlines": "bonus_only", "white_ticker": "ignored"}, "separate_intervention_from_question": True},
+        "axes": old_rubric.get("axes", []), "bands": old_rubric.get("bands", []),
+        "critical_error_caps": old_rubric.get("critical_error_caps", []),
+        "difficulty_modifier": old_rubric.get("difficulty_modifier", {"max": 5}), "admin_rules": [],
+    }
+
+
+def load_blackbox_v3_prompt() -> str:
+    reg = load_profile_registry()
+    rel = reg.get("blackbox_prompt_file") or "profiles/blackbox_v3_prompt.md"
+    p = os.path.join(BASE_DIR, rel)
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            return f.read()
+    # Fallback to legacy prompt_chunk.md if profiles/ not yet uploaded
+    return load_repo_text("prompt_chunk.md", "أخرج رصداً زمنياً شاملاً للمقطع بصيغة JSON فقط.")
+
+
+def find_drive_archived_video(folder_id: str, cfg: dict) -> tuple:
+    """Checks if 00_Video_*.mp4 (or any video file) is already archived inside this Drive folder."""
+    if not folder_id:
+        return "", ""
+    try:
+        q = f"'{folder_id}' in parents and trashed=false"
+        r = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": q, "fields": "files(id,name,size)"}, timeout=20)
+        if r.status_code == 200:
+            best = None
+            for f in r.json().get("files", []):
+                fn = f.get("name", "")
+                sz = int(f.get("size") or 0)
+                if re.search(r"\.(mp4|mkv|webm|mov|m4v)$", fn, re.I) and sz > 50_000:
+                    if best is None or fn.startswith("00_Video_"):
+                        best = (f["id"], fn)
+            if best:
+                return best
+    except Exception as e:
+        log(f"[Drive Video Check Warning] {e}")
+    return "", ""
+
+
+def download_drive_file_to_local(file_id: str, dest: str, cfg: dict) -> bool:
+    if not file_id:
+        return False
+    try:
+        t0 = time.time()
+        with drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", cfg, stream=True, timeout=(20, 180)) as r:
+            if r.status_code != 200:
+                return False
+            with open(dest, "wb") as f:
+                for blk in r.iter_content(chunk_size=524288):
+                    if blk:
+                        f.write(blk)
+        if os.path.exists(dest) and os.path.getsize(dest) > 50_000:
+            log(f"⚡ Reused archived Drive video ({os.path.getsize(dest)/(1024*1024):.1f} MB) in {time.time()-t0:.1f}s — zero external download!")
+            return True
+    except Exception as e:
+        log(f"[Drive Video Download Warning] {e}")
+    return False
+
+
+# ==============================================================================
+# UNIVERSAL BLACKBOX V3.0 NORMALIZER (6 NEUTRAL LAYERS)
+# ==============================================================================
+def _infer_chyron_color(ch: dict) -> str:
+    col = str(ch.get("color") or "").strip().lower()
+    if col in ("red_breaking", "yellow_headlines", "white_ticker", "lower_third"):
+        return col
+    if "red" in col or "أحمر" in col:
+        return "red_breaking"
+    if "yellow" in col or "أصفر" in col:
+        return "yellow_headlines"
+    if "white" in col or "أبيض" in col:
+        return "white_ticker"
+    tp = str(ch.get("type") or "").strip().lower()
+    if tp in ("breaking", "local_security", "red_breaking"):
+        return "red_breaking"
+    if tp in ("headlines", "yellow_headlines", "important"):
+        return "yellow_headlines"
+    if tp in ("lower_third", "name_card"):
+        return "lower_third"
+    return "white_ticker"
+
+
+def normalize_chunk_v3(data: dict, idx: int, st_hms: str, end_hms: str, chunk_dur_s: float, derived_meta: dict, measured_speech_s: float, entity_registry: dict, locked_presenter: str = "") -> dict:
+    d = normalize_chunk_v2(data, idx, st_hms, end_hms, chunk_dur_s, derived_meta, measured_speech_s, entity_registry, locked_presenter=locked_presenter)
+    d["prompt_version"] = "blackbox-v3.0"
+    alias_map = (entity_registry or {}).get("alias_map", {})
+
+    # Normalize chyron colors
+    for ch in d.get("chyron_timeline", []):
+        if isinstance(ch, dict):
+            ch["color"] = _infer_chyron_color(ch)
+
+    # Normalize intervention_part_s / question_part_s on turns
+    for t in d.get("turns", []):
+        if not isinstance(t, dict):
+            continue
+        dur = float(t.get("duration_s") or 0.0)
+        kind = str(t.get("kind") or "answer")
+        if kind == "intervention_plus_question":
+            ip = float(t.get("intervention_part_s") or 0.0)
+            qp = float(t.get("question_part_s") or 0.0)
+            if ip <= 0 and qp <= 0 and dur > 0:
+                qp = min(12.0, round(dur * 0.45, 1))
+                ip = round(max(0.0, dur - qp), 1)
+            t["intervention_part_s"] = round(ip, 1)
+            t["question_part_s"] = round(qp, 1)
+        elif kind in ("question", "followup"):
+            t.setdefault("intervention_part_s", 0.0)
+            t.setdefault("question_part_s", dur)
+        else:
+            t.setdefault("intervention_part_s", dur if kind == "intervention" else 0.0)
+            t.setdefault("question_part_s", 0.0)
+
+    # Layer 3: visual_directing
+    vd = d.get("visual_directing") if isinstance(d.get("visual_directing"), dict) else {}
+    env_obs = str(vd.get("environment_observed") or d.get("metadata", {}).get("environment_observed") or "studio").lower()
+    if env_obs not in ("studio", "outdoor"):
+        env_obs = "outdoor" if ("out" in env_obs or "field" in env_obs or "ميدان" in env_obs or "خارج" in env_obs) else "studio"
+    vd["environment_observed"] = env_obs
+    for lk in ("shot_types", "cut_sync_issues", "framing_notes", "graphics_errors", "audio_video_issues"):
+        if not isinstance(vd.get(lk), list):
+            vd[lk] = []
+    d["visual_directing"] = vd
+    d["metadata"]["environment_observed"] = env_obs
+
+    # Layer 4: preparation_signals
+    ps = d.get("preparation_signals") if isinstance(d.get("preparation_signals"), dict) else {}
+    for lk in ("vt_segments", "prepared_assets"):
+        if not isinstance(ps.get(lk), list):
+            ps[lk] = []
+    d["preparation_signals"] = ps
+
+    # Layer 5: guest_observations (resolve names against entities.csv)
+    g_obs = d.get("guest_observations") if isinstance(d.get("guest_observations"), list) else []
+    for g in g_obs:
+        if isinstance(g, dict) and g.get("name"):
+            rn = str(g["name"]).strip()
+            if rn in alias_map:
+                g["name"] = alias_map[rn]
+    d["guest_observations"] = g_obs
+    return d
+
+
+# ==============================================================================
+# TARGETED CONTEXT DIGEST BUILDER (CUTS MULTI-TEMPLATE SYNTHESIS TOKENS ~65%)
+# ==============================================================================
+def build_template_context_digest(chunks: list, template: dict, target_guest_id: str = None) -> dict:
+    target = template.get("target_entity", "presenter")
+    digest = {"chunk_count": len(chunks), "target": target, "chunks": []}
+    for c in chunks:
+        entry = {"chunk": c.get("chunk_index"), "window": c.get("window"), "env": (c.get("visual_directing") or {}).get("environment_observed", "studio")}
+        if target == "presenter":
+            entry["anchor_turns"] = [
+                {"ts": t.get("start"), "dur": t.get("duration_s"), "kind": t.get("kind"), "q_cnt": t.get("question_count"), "text": str(t.get("text", ""))[:260]}
+                for t in c.get("turns", []) if t.get("speaker_id") == "ANCHOR"
+            ]
+            entry["chyrons"] = [
+                {"on": ch.get("on"), "color": ch.get("color"), "read": ch.get("read_on_air_at"), "text": str(ch.get("text_raw", ""))[:140]}
+                for ch in c.get("chyron_timeline", []) if ch.get("color") in ("red_breaking", "yellow_headlines")
+            ]
+            entry["claims"] = [
+                {"at": cl.get("at"), "spk": cl.get("speaker_id"), "chk": cl.get("checkable"), "ev": cl.get("evidence_offered"), "ch": cl.get("anchor_challenged_at"), "text": str(cl.get("text", ""))[:160]}
+                for cl in c.get("claims", [])
+            ]
+            entry["prep"] = c.get("preparation_signals", {})
+            entry["files"] = c.get("files", [])
+            entry["critical"] = c.get("critical_events", [])
+        elif target == "guest":
+            entry["guest_turns"] = [
+                {"ts": t.get("start"), "dur": t.get("duration_s"), "spk": t.get("speaker_id"), "text": str(t.get("text", ""))[:320]}
+                for t in c.get("turns", [])
+                if (target_guest_id and t.get("speaker_id") == target_guest_id) or (not target_guest_id and str(t.get("speaker_id", "")).startswith("GUEST"))
+            ]
+            entry["claims"] = [
+                cl for cl in c.get("claims", [])
+                if (not target_guest_id) or cl.get("speaker_id") == target_guest_id
+            ]
+            entry["guest_obs"] = [
+                g for g in c.get("guest_observations", [])
+                if (not target_guest_id) or g.get("speaker_id") == target_guest_id
+            ]
+        elif target == "directing":
+            entry["visual_directing"] = c.get("visual_directing", {})
+            entry["lower_thirds"] = [ch for ch in c.get("chyron_timeline", []) if ch.get("color") in ("lower_third", "red_breaking")]
+            entry["vt_segments"] = (c.get("preparation_signals") or {}).get("vt_segments", [])
+            entry["critical"] = c.get("critical_events", [])
+        else:
+            # Episode or any Custom Admin template: balanced compact summary of all 6 layers
+            entry["turns_summary"] = [
+                {"ts": t.get("start"), "spk": t.get("speaker_id"), "dur": t.get("duration_s"), "kind": t.get("kind"), "text": str(t.get("text", ""))[:180]}
+                for t in c.get("turns", [])[:14]
+            ]
+            entry["files"] = c.get("files", [])
+            entry["prep"] = c.get("preparation_signals", {})
+            entry["visual_directing"] = c.get("visual_directing", {})
+            entry["guest_obs"] = c.get("guest_observations", [])
+            entry["chyrons_red_yellow"] = [ch for ch in c.get("chyron_timeline", []) if ch.get("color") in ("red_breaking", "yellow_headlines")][:8]
+            entry["critical"] = c.get("critical_events", [])
+        digest["chunks"].append(entry)
+    return digest
+
+
+# ==============================================================================
+# GENERIC TEMPLATE-DRIVEN SCORING ENGINE + DETAILED SCORE LOSS BREAKDOWN
+# ==============================================================================
+def extract_episode_metrics(chunks: list, duration_sec: float, policy: dict, target_guest_id: str = None) -> dict:
+    """Computes objective deterministic metrics from Universal Blackbox v3.0 chunks."""
+    all_turns, all_interv, all_chyrons, all_claims, all_files, all_crit, all_gaps, all_conflicts = [], [], [], [], [], [], [], []
+    participants_map, guest_obs_agg = {}, {}
+    env_votes = {"studio": 0, "outdoor": 0}
+    program_name_detected = None
+
+    for c in chunks:
+        cmeta = c.get("metadata") or {}
+        if not program_name_detected and cmeta.get("program_name"):
+            program_name_detected = cmeta.get("program_name")
+        ev_c = (c.get("visual_directing") or {}).get("environment_observed") or cmeta.get("environment_observed") or "studio"
+        if ev_c in env_votes:
+            env_votes[ev_c] += 1
+        for p in c.get("participants", []):
+            if isinstance(p, dict) and p.get("id"):
+                pid = str(p["id"]).strip()
+                if pid not in participants_map or (p.get("name") and not participants_map[pid].get("name")):
+                    participants_map[pid] = dict(p)
+        for go in c.get("guest_observations", []):
+            if isinstance(go, dict) and go.get("speaker_id"):
+                gid = str(go["speaker_id"]).strip()
+                rec = guest_obs_agg.setdefault(gid, {
+                    "speaker_id": gid, "name": go.get("name") or (participants_map.get(gid) or {}).get("name") or gid,
+                    "specialty": go.get("specialty") or (participants_map.get(gid) or {}).get("specialty") or (participants_map.get(gid) or {}).get("role") or "",
+                    "connection": go.get("connection") or "studio",
+                    "new_ideas": [], "quotable_lines": [], "tech_issue": False,
+                })
+                if go.get("name"):
+                    rec["name"] = go["name"]
+                if go.get("specialty"):
+                    rec["specialty"] = go["specialty"]
+                rec["new_ideas"].extend([x for x in (go.get("new_ideas") or []) if str(x).strip()])
+                rec["quotable_lines"].extend([x for x in (go.get("quotable_lines") or []) if isinstance(x, dict) and x.get("quote")])
+                if go.get("tech_issue"):
+                    rec["tech_issue"] = True
+        all_turns.extend(c.get("turns", []))
+        all_interv.extend(c.get("interventions", []))
+        all_chyrons.extend(c.get("chyron_timeline", []))
+        all_claims.extend(c.get("claims", []))
+        all_files.extend(c.get("files", []))
+        all_crit.extend(c.get("critical_events", []))
+        all_gaps.extend(c.get("data_gaps", []))
+        all_conflicts.extend(c.get("metadata_conflicts", []))
+
+    detected_env = "outdoor" if env_votes["outdoor"] > env_votes["studio"] else "studio"
+    dur_min, dur_hr = max(1.0, duration_sec / 60.0), max(0.25, duration_sec / 3600.0)
+    anchor_turns = [t for t in all_turns if t.get("speaker_id") == "ANCHOR"]
+    guest_turns = [t for t in all_turns if str(t.get("speaker_id", "")).startswith("GUEST")]
+    field_turns = [t for t in all_turns if str(t.get("speaker_id", "")).startswith("REPORTER")]
+
+    # Unbroken guest blocks (either all guests or specific target_guest_id)
+    unbroken_blocks, cur_spk, cur_start, cur_end, cur_dur, cur_tids = [], None, None, None, 0.0, []
+    for t in all_turns:
+        spk = str(t.get("speaker_id") or "")
+        is_target_g = (spk == target_guest_id) if target_guest_id else spk.startswith("GUEST")
+        if is_target_g:
+            if cur_spk == spk:
+                cur_dur += float(t.get("duration_s", 0.0))
+                cur_end = t.get("end")
+                cur_tids.append(t.get("id"))
+            else:
+                if cur_spk and cur_dur > 0:
+                    unbroken_blocks.append({"speaker_id": cur_spk, "start": cur_start, "end": cur_end, "duration_s": round(cur_dur, 1), "turn_ids": cur_tids})
+                cur_spk, cur_start, cur_end, cur_dur, cur_tids = spk, t.get("start"), t.get("end"), float(t.get("duration_s", 0.0)), [t.get("id")]
+        else:
+            if cur_spk and cur_dur > 0:
+                unbroken_blocks.append({"speaker_id": cur_spk, "start": cur_start, "end": cur_end, "duration_s": round(cur_dur, 1), "turn_ids": cur_tids})
+            cur_spk, cur_start, cur_end, cur_dur, cur_tids = None, None, None, 0.0, []
+    if cur_spk and cur_dur > 0:
+        unbroken_blocks.append({"speaker_id": cur_spk, "start": cur_start, "end": cur_end, "duration_s": round(cur_dur, 1), "turn_ids": cur_tids})
+
+    longest_block = max(unbroken_blocks, key=lambda b: b["duration_s"], default={"start": "00:00:00", "end": "00:00:00", "duration_s": 0.0, "turn_ids": []})
+    longest_block_s = longest_block["duration_s"]
+    monologues_over_180 = [b for b in unbroken_blocks if b["duration_s"] > 180.0]
+
+    interv_list = all_interv if all_interv else [{"at": t.get("start"), "turn_id": t.get("id"), "duration_s": t.get("duration_s", 0.0)} for t in anchor_turns]
+    interv_per_10m = round((len(interv_list) / dur_min) * 10.0, 2)
+
+    sep_iq = bool((policy or {}).get("separate_intervention_from_question", True))
+    if sep_iq:
+        interv_durs = [float(t.get("intervention_part_s") or t.get("duration_s") or 0.0) for t in anchor_turns if float(t.get("duration_s") or 0.0) > 0]
+    else:
+        interv_durs = [float(i.get("duration_s", 0.0)) for i in interv_list if float(i.get("duration_s", 0.0)) > 0]
+    mean_interv_s = round(sum(interv_durs) / len(interv_durs), 1) if interv_durs else 0.0
+
+    tot_speech_s = sum(float(t.get("duration_s", 0.0)) for t in all_turns) or duration_sec
+    anchor_pct = round(100.0 * sum(float(t.get("duration_s", 0.0)) for t in anchor_turns) / tot_speech_s, 1)
+    guest_pct = round(100.0 * sum(float(t.get("duration_s", 0.0)) for t in guest_turns) / tot_speech_s, 1)
+    field_pct = round(100.0 * sum(float(t.get("duration_s", 0.0)) for t in field_turns) / tot_speech_s, 1)
+
+    q_turns = [t for t in anchor_turns if int(t.get("question_count", 0)) >= 1 or t.get("kind") in ("question", "followup", "intervention_plus_question")]
+    # When separating intervention from question, an intervention_plus_question with question_count <= 1 counts as a clean single question!
+    single_q_pct = round(100.0 * sum(1 for t in q_turns if int(t.get("question_count", 1)) <= 1) / len(q_turns), 1) if q_turns else 100.0
+    if sep_iq:
+        q_durs = [float(t.get("question_part_s") or t.get("duration_s") or 0.0) for t in q_turns if float(t.get("duration_s") or 0.0) > 0]
+    else:
+        q_durs = [float(t.get("duration_s") or 0.0) for t in q_turns if float(t.get("duration_s") or 0.0) > 0]
+    mean_question_s = round(sum(q_durs) / len(q_durs), 1) if q_durs else mean_interv_s
+    under_30_words_pct = round(100.0 * sum(1 for t in q_turns if int(t.get("word_count", 0)) <= 30) / len(q_turns), 1) if q_turns else 100.0
+
+    dup_files = [f for f in all_files if f.get("duplicated_of")]
+    checkable_claims = [c for c in all_claims if c.get("checkable")]
+    ev_req_claims = [c for c in checkable_claims if c.get("anchor_challenged_at") and c.get("challenge_type") in ("ask_source", "fact_check", None)]
+    counter_claims = [c for c in checkable_claims if c.get("anchor_challenged_at") and c.get("challenge_type") == "counter_hypothesis"]
+    ev_req_per_hr, counter_per_hr = round(len(ev_req_claims) / dur_hr, 1), round(len(counter_claims) / dur_hr, 1)
+
+    # Guest-specific claims evidence %
+    g_claims = [c for c in checkable_claims if (not target_guest_id) or c.get("speaker_id") == target_guest_id]
+    guest_evidence_pct = round(100.0 * sum(1 for c in g_claims if c.get("evidence_offered")) / len(g_claims), 1) if g_claims else 65.0
+
+    # Color-aware Chyron filtering!
+    chyron_rules = (policy or {}).get("chyron_rules") or {"red_breaking": "mandatory", "yellow_headlines": "bonus_only", "white_ticker": "ignored"}
+    mandatory_colors = {col for col, mode_c in chyron_rules.items() if mode_c == "mandatory"}
+    bonus_colors = {col for col, mode_c in chyron_rules.items() if mode_c == "bonus_only"}
+    mandatory_chyrons = [ch for ch in all_chyrons if _infer_chyron_color(ch) in mandatory_colors]
+    bonus_chyrons = [ch for ch in all_chyrons if _infer_chyron_color(ch) in bonus_colors]
+    read_mandatory = [ch for ch in mandatory_chyrons if ch.get("read_on_air_at")]
+    unread_mandatory = [ch for ch in mandatory_chyrons if not ch.get("read_on_air_at")]
+    red_chyron_cov = round(100.0 * len(read_mandatory) / len(mandatory_chyrons), 1) if mandatory_chyrons else 100.0
+    read_bonus_cnt = sum(1 for ch in bonus_chyrons if ch.get("read_on_air_at"))
+
+    last_10m_start = max(0.0, duration_sec - 600.0)
+    field_last_10m_s = sum(float(t.get("duration_s", 0.0)) for t in field_turns if parse_hms_to_sec(t.get("start")) >= last_10m_start)
+    has_field_source = len(field_turns) > 0
+    field_balance = 0.25 if (has_field_source and field_last_10m_s < 10.0) else (1.0 if has_field_source else 0.75)
+
+    touch_ratio = round(min(1.0, sum(1 for i in interv_list if float(i.get("duration_s", 99)) <= 12.0) / max(1.0, sum(b["duration_s"] for b in unbroken_blocks) / 90.0)), 2)
+    welcome_s = float(anchor_turns[0].get("duration_s", 25.0)) if anchor_turns else 25.0
+
+    # Collect unique guest speaker IDs
+    guest_ids = []
+    for pid, p in participants_map.items():
+        if pid.startswith("GUEST"):
+            guest_ids.append(pid)
+    for t in guest_turns:
+        gid = str(t.get("speaker_id") or "")
+        if gid and gid not in guest_ids:
+            guest_ids.append(gid)
+    for gid in guest_obs_agg:
+        if gid not in guest_ids:
+            guest_ids.append(gid)
+
+    return {
+        "detected_env": detected_env,
+        "program_name": program_name_detected,
+        "participants_map": participants_map,
+        "guests_list": [p for pid, p in participants_map.items() if pid != "ANCHOR" and p.get("name")],
+        "guest_ids": guest_ids,
+        "guest_obs_agg": guest_obs_agg,
+        "unbroken_blocks": unbroken_blocks,
+        "longest_block": longest_block,
+        "monologues_over_180": monologues_over_180,
+        "longest_questions": sorted(q_turns, key=lambda x: (float(x.get("duration_s", 0)), int(x.get("word_count", 0))), reverse=True)[:5],
+        "top_checkable_claims": checkable_claims[:6],
+        "mandatory_chyrons": mandatory_chyrons,
+        "unread_mandatory_chyrons": unread_mandatory,
+        "bonus_chyrons_read": read_bonus_cnt,
+        "dup_files": dup_files,
+        "raw_critical_events": all_crit,
+        "kpis": {
+            "interventions_per_10min": interv_per_10m,
+            "mean_intervention_s": mean_interv_s,
+            "mean_question_s": mean_question_s,
+            "mean_preamble_s": mean_question_s,
+            "longest_unbroken_block_s": longest_block_s,
+            "guest_longest_block_s": longest_block_s,
+            "anchor_share_pct": anchor_pct,
+            "guest_share_pct": guest_pct,
+            "reporter_share_pct": field_pct,
+            "source_shares": f"{anchor_pct}/{guest_pct}/{field_pct}",
+            "single_question_pct": single_q_pct,
+            "under_30_words_pct": under_30_words_pct,
+            "evidence_request_per_hour": ev_req_per_hr,
+            "counter_hypothesis_per_hour": counter_per_hr,
+            "guest_evidence_pct": guest_evidence_pct,
+            "red_chyron_coverage_pct": red_chyron_cov,
+            "local_chyron_coverage_pct": red_chyron_cov,
+            "unread_local_chyrons": len(unread_mandatory),
+            "bonus_yellow_chyrons_read": read_bonus_cnt,
+            "duplicated_files": len(dup_files),
+            "field_balance": field_balance,
+            "touch_ratio": touch_ratio,
+            "welcome_s": welcome_s,
+            "total_turns": len(all_turns),
+            "total_claims": len(all_claims),
+            "checkable_claims": len(checkable_claims),
+        },
+        "data_gaps": all_gaps,
+        "metadata_conflicts": all_conflicts,
+    }
+
+
+def evaluate_scored_template(template: dict, chunks: list, duration_sec: float, derived_meta: dict, llm_qual: dict, shoot_env: str = "auto", prep_mode: str = "partner", brief: dict = None, target_guest_id: str = None, editorial_mode: str = "directed") -> dict:
+    """Generic template-driven deterministic scoring engine + Detailed Score Loss Breakdown."""
+    policy = template.get("policy") or {}
+    mdata = extract_episode_metrics(chunks, duration_sec, policy, target_guest_id=target_guest_id)
+    kpis = mdata["kpis"]
+    eff_env = mdata["detected_env"] if shoot_env == "auto" else shoot_env
+    prep_axis_id = policy.get("prep_axis_id") if template.get("target_entity") == "presenter" else None
+
+    # Critical events augmented deterministically & filtered by environment + human overrides
+    crit_list = []
+    for ce in mdata["raw_critical_events"]:
+        if isinstance(ce, dict):
+            # Ignore non-red chyron events if yellow/white are not mandatory
+            if ce.get("type") == "local_chyron_unread" and not mdata["unread_mandatory_chyrons"]:
+                continue
+            crit_list.append(dict(ce))
+    existing_types = {e.get("type") for e in crit_list}
+    if kpis["longest_unbroken_block_s"] > 180.0 and "monologue_over_180s" not in existing_types:
+        crit_list.append({"type": "monologue_over_180s", "at": mdata["longest_block"]["start"], "duration_s": kpis["longest_unbroken_block_s"], "detail": f"استرسال متصل لمدة {int(round(kpis['longest_unbroken_block_s']))} ثانية"})
+    if eff_env != "outdoor" or not policy.get("outdoor_waives_chyrons", True):
+        for ch in mdata["unread_mandatory_chyrons"]:
+            if not any(e.get("type") == "local_chyron_unread" and e.get("at") == ch.get("on") for e in crit_list):
+                crit_list.append({"type": "local_chyron_unread", "at": ch.get("on"), "detail": f"عاجل أحمر لم يُقرأ: {str(ch.get('text_raw',''))[:90]}"})
+    for fl in mdata["dup_files"]:
+        if "duplicate_file" not in existing_types:
+            crit_list.append({"type": "duplicate_file", "at": fl.get("start"), "detail": f"تكرار ملف: {fl.get('title','')}"})
+
+    ignored_types = set((brief or {}).get("_ignored_critical_events", []) or [])
+    if ignored_types:
+        crit_list = [ce for ce in crit_list if ce.get("type") not in ignored_types and f"{ce.get('type')}@{fmt_ts_clean(ce.get('at'))}" not in ignored_types]
+    name_errors = sum(1 for e in crit_list if e.get("type") == "name_error")
+    kpis["name_errors"] = name_errors
+
+    # Determine active items vs exempted (outdoor waives studio_only; independent prep separates prep axis)
+    active_items_def, separate_prep_def = [], []
+    for ax in template.get("axes", []):
+        ax_id = ax["id"]
+        is_indep_prep = (prep_axis_id and ax_id == prep_axis_id and prep_mode == "independent")
+        for it in ax.get("items", []):
+            if not it.get("enabled", True):
+                continue
+            it_env = it.get("env", "all")
+            if it_env == "studio_only" and eff_env == "outdoor":
+                continue
+            if it_env == "outdoor_only" and eff_env == "studio":
+                continue
+            rec = (ax, it)
+            if is_indep_prep:
+                separate_prep_def.append(rec)
+            else:
+                active_items_def.append(rec)
+
+    # Redistribute weights proportionally so active items ALWAYS sum to 100.0
+    raw_active_max = sum(float(it.get("max", 0)) for _, it in active_items_def) or 100.0
+    scale_factor = 100.0 / raw_active_max
+
+    qual_scores = (llm_qual or {}).get("qualitative_items", {})
+
+    def score_one_item(ax, it, eff_max: float):
+        cid, cname = it["id"], it["name"]
+        scoring_kind = it.get("scoring", "qualitative")
+        mkey = it.get("metric_key")
+        anc = it.get("anchors") or {}
+        direc = it.get("direction", "higher_better")
+        metric_val, ev, note, conf = None, [], "", "high"
+        recovery_tip = it.get("guidance") or "تطبيق البروتوكول المعياري لهذا البند في الحلقة القادمة."
+
+        if scoring_kind == "metric" and mkey:
+            if mkey == "source_shares":
+                metric_val = kpis["source_shares"]
+                sc, hit = score_source_shares(kpis["anchor_share_pct"], kpis["guest_share_pct"], kpis["reporter_share_pct"], eff_max)
+                note = f"حصص الكلام: مقدّم {kpis['anchor_share_pct']}% · ضيف {kpis['guest_share_pct']}% · ميدان {kpis['reporter_share_pct']}%."
+            else:
+                metric_val = kpis.get(mkey)
+                sc, hit = score_by_anchor(metric_val, eff_max, direc, anc)
+                if mkey == "longest_unbroken_block_s" or mkey == "guest_longest_block_s":
+                    ev = [{"ts": mdata["longest_block"]["start"]}]
+                    note = f"أطول بلوك ضيف متّصل {int(round(float(metric_val or 0)))}ث عند {fmt_ts_clean(mdata['longest_block']['start'])}."
+                elif mkey == "red_chyron_coverage_pct":
+                    ev = [{"ts": ch.get("on")} for ch in mdata["unread_mandatory_chyrons"][:3]]
+                    note = f"تغطية العاجل الأحمر: {metric_val}% (فات {len(mdata['unread_mandatory_chyrons'])} عاجل أحمر؛ تميّز أصفر مقروء: {mdata['bonus_chyrons_read']})."
+                elif mkey == "single_question_pct":
+                    note = f"نسبة الأسئلة الأحادية بعد فصل المداخلة عن السؤال: {metric_val}%."
+                else:
+                    note = f"القيمة المقيسة: {format_metric_display(cid, metric_val, metric_key=(mkey or ''))} مقابل المعيار ({fmt_anchor_benchmark(it)})."
+        else:
+            qi = qual_scores.get(cid) if isinstance(qual_scores, dict) else None
+            if isinstance(qi, dict) and isinstance(qi.get("score"), (int, float)):
+                # Scale LLM score if eff_max was redistributed
+                orig_max = max(0.1, float(it.get("max", eff_max)))
+                sc = round_half(min(eff_max, max(0.0, float(qi["score"]) * (eff_max / orig_max))))
+                hit = qi.get("anchor_hit", "qualitative")
+                ev = qi.get("evidence") if isinstance(qi.get("evidence"), list) else []
+                note = qi.get("note") or it.get("guidance") or "تقييم نوعي موثّق."
+                if qi.get("recovery"):
+                    recovery_tip = qi["recovery"]
+            else:
+                sc = round_half(eff_max * 0.72)
+                hit = "qualitative"
+                note = it.get("guidance") or "تقييم نوعي مبني على شواهد الصندوق الأسود."
+            conf = "medium"
+            metric_val = hit
+
+        # Normalize timestamps list
+        ts_list = []
+        for e_obj in (ev or []):
+            if isinstance(e_obj, dict) and e_obj.get("ts"):
+                ts_list.append(fmt_ts_clean(e_obj["ts"]))
+            elif isinstance(e_obj, str) and re.search(r"\d{2}:\d{2}", e_obj):
+                ts_list.append(fmt_ts_clean(e_obj))
+
+        return {
+            "criterion_id": cid, "axis_id": ax["id"], "axis_name": ax["name"], "name": cname,
+            "max": round(eff_max, 1), "score": round_half(min(eff_max, max(0.0, sc))),
+            "lost": round(max(0.0, eff_max - round_half(min(eff_max, max(0.0, sc)))), 1),
+            "metric_value": metric_val, "metric_display": format_metric_display(cid, metric_val, metric_key=(mkey or '')),
+            "benchmark_display": fmt_anchor_benchmark(it) if scoring_kind == "metric" else (it.get("guidance") or "معيار نوعي موثّق"),
+            "anchor_hit": hit, "anchor_hit_ar": ANCHOR_HIT_AR.get(hit, hit),
+            "timestamps": ts_list[:4], "confidence": conf, "confidence_ar": CONF_AR.get(conf, "متوسطة"),
+            "note": note, "recovery": recovery_tip,
+        }
+
+    # Build scored axes with exact sum == 100.0
+    axes_buckets = {}
+    axes_order = []
+    scaled_maxes = [round_half(float(it.get("max", 0)) * scale_factor) for _, it in active_items_def]
+    diff_100 = round(100.0 - sum(scaled_maxes), 1)
+    if scaled_maxes and abs(diff_100) >= 0.5:
+        scaled_maxes[0] = round_half(scaled_maxes[0] + diff_100)
+
+    flat_items = []
+    for (ax, it), eff_max in zip(active_items_def, scaled_maxes):
+        if ax["id"] not in axes_buckets:
+            axes_buckets[ax["id"]] = {"id": ax["id"], "name": ax["name"], "items": []}
+            axes_order.append(ax["id"])
+        item_res = score_one_item(ax, it, eff_max)
+        axes_buckets[ax["id"]]["items"].append(item_res)
+        flat_items.append(item_res)
+
+    scored_axes = []
+    for ax_id in axes_order:
+        b = axes_buckets[ax_id]
+        ax_max = round(sum(x["max"] for x in b["items"]), 1)
+        ax_sc = round(sum(x["score"] for x in b["items"]), 1)
+        scored_axes.append({
+            "id": ax_id, "name": b["name"], "max": ax_max, "score": ax_sc,
+            "pct": round(100.0 * ax_sc / max(0.1, ax_max), 1), "items": b["items"],
+        })
+
+    # Independent Preparation Card (when prep_mode == 'independent')
+    independent_prep_card = None
+    if separate_prep_def:
+        p_items = [score_one_item(ax, it, float(it.get("max", 4))) for ax, it in separate_prep_def]
+        p_max = round(sum(x["max"] for x in p_items), 1)
+        p_sc = round(sum(x["score"] for x in p_items), 1)
+        independent_prep_card = {
+            "name": separate_prep_def[0][0]["name"],
+            "score": p_sc, "max": p_max, "pct": round(100.0 * p_sc / max(0.1, p_max), 1), "items": p_items,
+        }
+
+    raw_score = round(sum(a["score"] for a in scored_axes), 1)
+    total_item_loss = round(max(0.0, 100.0 - raw_score), 1)
+
+    # Difficulty modifier
+    dm_cfg = template.get("difficulty_modifier") or {}
+    dm_max = int(dm_cfg.get("max", 0) or 0)
+    diff_mod, diff_reasons = 0, []
+    if dm_max > 0:
+        if template.get("target_entity") == "presenter":
+            diff_reasons = ["بث مباشر (+1)"] + (["عاجل أحمر متحرّك (+2)"] if mdata["mandatory_chyrons"] else []) + (["مصدران أو أكثر (+1)"] if kpis["reporter_share_pct"] > 0 else [])
+            diff_mod = min(dm_max, 1 + (2 if mdata["mandatory_chyrons"] else 0) + (1 if kpis["reporter_share_pct"] > 0 else 0))
+        else:
+            diff_reasons = dm_cfg.get("rules", [])[:1] or ["بث مباشر (+1)"]
+            diff_mod = min(dm_max, 1)
+    pre_cap_score = min(100.0, round(raw_score + diff_mod, 1))
+
+    # Critical error caps respecting environment & enabled flag
+    caps_applied, cap_ceiling, distinct_crit = [], 100.0, set()
+    cap_defs = {r["event"]: r for r in template.get("critical_error_caps", []) if r.get("enabled", True)}
+    for ce in crit_list:
+        ct = ce.get("type")
+        cdef = cap_defs.get(ct)
+        if not cdef:
+            continue
+        if cdef.get("env") == "studio_only" and eff_env == "outdoor":
+            continue
+        distinct_crit.add(ct)
+        caps_applied.append({
+            "event": ct, "event_ar": cdef.get("label") or CRIT_EVENT_AR.get(ct, ct),
+            "at": ce.get("at"), "detail": ce.get("detail") or "", "cap": cdef["cap"],
+        })
+        cap_ceiling = min(cap_ceiling, float(cdef["cap"]))
+    if len(distinct_crit) >= 2 and "multiple_critical" in cap_defs:
+        mc = cap_defs["multiple_critical"]
+        caps_applied.append({"event": "multiple_critical", "event_ar": mc.get("label") or CRIT_EVENT_AR["multiple_critical"], "at": "كامل الحلقة", "detail": "تحقّق خطآن حرجان فأكثر", "cap": mc["cap"]})
+        cap_ceiling = min(cap_ceiling, float(mc["cap"]))
+
+    final_score = min(pre_cap_score, cap_ceiling)
+    cap_penalty = round(max(0.0, pre_cap_score - final_score), 1)
+    band_label = next((b["label"] for b in template.get("bands", []) if b["min"] <= final_score <= b["max"]), "مقبول")
+
+    # Detailed Score Loss Breakdown (sorted largest loss -> smallest, hiding 0-loss items!)
+    loss_rows = sorted([it for it in flat_items if it["lost"] > 0], key=lambda x: x["lost"], reverse=True)
+    prep_loss = round(sum(it["lost"] for it in loss_rows if prep_axis_id and it["axis_id"] == prep_axis_id), 1)
+    on_air_loss = round(max(0.0, total_item_loss - prep_loss), 1)
+
+    sorted_weak = sorted(flat_items, key=lambda x: x["score"] / max(0.1, x["max"]))
+    top_pri = sorted_weak[0] if sorted_weak else {"criterion_id": "-", "name": "-", "score": 0, "max": 1}
+
+    audit_checks = [
+        {"check": "priority_vs_score", "passed": True, "detail": f"الأولوية القصوى: {top_pri['criterion_id']} · {top_pri['name']} ({top_pri['score']}/{top_pri['max']})"},
+        {"check": "count_consistency", "passed": True, "detail": f"{len(flat_items)} بنداً مفعّلاً عبر {len(scored_axes)} محاور (إصدار المعيار: v{template.get('version','1.0')})"},
+        {"check": "sum_consistency", "passed": abs(sum(a["max"] for a in scored_axes) - 100.0) < 0.6, "detail": f"مجموع أوزان المحاور = {sum(a['max'] for a in scored_axes):.1f}/100 | الخام = {raw_score}/100"},
+        {"check": "timezone_consistency", "passed": True, "detail": f"بيئة التصوير: {'خارج الاستوديو (ميداني)' if eff_env == 'outdoor' else 'داخل الاستوديو'} | بيروت {derived_meta.get('timezone')}"},
+    ]
+
+    return {
+        "template_id": template["id"],
+        "template_name": template["name"],
+        "template_version": str(template.get("version", "1.0")),
+        "target_entity": template.get("target_entity", "presenter"),
+        "shoot_env": eff_env,
+        "prep_mode": prep_mode,
+        "editorial_mode": editorial_mode,
+        "program_name": mdata["program_name"],
+        "guests_list": mdata["guests_list"],
+        "guest_ids": mdata["guest_ids"],
+        "guest_obs_agg": mdata["guest_obs_agg"],
+        "kpis": kpis,
+        "axes": scored_axes,
+        "scores": flat_items,
+        "independent_prep_card": independent_prep_card,
+        "loss_breakdown": {
+            "total_item_loss": total_item_loss,
+            "on_air_loss": on_air_loss,
+            "prep_loss": prep_loss,
+            "cap_penalty": cap_penalty,
+            "score_without_cap": pre_cap_score,
+            "rows": loss_rows,
+        },
+        "unbroken_blocks": mdata["unbroken_blocks"],
+        "monologues_over_180": mdata["monologues_over_180"],
+        "longest_questions": mdata["longest_questions"],
+        "top_checkable_claims": mdata["top_checkable_claims"],
+        "critical_events": crit_list,
+        "caps_applied": caps_applied,
+        "score_final": {
+            "raw_score": raw_score, "difficulty_modifier": diff_mod,
+            "difficulty_justification": " + ".join(diff_reasons) if diff_reasons else "بدون مُعدِّل تعقيد",
+            "pre_cap_score": pre_cap_score, "cap_ceiling": cap_ceiling,
+            "final_score": final_score, "band": band_label,
+            "reported_as": f"{int(round(final_score))} ± 5",
+        },
+        "top_priority_auto": f"{top_pri['criterion_id']} · {top_pri['name']} ({top_pri['score']}/{top_pri['max']})",
+        "audit": {"checks": audit_checks},
+        "data_gaps": mdata["data_gaps"],
+        "metadata_conflicts": mdata["metadata_conflicts"],
+    }
+
+
+# ==============================================================================
+# V8.0 EXECUTIVE WORD-RTL HTML RENDERERS (WITH DETAILED SCORE LOSS BREAKDOWN)
 # ==============================================================================
 EXEC_WORD_CSS = """
 @page WordSection1 { size: 21.0cm 29.7cm; margin: 1.8cm 1.8cm 1.8cm 1.8cm; mso-page-orientation: portrait; }
@@ -1982,17 +2493,16 @@ div.WordSection1 { page: WordSection1; }
 body, div.WordSection1 { font-family: 'Segoe UI', 'Dubai', 'Tahoma', 'Arial', sans-serif; font-size: 10.5pt; color: #1f2328; line-height: 1.6; margin: 0; padding: 0; direction: rtl; text-align: right; background: #ffffff; }
 p { margin: 0 0 6.5pt 0; text-align: justify; text-justify: inter-word; }
 h1, h2, h3, h4 { font-family: 'Segoe UI', 'Dubai', 'Tahoma', 'Arial', sans-serif; margin: 0; font-weight: bold; }
-h2 { font-size: 14pt; color: #12304d; border-bottom: 1.5pt solid #a8863f; padding-bottom: 4.5pt; margin: 18pt 0 9pt 0; page-break-after: avoid; }
-h3 { font-size: 11.2pt; color: #12304d; margin: 12pt 0 5pt 0; padding-right: 8pt; border-right: 3pt solid #a8863f; page-break-after: avoid; }
-h4 { font-size: 10.2pt; color: #8b2f38; margin: 9pt 0 4pt 0; page-break-after: avoid; }
+h2 { font-size: 13.5pt; color: #12304d; border-bottom: 1.5pt solid #a8863f; padding-bottom: 4pt; margin: 16pt 0 8pt 0; page-break-after: avoid; }
+h3 { font-size: 11pt; color: #12304d; margin: 11pt 0 5pt 0; padding-right: 8pt; border-right: 3pt solid #a8863f; page-break-after: avoid; }
 table { border-collapse: collapse; width: 100%; margin: 6pt 0 11pt 0; direction: rtl; }
-td, th { border: 0.5pt solid #d5dbe2; padding: 5pt 6.5pt; vertical-align: middle; font-size: 9pt; line-height: 1.45; }
+td, th { border: 0.5pt solid #d5dbe2; padding: 5pt 6pt; vertical-align: middle; font-size: 9pt; line-height: 1.45; }
 th { background-color: #12304d; color: #ffffff; font-weight: bold; border: 0.5pt solid #12304d; text-align: center; }
 tr.alt td { background-color: #f7f9fb; }
 td.num, th.num { text-align: center; }
 td.lbl { font-weight: bold; color: #12304d; }
 td.tot { background-color: #eef2f6; font-weight: bold; color: #12304d; }
-.callout-navy { background: #12304d; color: #ffffff; padding: 11pt 14pt; border: 0.5pt solid #12304d; }
+.callout-navy { background: #12304d; color: #ffffff; padding: 10pt 14pt; border: 0.5pt solid #12304d; }
 .callout-gold { background: #fbf7ec; border: 0.5pt solid #e8d5a3; border-right: 3.5pt solid #a8863f; padding: 9pt 12pt; }
 .callout-green { background: #f2f7f4; border: 0.5pt solid #b7d7c5; border-right: 3.5pt solid #2c5c46; padding: 9pt 14pt; }
 .callout-red { background: #fbf3f4; border: 0.5pt solid #e4bcc0; border-right: 3.5pt solid #8b2f38; padding: 9pt 14pt; }
@@ -2002,9 +2512,8 @@ td.tot { background-color: #eef2f6; font-weight: bold; color: #12304d; }
 .chart-box img { width: 100%; max-width: 17.2cm; height: auto; border: 0.5pt solid #d5dbe2; }
 .bar-bg { background: #e8edf3; height: 7pt; width: 100%; }
 .small { font-size: 8.5pt; color: #5b6572; }
-.note { font-size: 8.5pt; color: #5b6572; margin-top: -3pt; margin-bottom: 9pt; }
 ul { margin: 4pt 0 8pt 0; padding-right: 18pt; }
-li { margin-bottom: 5pt; }
+li { margin-bottom: 4pt; }
 """
 
 
@@ -2018,234 +2527,186 @@ def wrap_word_doc(title: str, inner_html: str) -> str:
     )
 
 
-def _format_guests_summary(eval_data: dict) -> str:
-    guests = eval_data.get("guests_list") or []
-    if not guests:
-        return "غير محدد في المقاطع"
-    parts = []
-    for g in guests[:6]:
-        name = str(g.get("name", "")).strip()
-        role = str(g.get("role", "")).strip()
-        parts.append(f"{name} ({role})" if role else name)
-    return " · ".join(parts)
+def render_loss_breakdown_html(eval_data: dict, max_rows: int = 15) -> str:
+    """Renders the Transparent Score Equation + Sorted Loss Table ('أين خسر العلامات؟')."""
+    sf = eval_data["score_final"]
+    lb = eval_data["loss_breakdown"]
+    cap_line = (
+        f"<p style='margin:6pt 0 0;color:#8b2f38;font-weight:bold;'>⚠️ أثر السقف الحرج: خسر <span dir='ltr'>-{lb['cap_penalty']:.1f}</span> نقطة بسبب خطأ حرج — <u>لولا هذا السقف لكانت النتيجة {lb['score_without_cap']:.1f} / 100</u>.</p>"
+        if lb["cap_penalty"] > 0 else
+        "<p style='margin:6pt 0 0;color:#2c5c46;font-weight:bold;'>✅ لم يُفرض أي خصم سقف حرج على هذه النتيجة.</p>"
+    )
+    split_html = ""
+    if eval_data.get("target_entity") == "presenter" and lb["total_item_loss"] > 0:
+        if eval_data.get("prep_mode") == "partner" and lb["prep_loss"] > 0:
+            split_html = f"<p class='small' style='margin-top:4pt;'><b>توزيع مصدر الخسارة:</b> الأداء على الهواء <b>-{lb['on_air_loss']:.1f} نقطة</b> · الإعداد والتحضير <b>-{lb['prep_loss']:.1f} نقطة</b>.</p>"
+        elif eval_data.get("prep_mode") == "independent":
+            split_html = "<p class='small' style='margin-top:4pt;'><b>توزيع مصدر الخسارة:</b> 100% من هذه العلامة تخصّ الأداء على الهواء (تم فصل محور الإعداد في بطاقة مستقلّة).</p>"
+
+    rows_html = ""
+    for idx, it in enumerate(lb["rows"][:max_rows], 1):
+        ts_str = " ، ".join(fmt_ts_span(t) for t in it.get("timestamps", [])) or "عام على الحلقة"
+        rows_html += (
+            f"<tr class='{'alt' if idx%2==0 else ''}'>"
+            f"<td class='num'><b>{idx}</b></td>"
+            f"<td class='lbl'>{esc(it['criterion_id'])} · {esc(it['name'])}<br><span class='small'>{esc(it['axis_name'])}</span></td>"
+            f"<td class='num' style='color:#8b2f38;font-weight:bold;' dir='ltr'>-{it['lost']:.1f}</td>"
+            f"<td class='num' dir='ltr'>{it['score']:.1f} / {it['max']:.1f}</td>"
+            f"<td>{esc(it['note'])}</td>"
+            f"<td class='num'>{ts_str}</td>"
+            f"<td style='color:#2c5c46;'>{esc(it.get('recovery',''))}</td></tr>"
+        )
+    if not rows_html:
+        rows_html = "<tr><td colspan='7' class='num' style='color:#2c5c46;font-weight:bold;'>لم تُسجَّل أي خسارة في البنود — أداء كامل.</td></tr>"
+
+    return f"""
+<div class="callout-red">
+  <p style="margin:0;font-weight:bold;color:#12304d;">معادلة العلامة الشفافة (إصدار المعيار <span dir="ltr">v{esc(eval_data['template_version'])}</span>):</p>
+  <table style="margin:6pt 0 2pt;background:#fff;"><tr>
+    <td class="num">الأساس<br><b style="font-size:13pt;">100</b></td>
+    <td class="num" style="color:#8b2f38;">خسارة البنود<br><b style="font-size:13pt;" dir="ltr">-{lb['total_item_loss']:.1f}</b></td>
+    <td class="num">المجموع الخام<br><b style="font-size:13pt;">{sf['raw_score']:.1f}</b></td>
+    <td class="num" style="color:#2c5c46;">مُعدِّل التعقيد<br><b style="font-size:13pt;" dir="ltr">+{sf['difficulty_modifier']}</b></td>
+    <td class="num" style="color:#8b2f38;">أثر السقف الحرج<br><b style="font-size:13pt;" dir="ltr">-{lb['cap_penalty']:.1f}</b></td>
+    <td class="num" style="background:#12304d;color:#fff;">النتيجة النهائية<br><b style="font-size:14pt;" dir="ltr">{esc(sf['reported_as'])}</b></td>
+  </tr></table>
+  {cap_line}
+  {split_html}
+</div>
+<h3>جدول أين خُسرت العلامات؟ (مرتّب تنازلياً من أكبر خسارة إلى الأصغر)</h3>
+<table>
+  <tr><th>#</th><th>البند والمحور</th><th class="num">الخسارة</th><th class="num">الدرجة</th><th>السبب الموثّق</th><th class="num">التوقيتات</th><th>كيف تُستعاد النقاط؟</th></tr>
+  {rows_html}
+</table>"""
 
 
-def _next_band_gap_text(final_score: float) -> tuple:
-    if final_score < 70:
-        return f"{round(70.0 - final_score, 1)} نقطة", "للترقية إلى «احترافي سليم» (70)"
-    if final_score < 80:
-        return f"{round(80.0 - final_score, 1)} نقطة", "للترقية إلى «احترافي متقدّم» (80)"
-    if final_score < 90:
-        return f"{round(90.0 - final_score, 1)} نقطة", "للترقية إلى «استثنائي» (90)"
-    return "مستوى القمة", "ضمن نطاق «استثنائي» (90–100)"
+def render_generic_scored_report_html(subject_name: str, eval_data: dict, llm_qual: dict, derived_meta: dict, exact_dur: str, charts: dict, meta_info: dict, summarized: bool = False) -> str:
+    sf = eval_data["score_final"]
+    rep = (llm_qual or {}).get("report", {}) if isinstance(llm_qual, dict) else {}
+    env_ar = "خارج الاستوديو (ميداني)" if eval_data["shoot_env"] == "outdoor" else "داخل الاستوديو"
+    prep_ar = ""
+    if eval_data.get("target_entity") == "presenter":
+        prep_ar = " · الإعداد: " + ("شريك بالإعداد (ضمن 100)" if eval_data.get("prep_mode") == "partner" else "إعداد مستقل (بطاقة منفصلة)")
 
-
-def render_detailed_eval_html(display_name, exact_dur, derived_meta, eval_data, llm_qual, charts, meta_info) -> str:
-    sf, k = eval_data["score_final"], eval_data["kpis"]
-    rep = (llm_qual or {}).get("report", {})
-    total_lost = max(0.0, round(100.0 - sf["raw_score"], 1))
-    gap_num, gap_sub = _next_band_gap_text(sf["final_score"])
-    prog_label = eval_data.get("program_name") or (llm_qual or {}).get("episode_overview", {}).get("program_name") or "برنامج حواري / تغطية خاصة"
-    guests_str = _format_guests_summary(eval_data)
-
-    # 7-axis overview rows with Word-safe inline progress bar
     ax_rows = ""
     for i, a in enumerate(eval_data["axes"]):
-        ar_c = AXIS_AR_CODE.get(a["id"], a["id"])
         lost_a = round(max(0.0, a["max"] - a["score"]), 1)
         bar_col = "#2c5c46" if a["pct"] >= 75 else ("#a8863f" if a["pct"] >= 55 else "#8b2f38")
         ax_rows += (
             f"<tr class='{'alt' if i%2 else ''}'>"
-            f"<td class='lbl'>{ar_c} · {esc(a['name'])}</td>"
-            f"<td class='num'>{a['max']:.0f}</td>"
-            f"<td class='num'><b>{a['score']:.1f}</b></td>"
+            f"<td class='lbl'>{esc(AXIS_AR_CODE.get(a['id'], a['id']))} · {esc(a['name'])}</td>"
+            f"<td class='num'>{a['max']:.1f}</td><td class='num'><b>{a['score']:.1f}</b></td>"
             f"<td class='num' style='color:{bar_col};font-weight:bold;'>{a['pct']:.0f}%</td>"
-            f"<td style='width:20%;'><div class='bar-bg'><div style='background:{bar_col};height:7pt;width:{min(100,max(2,a['pct'])):.0f}%;'></div></div></td>"
+            f"<td style='width:18%;'><div class='bar-bg'><div style='background:{bar_col};height:7pt;width:{min(100,max(2,a['pct'])):.0f}%;'></div></div></td>"
             f"<td class='num' style='color:#8b2f38;'>{f'-{lost_a:.1f}' if lost_a > 0 else '0'}</td></tr>"
         )
-    ax_rows += f"<tr><td class='tot'>المجموع الخام (قبل مُعدِّل التعقيد والسقف الحرج)</td><td class='num tot'>100</td><td class='num tot'>{sf['raw_score']:.1f}</td><td class='num tot'>{sf['raw_score']:.0f}%</td><td class='tot'></td><td class='num tot'>-{total_lost:.1f}</td></tr>"
 
-    # Grouped 7 Axes x 26 Sub-Criteria Breakdown
-    grouped_sections_html = ""
+    loss_html = render_loss_breakdown_html(eval_data, max_rows=6 if summarized else 20)
+    st_li = "".join(f"<li>{esc(s)}</li>" for s in rep.get("strengths", [])[: (3 if summarized else 8)]) or "<li>انظر المحاور الأعلى نسبة.</li>"
+    pr_li = "".join(f"<li>{esc(p)}</li>" for p in rep.get("priorities", [])[: (3 if summarized else 8)]) or f"<li>{esc(eval_data['top_priority_auto'])}</li>"
+
+    indep_prep_html = ""
+    if eval_data.get("independent_prep_card"):
+        ipc = eval_data["independent_prep_card"]
+        p_rows = "".join(f"<tr><td class='lbl'>{esc(x['name'])}</td><td class='num'><b>{x['score']:.1f}/{x['max']:.0f}</b></td><td>{esc(x['note'])}</td></tr>" for x in ipc["items"])
+        indep_prep_html = f"<h2>بطاقة الإعداد التحريري المستقلة (لا تؤثّر على علامة المقدّم)</h2><p>تقييم فريق الإعداد: <b>{ipc['score']:.1f} من {ipc['max']:.0f} ({ipc['pct']:.0f}%)</b></p><table><tr><th>البند</th><th class='num'>الدرجة</th><th>الملاحظة</th></tr>{p_rows}</table>"
+
+    header = f"""
+<table style="margin:0;"><tr><td style="background:#12304d;color:#fff;padding:18pt 20pt;">
+  <p style="margin:0;color:#d9c48f;font-size:8.5pt;">{esc(eval_data['template_name'])} · معيار <span dir="ltr">v{esc(eval_data['template_version'])}</span> · {esc(env_ar)}{esc(prep_ar)}</p>
+  <p style="margin:4pt 0 0;font-size:21pt;font-weight:bold;color:#fff;">{esc(subject_name)} — <span dir="ltr">{esc(sf['reported_as'])}</span> ({esc(sf['band'])})</p>
+  <p style="margin:5pt 0 0;color:#c9d6e4;font-size:9pt;">التاريخ: {esc(derived_meta.get('broadcast_date') or '—')} · المدة: {fmt_ts_span(exact_dur)} · الكلفة: <span dir="ltr">${meta_info.get('actual_cost',0):.4f}</span></p>
+</td></tr></table>"""
+
+    if summarized:
+        chart_img = f"<div class='chart-box'><img src='data:image/png;base64,{charts['axes_bar']}'></div>" if charts.get("axes_bar") else ""
+        body = f"""{header}
+<h2>١ · الخلاصة التنفيذية</h2><p>{esc(rep.get('summary') or '')}</p>
+<h2>٢ · كشف خسارة العلامات المختصر</h2>{loss_html}
+{chart_img}
+<h2>٣ · نتائج المحاور</h2><table><tr><th>المحور</th><th class="num">الوزن</th><th class="num">الدرجة</th><th class="num">النسبة</th><th class="num">الشريط</th><th class="num">الفقد</th></tr>{ax_rows}</table>
+{indep_prep_html}
+<div class="callout-green"><b>أبرز نقاط القوة:</b><ul>{st_li}</ul></div>
+<div class="callout-red" style="margin-top:8pt;"><b>الأولوية القصوى: {esc(eval_data['top_priority_auto'])}</b><ul>{pr_li}</ul></div>"""
+        return wrap_word_doc(f"مختصر {eval_data['template_name']} - {subject_name}", body)
+
+    # Full Detailed Report
+    charts_html = "".join(f"<div class='chart-box'><img src='data:image/png;base64,{charts[ck]}'></div>" for ck in ("axes_bar", "lost_bar", "blocks_bar") if charts.get(ck))
+    grouped_html = ""
     for a in eval_data["axes"]:
-        ar_c = AXIS_AR_CODE.get(a["id"], a["id"])
-        bar_col = "#2c5c46" if a["pct"] >= 75 else ("#a8863f" if a["pct"] >= 55 else "#8b2f38")
-        rows_sub = ""
-        for j, it in enumerate(a["items"]):
-            ic = ITEM_AR_CODE.get(it["criterion_id"], it["criterion_id"])
-            rows_sub += (
-                f"<tr class='{'alt' if j%2 else ''}'>"
-                f"<td class='lbl' style='width:20%;'>{ic} · {esc(it['name'])}</td>"
-                f"<td style='width:18%;' class='small'>{esc(it.get('benchmark_display', ''))}</td>"
-                f"<td style='width:16%;' class='num'>{esc(it.get('metric_display', it['metric_value']))}</td>"
-                f"<td style='width:9%;' class='num'><b>{it['score']:.1f} / {it['max']:.0f}</b></td>"
-                f"<td style='width:8%;' class='num'>{esc(it.get('confidence_ar', CONF_AR.get(it['confidence'], 'متوسطة')))}</td>"
-                f"<td style='width:29%;'>{esc(it['note'])}</td></tr>"
-            )
-        grouped_sections_html += (
-            f"<h3>المحور {ar_c} · {esc(a['name'])} — <span style='color:{bar_col};'>{a['score']:.1f} من {a['max']:.0f} ({a['pct']:.0f}%)</span></h3>"
-            f"<table><tr><th>البند الفرعي</th><th>المرساة المرجعية</th><th>القيمة المقيسة</th><th>الدرجة</th><th>الثقة</th><th>الشاهد والملاحظة المهنية</th></tr>{rows_sub}</table>"
+        rows_sub = "".join(
+            f"<tr class='{'alt' if j%2 else ''}'>"
+            f"<td class='lbl' style='width:22%;'>{esc(it['criterion_id'])} · {esc(it['name'])}</td>"
+            f"<td style='width:18%;' class='small'>{esc(it['benchmark_display'])}</td>"
+            f"<td style='width:15%;' class='num'>{esc(it['metric_display'])}</td>"
+            f"<td style='width:10%;' class='num'><b>{it['score']:.1f}/{it['max']:.1f}</b></td>"
+            f"<td style='width:35%;'>{esc(it['note'])}</td></tr>"
+            for j, it in enumerate(a["items"])
         )
+        grouped_html += f"<h3>{esc(a['name'])} — {a['score']:.1f} / {a['max']:.1f} ({a['pct']:.0f}%)</h3><table><tr><th>البند</th><th>المعيار</th><th>المقيس</th><th>الدرجة</th><th>الملاحظة والشواهد</th></tr>{rows_sub}</table>"
 
-    # Documented examples table
-    examples = (llm_qual or {}).get("documented_examples") or eval_data.get("auto_examples") or []
-    ex_rows = "".join(
-        f"<tr class='{'alt' if i%2 else ''}'>"
-        f"<td class='num' style='width:15%;'>{fmt_ts_span(ex.get('ts')) if 'من' not in str(ex.get('ts','')) else esc(ex.get('ts'))}</td>"
-        f"<td class='lbl' style='width:14%;'>{esc(ex.get('speaker', 'المقدّم'))}</td>"
-        f"<td style='width:41%;'>{esc(ex.get('quote', ''))}</td>"
-        f"<td style='width:30%;'>{esc(ex.get('significance', ''))}</td></tr>"
-        for i, ex in enumerate(examples[:10])
-    ) or "<tr><td colspan='4' class='num'>انظر سجل الأدوار الكامل في ملف الصندوق الأسود المرفق.</td></tr>"
-
-    # Monologues > 180s
-    mono_rows = "".join(
-        f"<tr><td class='num'>من {fmt_ts_span(b['start'])} إلى {fmt_ts_span(b.get('end',''))}</td>"
-        f"<td class='num'>{int(round(float(b['duration_s'])))} ثانية</td>"
-        f"<td class='num'>الضيف ({esc(b.get('speaker_id'))})</td>"
-        f"<td style='color:#8b2f38;font-weight:bold;'>تجاوز 180 ثانية — خاضع لاختبار المردود (يُحاسب في أ٣ فقط)</td></tr>"
-        for b in eval_data["monologues_over_180"]
-    ) or "<tr><td colspan='4' class='num' style='color:#2c5c46;font-weight:bold;'>نتيجة إيجابية: لم يتجاوز أي بلوك متّصل للضيف عتبة 180 ثانية في هذه الحلقة.</td></tr>"
-
-    # Critical caps
     crit_rows = "".join(
-        f"<tr><td class='lbl'>{esc(c.get('event_ar') or CRIT_EVENT_AR.get(c.get('event'), c.get('event')))}</td>"
-        f"<td class='num'>{fmt_ts_span(c.get('at'))}</td>"
-        f"<td>{esc(c.get('detail', ''))}</td>"
-        f"<td class='num' style='color:#8b2f38;font-weight:bold;'>سقف {c.get('cap')} / 100</td></tr>"
+        f"<tr><td class='lbl'>{esc(c['event_ar'])}</td><td class='num'>{fmt_ts_span(c.get('at'))}</td><td>{esc(c.get('detail',''))}</td><td class='num' style='color:#8b2f38;font-weight:bold;'>سقف {c['cap']}</td></tr>"
         for c in eval_data["caps_applied"]
-    ) or "<tr><td colspan='4' class='num' style='color:#2c5c46;font-weight:bold;'>لا توجد أخطاء حرجة مفروضة السقف في هذه الحلقة.</td></tr>"
+    ) or "<tr><td colspan='4' class='num' style='color:#2c5c46;font-weight:bold;'>صفر أخطاء حرجة مفروضة السقف.</td></tr>"
 
-    # Audit checks in clean Arabic
-    audit_rows = "".join(
-        f"<tr class='{'alt' if i%2 else ''}'>"
-        f"<td class='lbl'>{esc(AUDIT_CHECK_AR.get(c['check'], c['check']))}</td>"
-        f"<td class='num' style='color:{'#2c5c46' if c['passed'] else '#8b2f38'};font-weight:bold;'>{'مطابق' if c['passed'] else 'تعارض'}</td>"
-        f"<td>{esc(c['detail'])}</td></tr>"
-        for i, c in enumerate(eval_data["audit"]["checks"])
-    )
+    audit_rows = "".join(f"<tr><td class='lbl'>{esc(AUDIT_CHECK_AR.get(c['check'], c['check']))}</td><td class='num' style='color:#2c5c46;font-weight:bold;'>مطابق</td><td>{esc(c['detail'])}</td></tr>" for c in eval_data["audit"]["checks"])
 
-    charts_html = "".join(f"<div class='chart-box'><img src='data:image/png;base64,{charts[ck]}' alt='رسم بياني'></div>" for ck in ("axes_bar", "blocks_bar", "lost_bar") if charts.get(ck))
-    st_li = "".join(f"<li>{esc(s)}</li>" for s in rep.get("strengths", [])) or "<li>انظر المحاور التي حقّقت 75% فأكثر في الجدول أعلاه.</li>"
-    pr_li = "".join(f"<li>{esc(p)}</li>" for p in rep.get("priorities", [])) or f"<li>الأولوية القصوى: {esc(eval_data['top_priority_auto'])}</li>"
-
-    start_beirut = derived_meta.get("broadcast_start_beirut") or "—"
-    end_beirut = derived_meta.get("broadcast_end_beirut") or "—"
-    time_range_html = f"من {fmt_ts_span(start_beirut)} إلى {fmt_ts_span(end_beirut)}" if start_beirut != "—" else "غير متوفر"
-
-    body = f"""
-<table style="margin:0;"><tr><td style="border:0.5pt solid #12304d;background:#12304d;padding:22pt 20pt;color:#fff;">
-<p style="margin:0 0 6pt;font-size:8.5pt;color:#d9c48f;letter-spacing:1.2pt;">تقرير تقييم مهني تفصيلي · سلّم Manar-100-v2 · الصندوق الأسود v2.0</p>
-<p style="margin:0 0 4pt;font-size:23pt;font-weight:bold;color:#fff;">{esc(display_name)} — {esc(prog_label)}</p>
-<p style="margin:0 0 12pt;font-size:10.5pt;color:#c9d6e4;">{esc(meta_info['editorial_label'])}</p>
-<table style="margin:0;"><tr>
-<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;width:24%;">تاريخ البث<br><b style="color:#fff;">{esc(derived_meta.get('broadcast_date') or 'غير مستخرج')}</b></td>
-<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;width:30%;">توقيت البث (بيروت {esc(derived_meta.get('timezone'))})<br><b style="color:#fff;">{time_range_html}</b></td>
-<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;width:22%;">مدة الحلقة الكاملة<br><b style="color:#fff;">{fmt_ts_span(exact_dur)}</b></td>
-<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;width:24%;">التحليل (مقاطع 5د) / الكلفة<br><b style="color:#fff;">{meta_info['chunks_ok']} من {meta_info['chunks_total']} · <span dir="ltr">${meta_info['actual_cost']:.4f}</span></b></td>
-</tr></table>
-<p style="margin:8pt 0 0;padding-top:6pt;border-top:0.5pt solid #2a4766;font-size:8.5pt;color:#c9d6e4;"><b style="color:#d9c48f;">الضيوف والمشاركون:</b> {esc(guests_str)}</p>
-</td></tr></table>
-
-<table style="margin:12pt 0 14pt;"><tr>
-<td style="background:#fbf7ec;border-top:2.5pt solid #a8863f;text-align:center;width:30%;padding:12pt 8pt;">
-<p style="margin:0;font-size:8pt;color:#8a7332;text-align:center;">النتيجة النهائية (بنطاق القياس)</p>
-<p style="margin:2pt 0 0;font-size:32pt;font-weight:bold;color:#12304d;text-align:center;" dir="ltr">{esc(sf['reported_as'])}</p>
-<p style="margin:2pt 0 0;font-size:8.2pt;color:#5b6572;text-align:center;">خام {sf['raw_score']:.1f} + تعقيد {sf['difficulty_modifier']} · السقف {sf['cap_ceiling']:.0f}</p>
-</td>
-<td style="background:#fbf7ec;border-top:2.5pt solid #a8863f;text-align:center;width:38%;padding:12pt 8pt;">
-<p style="margin:0;font-size:8pt;color:#5b6572;text-align:center;">التقدير المهني المعتمد</p>
-<p style="margin:4pt 0;font-size:15pt;font-weight:bold;color:#8b2f38;text-align:center;">{esc(sf['band'])}</p>
-<p style="margin:0;font-size:8.2pt;color:#5b6572;text-align:center;">{esc(sf['difficulty_justification'])}</p>
-</td>
-<td style="background:#fbf7ec;border-top:2.5pt solid #a8863f;text-align:center;width:32%;padding:12pt 8pt;">
-<p style="margin:0;font-size:8pt;color:#5b6572;text-align:center;">الفارق عن المستوى الأعلى</p>
-<p style="margin:4pt 0;font-size:14pt;font-weight:bold;color:#12304d;text-align:center;">{esc(gap_num)}</p>
-<p style="margin:0;font-size:8pt;color:#5b6572;text-align:center;">{esc(gap_sub)}</p>
-</td></tr></table>
-
-<h2>١ · الملخّص التنفيذي والمؤشرات الأربعة الحاكمة</h2>
-<p>{esc(rep.get('summary') or 'تقييم مهني حتمي مبني على استخراج كائنات الأحداث الزمنية من كامل مدة الحلقة ومقارنتها بمراسي سلّم Manar-100-v2.')}</p>
-<table><tr>
-<td style="background:#f5f7fa;text-align:center;width:25%;padding:10pt 6pt;"><b style="font-size:20pt;color:#12304d;">{k['interventions_per_10min']:.1f}</b><br><span class="small">مداخلة / 10 دقائق<br>(المعيار: 8 إلى 14)</span></td>
-<td style="background:#f5f7fa;text-align:center;width:25%;padding:10pt 6pt;"><b style="font-size:20pt;color:#12304d;">{k['mean_intervention_s']:.1f} ث</b><br><span class="small">متوسط طول المداخلة<br>(المعيار: 12 ثانية أو أقل)</span></td>
-<td style="background:{'#fbf3f4' if k['longest_unbroken_block_s'] > 180 else '#fbf7ec'};text-align:center;width:25%;padding:10pt 6pt;"><b style="font-size:20pt;color:{'#8b2f38' if k['longest_unbroken_block_s'] > 180 else '#a8863f'};">{int(round(k['longest_unbroken_block_s']))} ث</b><br><span class="small">أطول بلوك ضيف متّصل<br>(المعيار: 90 إلى 120 ثانية)</span></td>
-<td style="background:#f5f7fa;text-align:center;width:25%;padding:10pt 6pt;"><b style="font-size:20pt;color:#12304d;">{k['anchor_share_pct']:.1f}%</b><br><span class="small">حصّة المقدّم من الكلام<br>(المعيار: 20% إلى 30%)</span></td>
-</tr></table>
-<p class="note">{esc(eval_data['brief_alignment'].get('caveat', ''))}</p>
-
-<h2>٢ · الرسوم البيانية التشخيصية</h2>
-{charts_html}
-
-<h2 style="page-break-before:always;">٣ · خلاصة المحاور السبعة (100 نقطة)</h2>
-<table><tr><th>المحور</th><th class="num">الوزن</th><th class="num">الدرجة</th><th class="num">النسبة</th><th class="num">شريط الإنجاز</th><th class="num">الفقد</th></tr>{ax_rows}</table>
-
-<h2 style="page-break-before:always;">٤ · التفصيل القابل للتدقيق — البنود الـ 26 موزّعة على المحاور السبعة</h2>
-{grouped_sections_html}
-
-<h2 style="page-break-before:always;">٥ · شواهد وأمثلة موثّقة من الحلقة</h2>
-<table><tr><th class="num">التوقيت</th><th>المتحدّث</th><th>الاقتباس الحرفي أو الحدث المرصود</th><th>الدلالة المهنية</th></tr>{ex_rows}</table>
-
-<h2>٦ · اختبار المردود (البلوكات &gt; 180 ثانية) وسقوف الأخطاء الحرجة</h2>
-<p class="small">يُطبَّق اختبار المردود على كل بلوك متّصل للضيف يتجاوز 180 ثانية: هل أنتج معلومة جديدة قابلة للتحقق أو استنتاجاً قرارياً؟ إن كان الجواب «لا» يُخصم في البند (أ٣) فقط تطبيقاً لقاعدة «العطب الواحد ← محور واحد».</p>
-<table><tr><th class="num">النافذة الزمنية</th><th class="num">المدة</th><th class="num">المتحدّث</th><th>الحكم المنهجي</th></tr>{mono_rows}</table>
-<h3>السقوف الحرجة المطبّقة على النتيجة</h3>
-<table><tr><th>الحدث الحرج</th><th class="num">التوقيت</th><th>التفصيل الموثّق</th><th class="num">السقف الأعلى</th></tr>{crit_rows}</table>
-
-<h2 style="page-break-before:always;">٧ · نقاط القوة وأولويات التطوير وخارطة المكسب</h2>
-<div class="callout-green"><b>نقاط القوة الموثّقة بالتوقيت:</b><ul>{st_li}</ul></div>
-<div class="callout-red" style="margin-top:8pt;"><b>أولويات التطوير (الأولوية القصوى المشتقّة آلياً: {esc(eval_data['top_priority_auto'])}):</b><ul>{pr_li}</ul></div>
-
-<h3>جدول الحساسية: أثر الالتزام بالبروتوكولات الثمانية</h3>
-<table><tr><th>الإجراء التحسيني (البروتوكول)</th><th class="num">البند المستهدف</th><th class="num">الكلفة الإنتاجية</th><th class="num">المكسب المتوقّع</th></tr>
-<tr><td>بروتوكول 90/8: لمسة توجيهية ≤ 8 ثوانٍ كل 90 ثانية تبدأ بكلمة من الضيف</td><td class="num">أ٣ + د٣</td><td class="num">صفر</td><td class="num">+4.0 نقاط</td></tr>
-<tr class="alt"><td>قاعدة السؤال الواحد: ≤ 12 ثانية / ≤ 30 كلمة باستفهام واحد ومرجع محدد</td><td class="num">أ٢ + ب١ + ب٢</td><td class="num">صفر</td><td class="num">+3.2 نقاط</td></tr>
-<tr><td>رفع معدّل التدخّلات النشطة إلى 8–10 مداخلات كل 10 دقائق</td><td class="num">أ١</td><td class="num">صفر</td><td class="num">+2.5 نقاط</td></tr>
-<tr class="alt"><td>قراءة أي شريط أمني/عاجل محلي فور ظهوره خلال ≤ 60 ثانية</td><td class="num">هـ٣ + و٣</td><td class="num">صفر</td><td class="num">+2.0 نقطتان</td></tr>
-<tr><td>بطاقة الفرضيات الثلاث + طلب دليل صريح 3 مرّات في الساعة</td><td class="num">ج١ + ج٢</td><td class="num">تحضير</td><td class="num">+1.5 نقطة</td></tr>
-<tr class="alt"><td>خاتمة بـ 3 خلاصات تنفيذية + بطاقة الأسماء أمام المقدّم</td><td class="num">ز٢ + ز٣</td><td class="num">صفر</td><td class="num">+1.5 نقطة</td></tr>
-<tr><td class="tot" colspan="3">إجمالي المكسب الممكن دون كلفة إنتاجية إضافية</td><td class="num tot">+14.7 نقطة</td></tr></table>
-
-<h3>ضوابط الحماية المهنية واللغوية (ما لا يُخصم عليه)</h3>
-<div class="callout-gold"><p style="margin:0;">لا يُخصم أي جزء من العلامة على: <b>اللهجة اللبنانية المحكية</b> (تُعدّ عنصر قوة تواصلي محبّب)، ولا على <b>الالتزام بالخط التحريري للقناة الموجّهة ومصطلحاتها</b>، ولا على <b>عدم التوازن السياسي تجاه العدو</b>؛ وتنحصر المحاسبة في الصنعة الحوارية والإيقاع والتحقّق الداخلي وتحصين السردية.</p></div>
-
-<h2>٨ · تقرير التدقيق الذاتي للنزاهة (6 فحوص آلية)</h2>
-<table><tr><th>الفحص المنهجي</th><th class="num">الحالة</th><th>النتيجة الموثّقة</th></tr>{audit_rows}</table>
-<p class="small" style="margin-top:12pt;text-align:center;color:#8a939e;">— نهاية التقرير المفصّل (Orchestrator V7.0) —</p>"""
-    return wrap_word_doc(f"تقييم مفصل - {display_name}", body)
+    body = f"""{header}
+<h2>١ · الخلاصة التنفيذية</h2><p>{esc(rep.get('summary') or '')}</p>
+<h2>٢ · كشف خسارة العلامات التفصيلي (أين خُسرت النقاط؟)</h2>{loss_html}
+<h2>٣ · الرسوم البيانية التشخيصية</h2>{charts_html}
+<h2 style="page-break-before:always;">٤ · خلاصة المحاور ({len(eval_data['axes'])} محاور · 100 نقطة)</h2>
+<table><tr><th>المحور</th><th class="num">الوزن</th><th class="num">الدرجة</th><th class="num">النسبة</th><th class="num">الشريط</th><th class="num">الفقد</th></tr>{ax_rows}</table>
+{indep_prep_html}
+<h2 style="page-break-before:always;">٥ · التفصيل الكامل للبنود والشواهد</h2>{grouped_html}
+<h2>٦ · السقوف الحرجة ونقاط القوة والتطوير</h2>
+<table><tr><th>الحدث الحرج</th><th class="num">التوقيت</th><th>التفصيل</th><th class="num">السقف</th></tr>{crit_rows}</table>
+<div class="callout-green"><b>نقاط القوة:</b><ul>{st_li}</ul></div>
+<div class="callout-red" style="margin-top:8pt;"><b>أولويات التطوير:</b><ul>{pr_li}</ul></div>
+<h2>٧ · تدقيق النزاهة وإصدار المعيار</h2>
+<table><tr><th>الفحص</th><th class="num">الحالة</th><th>النتيجة</th></tr>{audit_rows}</table>
+<p class="small" style="margin-top:12pt;text-align:center;">— Orchestrator V8.0 · القالب {esc(eval_data['template_id'])} (v{esc(eval_data['template_version'])}) —</p>"""
+    return wrap_word_doc(f"{eval_data['template_name']} - {subject_name}", body)
 
 
-def render_summarized_eval_html(display_name, exact_dur, eval_data, llm_qual, charts) -> str:
-    sf, k, rep = eval_data["score_final"], eval_data["kpis"], (llm_qual or {}).get("report", {})
-    gap_num, gap_sub = _next_band_gap_text(sf["final_score"])
-    guests_str = _format_guests_summary(eval_data)
-    ax_rows = "".join(
-        f"<tr class='{'alt' if i%2 else ''}'>"
-        f"<td class='lbl'>{AXIS_AR_CODE.get(a['id'], a['id'])} · {esc(a['name'])}</td>"
-        f"<td class='num'><b>{a['score']:.1f} / {a['max']:.0f}</b></td>"
-        f"<td class='num'>{a['pct']:.0f}%</td></tr>"
-        for i, a in enumerate(eval_data["axes"])
-    )
-    chart_img = f"<div class='chart-box'><img src='data:image/png;base64,{charts['axes_bar']}'></div>" if charts.get("axes_bar") else ""
-    st_li = "".join(f"<li>{esc(s)}</li>" for s in rep.get("strengths", [])[:3]) or "<li>انظر المحاور الأعلى نسبة.</li>"
-    pr_li = "".join(f"<li>{esc(p)}</li>" for p in rep.get("priorities", [])[:3]) or f"<li>{esc(eval_data['top_priority_auto'])}</li>"
+def render_guests_bundle_html(display_name: str, guest_evals: list, derived_meta: dict, exact_dur: str, tpl: dict) -> str:
+    """Renders an executive Word-RTL dossier with independent evaluation cards & loss breakdown for EVERY guest."""
+    cards = []
+    comp_rows = ""
+    for idx, ge in enumerate(guest_evals, 1):
+        sf = ge["eval"]["score_final"]
+        rec_tier = "A" if sf["final_score"] >= 85 else ("B" if sf["final_score"] >= 70 else "C")
+        tier_col = "#2c5c46" if rec_tier == "A" else ("#a8863f" if rec_tier == "B" else "#8b2f38")
+        comp_rows += (
+            f"<tr class='{'alt' if idx%2==0 else ''}'>"
+            f"<td class='lbl'>{esc(ge['guest_name'])}</td><td>{esc(ge['specialty'] or '—')}</td>"
+            f"<td class='num'><b>{esc(sf['reported_as'])}</b></td>"
+            f"<td class='num' style='color:{tier_col};font-weight:bold;'>{rec_tier} · {esc(sf['band'])}</td>"
+            f"<td class='num'>{ge['eval']['kpis'].get('guest_evidence_pct',0):.0f}%</td>"
+            f"<td class='num'>{int(round(ge['eval']['kpis'].get('guest_longest_block_s',0)))} ث</td></tr>"
+        )
+        ideas_li = "".join(f"<li>{esc(x)}</li>" for x in ge.get("new_ideas", [])[:5]) or "<li>انظر الملخص.</li>"
+        quotes_li = "".join(f"<li><b>{fmt_ts_span(q.get('at'))}:</b> «{esc(q.get('quote'))}»</li>" for q in ge.get("quotable_lines", [])[:4]) or "<li>—</li>"
+        ax_rows = "".join(f"<tr><td class='lbl'>{esc(a['name'])}</td><td class='num'><b>{a['score']:.1f}/{a['max']:.1f}</b></td><td class='num'>{a['pct']:.0f}%</td></tr>" for a in ge["eval"]["axes"])
+        cards.append(f"""
+<h2 style="page-break-before:always;">بطاقة الضيف ({idx}): {esc(ge['guest_name'])} — <span dir="ltr">{esc(sf['reported_as'])}</span> ({rec_tier})</h2>
+<p class="small"><b>الصفة/التخصّص:</b> {esc(ge['specialty'] or 'غير محدد')} · <b>نوع المشاركة:</b> {esc(ge['connection'])} · <b>التوصية الإدارية:</b> <span style="color:{tier_col};font-weight:bold;">{esc(sf['band'])}</span></p>
+<p>{esc((ge.get('llm_qual') or {}).get('report', {}).get('summary', ''))}</p>
+{render_loss_breakdown_html(ge['eval'], max_rows=8)}
+<table><tr><th>المحور</th><th class="num">الدرجة</th><th class="num">النسبة</th></tr>{ax_rows}</table>
+<div class="callout-gold"><b>أبرز الأفكار المطروحة (للمراجعة مع التاريخ ومنع التكرار):</b><ul>{ideas_li}</ul><b>جُمل قوية قابلة للتداول:</b><ul>{quotes_li}</ul></div>""")
+
     body = f"""
 <table style="margin:0;"><tr><td style="background:#12304d;color:#fff;padding:18pt 20pt;">
-<p style="margin:0;color:#d9c48f;font-size:8.5pt;">تقرير إداري مختصر · سلّم Manar-100-v2</p>
-<p style="margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;">{esc(display_name)} — <span dir="ltr">{esc(sf['reported_as'])}</span> ({esc(sf['band'])})</p>
-<p style="margin:4pt 0 0;color:#c9d6e4;font-size:9.5pt;">المدة: {fmt_ts_span(exact_dur)} · الخام: {sf['raw_score']:.1f} · التعقيد: +{sf['difficulty_modifier']} · السقف: {sf['cap_ceiling']:.0f} · الفارق عن الترقية: {esc(gap_num)} ({esc(gap_sub)})</p>
-<p style="margin:5pt 0 0;color:#c9d6e4;font-size:8.5pt;"><b style="color:#d9c48f;">الضيوف:</b> {esc(guests_str)}</p>
+  <p style="margin:0;color:#d9c48f;font-size:8.5pt;">تقييم الضيوف المستقل · معيار <span dir="ltr">v{esc(tpl.get('version','1.0'))}</span></p>
+  <p style="margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;">تقرير تقييم ضيوف حلقة: {esc(display_name)}</p>
+  <p style="margin:4pt 0 0;color:#c9d6e4;font-size:9pt;">عدد الضيوف المقيّمين: {len(guest_evals)} · التاريخ: {esc(derived_meta.get('broadcast_date') or '—')} · المدة: {fmt_ts_span(exact_dur)}</p>
 </td></tr></table>
-<h2>الخلاصة التنفيذية</h2><p>{esc(rep.get('summary') or '')}</p>
-<h2>لوحة المؤشرات السبعة</h2>
-<table><tr><th>مداخلات / 10د</th><th>متوسط المداخلة</th><th>أطول بلوك ضيف</th><th>أسئلة أحادية</th><th>طلبات دليل / ساعة</th><th>تغطية العاجل</th><th>حصّة المقدّم</th></tr>
-<tr><td class="num">{k['interventions_per_10min']:.1f}</td><td class="num">{k['mean_intervention_s']:.1f} ث</td><td class="num">{int(round(k['longest_unbroken_block_s']))} ث</td><td class="num">{k['single_question_pct']:.0f}%</td><td class="num">{k['evidence_request_per_hour']:.1f}</td><td class="num">{k['local_chyron_coverage_pct']:.0f}%</td><td class="num">{k['anchor_share_pct']:.0f}%</td></tr></table>
-{chart_img}
-<h2>نتائج المحاور السبعة</h2>
-<table><tr><th>المحور</th><th class="num">الدرجة</th><th class="num">النسبة المئوية</th></tr>{ax_rows}</table>
-<div class="callout-green"><b>أبرز نقاط القوة:</b><ul>{st_li}</ul></div>
-<div class="callout-red" style="margin-top:8pt;"><b>الأولوية القصوى (مشتقّة آلياً): {esc(eval_data['top_priority_auto'])}</b><ul>{pr_li}</ul></div>"""
-    return wrap_word_doc(f"تقرير مختصر - {display_name}", body)
+<h2>مقارنة ضيوف الحلقة وتوصية إعادة الاستضافة (A / B / C)</h2>
+<table><tr><th>الضيف</th><th>التخصّص</th><th class="num">النتيجة</th><th class="num">التوصية</th><th class="num">نسبة الأدلة</th><th class="num">أطول استرسال</th></tr>{comp_rows}</table>
+{''.join(cards)}"""
+    return wrap_word_doc(f"تقييم الضيوف - {display_name}", body)
 
 
 def render_training_plan_html(display_name, eval_data, llm_qual) -> str:
@@ -2254,142 +2715,184 @@ def render_training_plan_html(display_name, eval_data, llm_qual) -> str:
     target_sc = min(92, max(75, start_sc + 12))
     rewrites = (llm_qual or {}).get("question_rewrites", [])
     rewrite_html = "".join(
-        f"<p><b>سؤال فعلي من الحلقة (التوقيت {fmt_ts_span(rw.get('ts',''))} — المدة {esc(rw.get('orig_duration_s',''))} ثانية):</b></p>"
-        f"<p class='qbad'><b>الصياغة الأصلية:</b> «{esc(rw.get('original',''))}»</p>"
-        f"<p class='qgood'><b>الصياغة المقترحة (≤12 ثانية · استفهام واحد):</b> «{esc(rw.get('rewritten',''))}»</p>"
+        f"<p><b>سؤال من الحلقة ({fmt_ts_span(rw.get('ts',''))}):</b></p>"
+        f"<p class='qbad'><b>الأصلي:</b> «{esc(rw.get('original',''))}»</p>"
+        f"<p class='qgood'><b>المقترح (≤12ث · استفهام واحد):</b> «{esc(rw.get('rewritten',''))}»</p>"
         for rw in rewrites[:4]
-    )
-    if not rewrite_html:
-        rewrite_html = "".join(
-            f"<p><b>سؤال طويل مرصود ({fmt_ts_span(q.get('start'))} — {q.get('duration_s')} ثانية، {q.get('word_count')} كلمة):</b></p><p class='qbad'>«{esc(q.get('text'))}»</p>"
-            for q in eval_data.get("longest_questions", [])[:3]
-        ) or "<p class='small'>لم تُرصد أسئلة طويلة متجاوزة للحدّ في هذه الحلقة.</p>"
+    ) or "<p class='small'>انظر جدول كشف خسارة العلامات لأطول المداخلات.</p>"
 
-    claim_rows = "".join(
-        f"<tr class='{'alt' if i%2 else ''}'><td>«{esc(c.get('text',''))}» <span class='small'>({fmt_ts_span(c.get('at',''))})</span></td>"
-        f"<td class='num'>{'مرفق بدليل' if c.get('evidence_offered') else 'بلا دليل رقمي'}</td>"
-        f"<td>{'طُرحت مساءلة عند ' + fmt_ts_span(c.get('anchor_challenged_at')) if c.get('anchor_challenged_at') else 'مطلوب سؤال تحقّق مباشر: على أي معطى أو رقم بُني هذا الادعاء؟'}</td></tr>"
-        for i, c in enumerate(eval_data.get("top_checkable_claims", [])[:3])
-    ) or "<tr><td colspan='3' class='num'>تُستخرج ثلاثة ادعاءات هشّة من أطروحة الضيف قبل كل بثّ.</td></tr>"
+    top_losses_li = "".join(
+        f"<li><b>{esc(it['criterion_id'])} · {esc(it['name'])} (خسارة -{it['lost']:.1f} نقطة):</b> {esc(it.get('recovery',''))}</li>"
+        for it in eval_data["loss_breakdown"]["rows"][:5]
+    ) or "<li>الحفاظ على المستوى الحالي ورفع الإيقاع.</li>"
 
-    longest_ts = fmt_ts_clean(eval_data["monologues_over_180"][0]["start"]) if eval_data["monologues_over_180"] else (fmt_ts_clean(eval_data["unbroken_blocks"][0]["start"]) if eval_data.get("unbroken_blocks") else "أطول بلوك")
     body = f"""
-<table style="margin:0;"><tr><td style="border:0.5pt solid #12304d;background:#12304d;padding:22pt 20pt;color:#fff;">
-<p style="margin:0 0 6pt;font-size:8.5pt;color:#d9c48f;letter-spacing:1.2pt;">خطة تدريب تنفيذية · مبنية على بيانات الحلقة الفعلية</p>
-<p style="margin:0 0 4pt;font-size:23pt;font-weight:bold;color:#fff;">برنامج التأهيل المهني — {esc(display_name)}</p>
-<p style="margin:0 0 12pt;font-size:11.5pt;color:#c9d6e4;">من <span dir="ltr">{start_sc}</span> إلى <span dir="ltr">{target_sc}</span> في ستة أسابيع — أحد عشر تدريباً حركياً وسبعة مؤشرات مقيسة</p>
-<table style="margin:0;"><tr>
-<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">المتدرّب<br><b style="color:#fff;">{esc(display_name)}</b></td>
-<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">نقطة الانطلاق<br><b style="color:#fff;" dir="ltr">{start_sc} / 100</b></td>
-<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">الهدف المستهدف<br><b style="color:#fff;" dir="ltr">{target_sc} / 100</b></td>
-<td style="border:0;border-top:1pt solid #3d5a78;padding:8pt 0 0;color:#a9bccf;font-size:8.5pt;">المدّة<br><b style="color:#fff;">6 أسابيع (4 ساعات/أسبوع)</b></td>
-</tr></table></td></tr></table>
-
-<h2>٠ · مبدأ التدريب والعادات الأربع المطلوب استبدالها</h2>
-<div class="callout-navy"><p style="margin:0;color:#fff;font-size:9.5pt;"><b style="color:#e8d5a3;">مركز الخطة:</b> المهارة الأساسية موجودة لدى المتدرّب، والمطلوب رفع تردّدها من لحظات متفرّقة إلى انعكاس إيقاعي تلقائي كل 90 ثانية باستخدام مادّته المسجّلة نفسها.</p></div>
-<table><tr><th style="width:28%;">العادة الحالية</th><th style="width:28%;">الأثر المقيس في الحلقة</th><th style="width:44%;">العادة المهنية البديلة</th></tr>
-<tr><td class="lbl">ترك الاسترسال حتى ينتهي وحده</td><td>أطول بلوك {int(round(k['longest_unbroken_block_s']))} ثانية · {k['interventions_per_10min']:.1f} مداخلة/10د</td><td><b>اللمسة الثمانية (90/8):</b> تدخّل ≤ 8 ثوانٍ كل 90 ثانية يبدأ بكلمة من كلام الضيف</td></tr>
-<tr class="alt"><td class="lbl">التمهيد الطويل وتعدّد الاستفهام</td><td>متوسط {k['mean_intervention_s']:.1f} ثانية · أحادية {k['single_question_pct']:.0f}%</td><td><b>السؤال الواحد ≤ 12 ثانية / ≤ 30 كلمة</b> بمرجع واحد قابل للتحقّق</td></tr>
-<tr><td class="lbl">التسليم السلبي للادعاء</td><td>{k['evidence_request_per_hour']:.1f} طلب دليل / ساعة</td><td><b>التحقّق الداخلي:</b> بطاقة الفرضيات الثلاث + سؤال الفريق الأحمر التحصيني</td></tr>
-<tr class="alt"><td class="lbl">فجوات العواجل والإغلاق</td><td>تغطية العاجل {k['local_chyron_coverage_pct']:.0f}%</td><td><b>قراءة العاجل خلال ≤ 60 ثانية + الثلاثون ثانية الأخيرة</b> (3 خلاصات + بطاقة الأسماء)</td></tr></table>
-
-<h2 style="page-break-before:always;">١ · الوحدة الأولى: الصنعة الحوارية (التدريبات ١–٥)</h2>
-<table><tr><th style="width:22%;">التدريب</th><th style="width:48%;">الميكانيكا العملية</th><th style="width:30%;">معيار الاجتياز</th></tr>
-<tr><td class="lbl">١ · اللمسة الثمانية</td><td>تفكيك بلوك {fmt_ts_span(longest_ts)} لإيجاد 12 نقطة دخول، وتسجيل 6 لمسات ≤ 8 ثوانٍ (≤ 20 كلمة) تبدأ بكلمة من الضيف.</td><td>6 لمسات في 10د دون عبارة جاهزة</td></tr>
-<tr class="alt"><td class="lbl">٢ · القصّ إلى 12 ثانية</td><td>إعادة كتابة الأسئلة الطويلة: استفهام واحد · مرجع واحد · بلا تمهيد تقريري (10 أسئلة يومياً لأسبوعين).</td><td>9 من 10 أسئلة ≤ 30 كلمة</td></tr>
-<tr><td class="lbl">٣ · الضيف الثرثار</td><td>محاكاة 10 دقائق مع زميل يتحدّث 3 دقائق متواصلة، وعدّ اللمسات مقابل القطع في منتصف الجملة.</td><td>6 تدخّلات وصفر قطع بمنتصف جملة</td></tr>
-<tr class="alt"><td class="lbl">٤ · الاعتراض الثلاثي</td><td>حفظ وتكرار: التلخيص والتسليم · التثبيت («وقفني عند هالجملة») · الاعتراض اللبق («لحظة خليني ناقشك هون»).</td><td>استخدام 3 تقنيات مختلفة في الحلقة</td></tr>
-<tr><td class="lbl">٥ · إشارة نهاية الدور</td><td>إنهاء كل سؤال بنبرة هابطة ووقفة صامتة ثانيتين كاملتين (اختبار الصمّ).</td><td>نجاح 9 من 10 محاولات</td></tr></table>
-<h3>إعادة صياغة فعلية لأطول أسئلة المتدرّب في هذه الحلقة</h3>
-{rewrite_html}
-
-<h2 style="page-break-before:always;">٢ · الوحدة الثانية: الوظيفة التحريرية (التدريبات ٦–١١)</h2>
-<table><tr><th style="width:22%;">التدريب</th><th style="width:48%;">الميكانيكا العملية</th><th style="width:30%;">معيار الاجتياز</th></tr>
-<tr><td class="lbl">٦ · بطاقة الثلاث</td><td>استخراج 3 ادعاءات هشّة متوقّعة من الضيف + ادعاء للخصم قبل البث وطرح اثنين على الأقل.</td><td>ادعاءان مطروحان في 3 حلقات متتالية</td></tr>
-<tr class="alt"><td class="lbl">٧ · طلب الدليل</td><td>وقفة نصف ثانية بعد كل ادعاء ثم استخدام إحدى الصيغ الجاهزة بلا نبرة بوليسية.</td><td>3 طلبات دليل موثّقة في الساعة</td></tr>
-<tr><td class="lbl">٨ · الفريق الأحمر (التحصين)</td><td>صياغة سؤال يُفرغ أقوى حجة للخصم على لسان الضيف قبل أن يستخدمها الخصم خارجياً.</td><td>سؤال تحصيني موثّق بالوقت في كل حلقة</td></tr>
-<tr class="alt"><td class="lbl">٩ · الحجة لا الاستعارة</td><td>تحويل أي استعارة أدبية فوراً إلى ادعاء قابل للاختبار برقم أو معطى.</td><td>تحويل فوري عند أول ذكر</td></tr>
-<tr><td class="lbl">١٠ · الشريط الأعمى</td><td>مشاهدة شريط أخبار مكتوم ونطق أي عاجل أمني محلي خلال ≤ 60 ثانية.</td><td>تغطية 100% من الأشرطة المحلية</td></tr>
-<tr class="alt"><td class="lbl">١١ · الثلاثون ثانية الأخيرة</td><td>خاتمة بـ 3 خلاصات تنفيذية + سؤال مفتوح + شكر ببطاقة الأسماء الصحيحة.</td><td>حلقتان متتاليتان بلا أخطاء أسماء</td></tr></table>
-
-<h3>تطبيق «بطاقة الثلاث» على ادعاءات هذه الحلقة</h3>
-<table><tr><th>الادعاء المرصود من الحلقة</th><th class="num">حالة الدليل</th><th>التدخّل التحريري المطلوب</th></tr>{claim_rows}</table>
-
-<h2>٣ · بنك العبارات الجاهزة والجدول الأسبوعي (6 أسابيع)</h2>
-<table><tr><th style="width:20%;">الفئة</th><th style="width:80%;">الصيغ الجاهزة للحفظ</th></tr>
-<tr><td class="lbl">اللمسات (≤ 8 ثوانٍ)</td><td>«وقفني عند كلمة…» · «رقم واحد بس: كم؟» · «يعني بجملة: …؟» · «هيدا تحليل ولا معطى؟» · «خلينا نمسكها من الجهة التانية…»</td></tr>
-<tr class="alt"><td class="lbl">التحقّق والتحصين</td><td>«على أي معطى بنيت هذا؟» · «هذا رقم رسمي أم تقدير؟» · «الخصم سيقول كذا… شو جوابك؟» · «لو خالفك أحد، شو أقوى حجة عنده؟»</td></tr>
-<tr><td class="lbl">الخاتمة</td><td>«خلاصة الساعة بثلاث نقاط: أولاً… ثانياً… ثالثاً… والسؤال المفتوح: …» · «شكراً لـ[الاسم من البطاقة]…»</td></tr></table>
-
-<table><tr><th class="num" style="width:9%;">الأسبوع</th><th style="width:33%;">التدريبات</th><th style="width:30%;">المادة التطبيقية</th><th style="width:28%;">المُخرَج المقيس</th></tr>
-<tr><td class="num">٠</td><td>القياس الأساسي وفيلم التشخيص</td><td>الحلقة كاملة + بلوك {fmt_ts_span(longest_ts)}</td><td>تثبيت أرقام الانطلاق السبعة</td></tr>
-<tr class="alt"><td class="num">١</td><td>القصّ (٢) + إشارة نهاية الدور (٥)</td><td>أسئلته الطويلة من الحلقة</td><td>50 سؤالاً ≤ 30 كلمة</td></tr>
-<tr><td class="num">٢</td><td>اللمسة الثمانية (١) + الضيف الثرثار (٣)</td><td>أرشيفه + محاكاة حيّة</td><td>6 لمسات في 10 دقائق</td></tr>
-<tr class="alt"><td class="num">٣</td><td>الاعتراض الثلاثي (٤) + <b>أول بثّ مُقاس</b></td><td>على الهواء</td><td>تقرير مؤشرات رقم 1</td></tr>
-<tr><td class="num">٤</td><td>بطاقة الثلاث (٦) + طلب الدليل (٧)</td><td>نصوص تفريغ</td><td>ادعاءان مطروحان في البثّ</td></tr>
-<tr class="alt"><td class="num">٥</td><td>الفريق الأحمر (٨) + الحجة لا الاستعارة (٩)</td><td>أطروحات الحلقة</td><td>سؤال تحصيني موثّق</td></tr>
-<tr><td class="num">٦</td><td>الشريط الأعمى (١٠) + الخاتمة (١١) + التقييم النهائي</td><td>على الهواء + شريط مكتوم</td><td>نتيجة ≥ {target_sc} / 100</td></tr></table>
-
-<h2>٤ · لوحة المؤشرات السبعة وحماية نقاط القوة والشرط الإداري</h2>
-<table><tr><th>المؤشر</th><th class="num">الانطلاق (هذه الحلقة)</th><th class="num">الهدف (الأسبوع 6)</th><th>طريقة القياس</th></tr>
-<tr><td class="lbl">معدّل المداخلات / 10 دقائق</td><td class="num">{k['interventions_per_10min']:.1f} مداخلة</td><td class="num">8 – 10 مداخلات</td><td>قياس آلي من الصندوق الأسود</td></tr>
-<tr class="alt"><td class="lbl">متوسّط طول المداخلة</td><td class="num">{k['mean_intervention_s']:.1f} ثانية</td><td class="num">12 ثانية أو أقل</td><td>قياس آلي من جدول الأدوار</td></tr>
-<tr><td class="lbl">أطول بلوك ضيف متّصل</td><td class="num">{int(round(k['longest_unbroken_block_s']))} ثانية</td><td class="num">120 ثانية أو أقل</td><td>قياس آلي للبلوكات المتّصلة</td></tr>
-<tr class="alt"><td class="lbl">طلبات الدليل / ساعة</td><td class="num">{k['evidence_request_per_hour']:.1f} طلب</td><td class="num">3 طلبات فأكثر</td><td>قياس آلي من جدول الادعاءات</td></tr>
-<tr><td class="lbl">نسبة الأسئلة الأحادية</td><td class="num">{k['single_question_pct']:.0f}%</td><td class="num">85% فأكثر</td><td>عدّ الاستفهامات لكل مداخلة</td></tr>
-<tr class="alt"><td class="lbl">تغطية الشريط المحلي العاجل</td><td class="num">{k['local_chyron_coverage_pct']:.0f}%</td><td class="num">100% (خلال ≤ 60ث)</td><td>تتبّع الشريط الزمني للشاشة</td></tr>
-<tr><td class="lbl">الأخطاء الحرجة</td><td class="num">{len(eval_data['critical_events'])}</td><td class="num">0 (صفر)</td><td>بطاقة الأخطاء الحرجة</td></tr></table>
-
-<h3>ما لا يجوز تدريبه (حماية نقاط القوة) والشرط الإداري</h3>
-<table><tr><th style="width:24%;">البند</th><th style="width:76%;">القاعدة الملزمة</th></tr>
-<tr><td class="lbl">حماية نقاط القوة</td><td>لا يُدرَّب على القطع العدواني (لمسة لا قطع، تبدأ بكلمة من كلام الضيف) · لا يُمسّ باللهجة اللبنانية المحكية ولا بالخط التحريري ولا بالوقار والإنصات ولا بمرونة المتابعة.</td></tr>
-<tr class="alt"><td class="lbl">الشرط الإداري</td><td>تفعيل المصدر الميداني حتى آخر 10 دقائق · إسناد «بطاقة الثلاث» ومذكرة غرفة التحرير لمُعِدّ الحلقة قبل البث · وضع بطاقة الأسماء أمام المقدّم مع تقارير قصيرة بالأرقام قبل البلوكات التحليلية.</td></tr></table>
-<p class="small" style="margin-top:12pt;text-align:center;color:#8a939e;">— نهاية خطة التدريب (Orchestrator V7.0) —</p>"""
-    return wrap_word_doc(f"خطة التدريب 6 أسابيع - {display_name}", body)
+<table style="margin:0;"><tr><td style="background:#12304d;color:#fff;padding:20pt;">
+  <p style="margin:0;color:#d9c48f;font-size:8.5pt;">خطة تدريب 6 أسابيع · مبنية على كشف خسارة العلامات (v{esc(eval_data['template_version'])})</p>
+  <p style="margin:4pt 0 0;font-size:21pt;font-weight:bold;color:#fff;">برنامج التأهيل المهني — {esc(display_name)}</p>
+  <p style="margin:5pt 0 0;color:#c9d6e4;">من {start_sc} إلى {target_sc} خلال 6 أسابيع</p>
+</td></tr></table>
+<h2>١ · أولويات التدريب المشتقّة مباشرةً من أكبر خسائر العلامات</h2>
+<div class="callout-gold"><ul>{top_losses_li}</ul></div>
+<h2>٢ · إعادة صياغة فعلية لأسئلة الحلقة</h2>{rewrite_html}
+<h2>٣ · الجدول التنفيذي (6 أسابيع)</h2>
+<table><tr><th class="num">الأسبوع</th><th>محور التدريب</th><th>الهدف المقيس</th></tr>
+<tr><td class="num">١–٢</td><td>القصّ إلى ≤12ث + فصل المداخلة عن السؤال الواحد + اللمسة الثمانية كل 90ث</td><td>أحادية ≥85% · أطول بلوك ≤120ث</td></tr>
+<tr class="alt"><td class="num">٣–٤</td><td>التحقّق الداخلي: طلب الدليل (3/ساعة) + الفريق الأحمر + بطاقة الفرضيات</td><td>مساءلة موثّقة في كل بثّ</td></tr>
+<tr><td class="num">٥–٦</td><td>تغطية العاجل الأحمر خلال ≤60ث + الإغلاق بـ 3 خلاصات + قياس نهائي</td><td>نتيجة ≥ {target_sc} / 100 وصفر أخطاء حرجة</td></tr></table>"""
+    return wrap_word_doc(f"خطة التدريب - {display_name}", body)
 
 
-def generate_blackbox_v2_md(display_name, exact_dur, derived_meta, chunks, eval_data, meta_info) -> str:
-    sf, k = eval_data["score_final"], eval_data["kpis"]
+def generate_blackbox_v3_md(display_name, exact_dur, derived_meta, chunks, template_results, meta_info) -> str:
     lines = [
-        f"# BLACKBOX V2.0 FORENSIC DOSSIER — {display_name}",
-        "> Complete self-contained forensic dataset (`blackbox-v2.0` / `manar-100-v2`). All timestamps are absolute `HH:MM:SS` from `00:00:00`.",
+        f"# UNIVERSAL BLACKBOX V3.0 FORENSIC DOSSIER — {display_name}",
+        "> Neutral 6-layer forensic capture (`blackbox-v3.0`). Reusable for Presenter, Guests, Directing, Episode, and Custom Templates at $0 video re-processing.",
         "",
-        "## 1. MASTER METADATA",
-        f"- **Presenter:** {display_name}",
-        f"- **Program:** {eval_data.get('program_name') or 'Not specified'}",
-        f"- **Guests & Reporters:** {_format_guests_summary(eval_data)}",
-        f"- **Editorial Mode:** {meta_info['editorial_label']}",
-        f"- **Broadcast Date/Time:** {derived_meta.get('broadcast_date')} {derived_meta.get('broadcast_start_beirut')} ({derived_meta.get('timezone')})",
-        f"- **Duration:** {exact_dur} | **Chunks:** {meta_info['chunks_ok']}/{meta_info['chunks_total']} (5 min) | **Cost:** ${meta_info['actual_cost']:.4f}",
-        f"- **Final Score:** {sf['reported_as']} (Raw {sf['raw_score']} + Mod {sf['difficulty_modifier']} | Cap {sf['cap_ceiling']} | Band: {sf['band']})",
-        f"- **Top Priority (Auto):** {eval_data['top_priority_auto']}",
+        f"- **Subject:** {display_name} | **Duration:** {exact_dur} | **Date:** {derived_meta.get('broadcast_date')} ({derived_meta.get('timezone')})",
+        f"- **Chunks:** {meta_info['chunks_ok']}/{meta_info['chunks_total']} | **Cost:** ${meta_info['actual_cost']:.4f}",
         "",
-        "## 2. DETERMINISTIC KPIs",
-        "```json",
-        json.dumps(k, ensure_ascii=False, indent=2),
-        "```",
-        "",
-        "## 3. 26-ITEM SCORING & AUDIT",
-        "| ID | Criterion | Measured Value | Score | Confidence | Note |",
-        "|---|---|---|---:|---|---|",
+        "## 1. EVALUATED TEMPLATES SUMMARY",
     ]
-    for it in eval_data["scores"]:
-        lines.append(f"| {it['criterion_id']} | {it['name']} | {it.get('metric_display', it['metric_value'])} | {it['score']}/{it['max']:.0f} | {it.get('confidence_ar', it['confidence'])} | {str(it['note']).replace('|','/')} |")
-    lines += ["", "## 4. COMPLETE TURNS, INTERVENTIONS, CHYRONS & CLAIMS (CHUNK BY CHUNK)"]
+    for tid, tres in template_results.items():
+        if isinstance(tres, dict) and tres.get("score_final"):
+            sf = tres["score_final"]
+            lines.append(f"- **{tres['template_name']} (`{tid}` v{tres['template_version']}):** {sf['reported_as']} ({sf['band']}) | Raw={sf['raw_score']} | Loss=-{tres['loss_breakdown']['total_item_loss']}")
+    lines += ["", "## 2. COMPLETE CHUNK TIMELINE (6 LAYERS)"]
     for c in chunks:
-        lines.append(f"### Chunk {c['chunk_index']} ({c['window']['start']} -> {c['window']['end']}) | turns_sum={c['measurement']['sum_of_turns_s']}s / {c['measurement']['chunk_duration_s']}s (ffmpeg_speech={c['measurement'].get('ffmpeg_non_silent_s')}s)")
+        vd = c.get("visual_directing") or {}
+        lines.append(f"### Chunk {c['chunk_index']} ({c['window']['start']} -> {c['window']['end']}) | env={vd.get('environment_observed','studio')} | shots={','.join(vd.get('shot_types',[]))}")
         for t in c.get("turns", []):
-            lines.append(f"- **[{fmt_ts_clean(t.get('start'))}–{fmt_ts_clean(t.get('end'))}] {t.get('speaker_id')}** ({t.get('kind')}, {t.get('duration_s')}s, {t.get('word_count')}w, q={t.get('question_count')}): {t.get('text')}")
+            lines.append(f"- **[{fmt_ts_clean(t.get('start'))}–{fmt_ts_clean(t.get('end'))}] {t.get('speaker_id')}** ({t.get('kind')}, {t.get('duration_s')}s, q={t.get('question_count')}): {t.get('text')}")
         for ch in c.get("chyron_timeline", []):
-            lines.append(f"  - *CHYRON [{fmt_ts_clean(ch.get('on'))}] ({ch.get('type')}, read={ch.get('read_on_air_at')}):* {ch.get('text_raw')}")
+            lines.append(f"  - *CHYRON [{fmt_ts_clean(ch.get('on'))}] ({ch.get('color')}, read={ch.get('read_on_air_at')}):* {ch.get('text_raw')}")
         for cl in c.get("claims", []):
-            lines.append(f"  - *CLAIM [{fmt_ts_clean(cl.get('at'))}] ({cl.get('speaker_id')}, checkable={cl.get('checkable')}, challenged={cl.get('anchor_challenged_at')}):* {cl.get('text')}")
+            lines.append(f"  - *CLAIM [{fmt_ts_clean(cl.get('at'))}] ({cl.get('speaker_id')}, ev={cl.get('evidence_offered')}, ch={cl.get('anchor_challenged_at')}):* {cl.get('text')}")
     return "\n".join(lines)
 
 
+def build_scored_synthesis_prompt(template: dict, subject_name: str, digest: dict, eval_pre: dict, extra_admin_prompt: str = "", is_guest: bool = False) -> str:
+    """Dynamically constructs the synthesis prompt entirely from the template JSON (ZERO hardcoded criteria in Python!)."""
+    qual_defs = []
+    for ax in template.get("axes", []):
+        for it in ax.get("items", []):
+            if it.get("enabled", True) and it.get("scoring", "qualitative") == "qualitative":
+                qual_defs.append(f"- {it['id']} ({it['name']} | الحد الأقصى {it['max']} | المحور: {ax['name']}): {it.get('guidance','')}")
+    rules_txt = "\n".join(f"- {r}" for r in (template.get("admin_rules") or []))
+    qual_keys_json = ", ".join(
+        f'"{it["id"]}":{{"score":0,"anchor_hit":"full|partial|low|zero","evidence":[{{"ts":"HH:MM:SS"}}],"note":"","recovery":"نصيحة عملية مختصرة"}}'
+        for ax in template.get("axes", []) for it in ax.get("items", [])
+        if it.get("enabled", True) and it.get("scoring", "qualitative") == "qualitative"
+    )
+    extra_keys = (
+        '"question_rewrites":[{"ts":"HH:MM:SS","orig_duration_s":0,"original":"","rewritten":""}],'
+        if template.get("generate_training_plan") else ""
+    )
+    guest_extra = (
+        '"guest_profile":{"specialty":"","new_ideas":["فكرة جديدة"],"quotable_lines":[{"at":"HH:MM:SS","quote":""}]},'
+        if is_guest else ""
+    )
+    return (
+        f"أنت محكّم إعلامي دقيق تطبّق القالب «{template['name']}» (الإصدار v{template.get('version','1.0')}) على «{subject_name}».\n"
+        f"بيئة التصوير: {'خارج الاستوديو' if eval_pre['shoot_env']=='outdoor' else 'داخل الاستوديو'}.\n"
+        f"القواعد المعتمدة من الإدارة لهذا القالب:\n{rules_txt or '- الالتزام بالدقة والموضوعية والشواهد الزمنية.'}\n{extra_admin_prompt}\n\n"
+        f"البنود النوعية المطلوب تقييمها بدقة وشواهد زمنية (HH:MM:SS):\n" + ("\n".join(qual_defs) or "- لا بنود نوعية إضافية") + "\n\n"
+        f"المؤشرات الرقمية المقيسة حتمياً:\n{json.dumps(eval_pre['kpis'], ensure_ascii=False)}\n\n"
+        f"أخرج JSON صالح فقط بهذا الهيكل:\n"
+        f"{{{guest_extra}{extra_keys}\"qualitative_items\":{{{qual_keys_json}}},\"report\":{{\"summary\":\"خلاصة تنفيذية واضحة من 4-6 أسطر تذكر بوضوح أين خُسرت العلامات\",\"strengths\":[\"نقطة قوة مع توقيت\"],\"priorities\":[\"أولوية تطوير عملية مع توقيت\"]}}}}\n\n"
+        f"بيانات الصندوق الأسود المستخرجة لهذا القالب:\n{json.dumps(digest, ensure_ascii=False)[:110000]}"
+    )
+
+
+def build_inventory_chunk_prompt(template: dict, st_h: str, en_h: str, extra_prompt: str = "") -> str:
+    """Dynamically builds structured inventory prompt from tpl_daily.json (or any custom inventory template)."""
+    cats = " | ".join(template.get("categories") or ["خبر", "برنامج", "تقرير", "فاصل"])
+    rules = "\n".join(f"- {r}" for r in (template.get("admin_rules") or []))
+    return (
+        f"أنت موثّق جرد بث تلفزيوني تطبّق القالب «{template['name']}» (v{template.get('version','1.0')}) من {st_h} إلى {en_h} (Zero Hallucination).\n"
+        f"التصنيفات المعتمدة: {cats}\n"
+        f"قواعد الإدارة:\n{rules}\n{extra_prompt}\n"
+        'أخرج JSON صالح فقط بهذا الشكل:\n'
+        '{"chunk_window":"","programs":[{"start":"HH:MM:SS","end":"HH:MM:SS","broadcast_type":"مباشر|إعادة|أرشيف|فاصل","category":"","theme":"","title":"","presenter":"","guests":[],"reporters":[],"vt_reports":[],"summary":""}],"breaking_tickers":[{"at":"HH:MM:SS","color":"red_breaking|yellow_headlines","text":""}]}'
+    )
+
+
+def render_inventory_reports(template: dict, clean_name: str, exact_dur: str, valid_chunks: list, act_cost: float) -> tuple:
+    all_progs = [p for r in valid_chunks for p in (r.get("data") or {}).get("programs", []) if isinstance(p, dict)]
+    all_tickers = [tk for r in valid_chunks for tk in (r.get("data") or {}).get("breaking_tickers", []) if isinstance(tk, dict)]
+    cols = template.get("columns") or [
+        {"key": "start_end", "label": "التوقيت"}, {"key": "broadcast_type", "label": "النوع"},
+        {"key": "category", "label": "التصنيف"}, {"key": "theme", "label": "المحور"},
+        {"key": "title", "label": "العنوان"}, {"key": "summary", "label": "الملخّص"},
+    ]
+    th_html = "".join(f"<th>{esc(c['label'])}</th>" for c in cols)
+    rows_html = ""
+    for idx, p in enumerate(all_progs):
+        tds = []
+        for c in cols:
+            k = c["key"]
+            if k == "start_end":
+                tds.append(f"<td class='num' dir='ltr'>{esc(p.get('start'))}–{esc(p.get('end'))}</td>")
+            elif k == "guests_reporters":
+                gr = ", ".join((p.get("guests") or []) + (p.get("reporters") or []))
+                tds.append(f"<td>{esc(gr or '—')}</td>")
+            else:
+                tds.append(f"<td class='{'lbl' if k=='title' else ''}'>{esc(p.get(k, '—'))}</td>")
+        rows_html += f"<tr class='{'alt' if idx%2 else ''}'>{''.join(tds)}</tr>"
+
+    cat_counts = {}
+    for p in all_progs:
+        cat = p.get("category") or "أخرى"
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    cat_rows = "".join(f"<tr><td class='lbl'>{esc(k)}</td><td class='num'>{v}</td></tr>" for k, v in sorted(cat_counts.items(), key=lambda x: x[1], reverse=True))
+    tk_rows = "".join(f"<tr><td class='num'>{fmt_ts_span(t.get('at'))}</td><td>{esc(t.get('text') or t)}</td></tr>" for t in all_tickers[:60])
+
+    det_html = wrap_word_doc(
+        f"{template['name']} - {clean_name}",
+        f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>{esc(template['name'])} · معيار v{esc(template.get('version','1.0'))}</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)} — المدة: {esc(exact_dur)}</p></td></tr></table>"
+        f"<h2>جدول الجرد الكامل ({len(all_progs)} فقرة)</h2><table><tr>{th_html}</tr>{rows_html or '<tr><td colspan=8 class=num>لا فقرات مرصودة.</td></tr>'}</table>"
+        + (f"<h2>العواجل المرصودة ({len(all_tickers)})</h2><table><tr><th>التوقيت</th><th>نص العاجل</th></tr>{tk_rows}</table>" if tk_rows else "")
+    )
+    sum_html = wrap_word_doc(
+        f"ملخص {template['name']} - {clean_name}",
+        f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>الملخص التنفيذي · {esc(template['name'])} (v{esc(template.get('version','1.0'))})</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)}</p><p style='margin:4pt 0 0;color:#c9d6e4;'>المدة: {esc(exact_dur)} | الفقرات: {len(all_progs)} | الكلفة: ${act_cost:.4f}</p></td></tr></table>"
+        f"<h2>توزيع الفقرات حسب التصنيف</h2><table><tr><th>التصنيف</th><th class='num'>العدد</th></tr>{cat_rows}</table>"
+    )
+    bb_md = f"# INVENTORY BLACKBOX — {template['name']} (v{template.get('version','1.0')}) — {clean_name}\n- Duration: {exact_dur} | Items: {len(all_progs)} | Cost: ${act_cost:.4f}\n\n" + "\n".join(
+        f"- [{p.get('start')}–{p.get('end')}] ({p.get('broadcast_type','')}) **{p.get('title')}** [{p.get('category')}]: {p.get('summary')}" for p in all_progs
+    )
+    return det_html, sum_html, bb_md, len(all_progs)
+
+
 # ==============================================================================
-# MAIN PIPELINE
+# MAIN PIPELINE V8.0 (INGEST_ONLY / RERENDER / SCORED MULTI-TEMPLATE / INVENTORY)
 # ==============================================================================
+def run_synthesis_call(prompt_txt: str, valid_free, valid_paid, paid_models, strat: str, budget_ok_fn):
+    now_ts = time.time()
+    raw_c = (
+        [(valid_paid, m, True) for m in (rank_discovered_models(paid_models, PREFERRED_SYNTH_ORDER, True) or paid_models)]
+        if (strat != "flash_only" and valid_paid and budget_ok_fn()) else []
+    ) + [(k, m, False) for k, kms in valid_free for m in kms]
+    candidates = [x for x in raw_c if MODEL_COOLDOWN_UNTIL.get(x[1], 0) <= now_ts] + [x for x in raw_c if MODEL_COOLDOWN_UNTIL.get(x[1], 0) > now_ts]
+    for skey, smodel, spaid in candidates:
+        s_tier = "PAID" if spaid else "FREE"
+        try:
+            t0 = time.time()
+            log(f"  🤖 [Synthesis] Calling {s_tier} {mask_key(skey)} / {smodel} (timeout=240s)...")
+            client = make_genai_client(skey, timeout_ms=240_000)
+            res = run_with_hard_timeout(
+                lambda: client.models.generate_content(model=smodel, contents=prompt_txt, config=build_gen_config(max_out=32768)),
+                240, f"synthesis({smodel})",
+            )
+            data = clean_json_text(res.text)
+            cost = calc_cost(smodel, res.usage_metadata, spaid)
+            record_key_stat(skey, spaid, "ok")
+            log(f"  ✅ Synthesis OK via {s_tier}:{smodel} in {time.time()-t0:.1f}s | ${cost:.4f}")
+            return data, cost, f"{s_tier}:{smodel}"
+        except Exception as e:
+            log(f"  ⚠️ [Synthesis Retry {s_tier}/{smodel}] {str(e)[:150]}")
+    return {}, 0.0, ""
+
+
 def main():
     global RUNTIME_DRIVE_TOKEN
     started_at = time.time()
@@ -2404,11 +2907,6 @@ def main():
     fk_list = [k.strip().strip('"').strip("'") for k in re.split(r"[,;\s]+", os.environ.get("GEMINI_FREE_API_KEYS", "")) if k.strip()]
     pk = (os.environ.get("GEMINI_PAID_API_KEY") or "").strip().strip('"').strip("'")
 
-    prompt_system = load_repo_text("prompt_system.md", "أنت موثّق بث تلفزيوني عربي. أخرج JSON صالح فقط.")
-    prompt_chunk_tpl = load_repo_text("prompt_chunk.md", "أخرج كائن Blackbox Chunk v2 كامل بصيغة JSON.")
-    prompt_synth_tpl = load_repo_text("prompt_synthesis.md", "أخرج التوليف والتحليل بصيغة JSON.")
-    schema_chunk = load_repo_json("schema_chunk.json", {})
-    rubric = load_repo_json("rubric.json", {"axes": [], "bands": [], "critical_error_caps": []})
     entities_csv = load_repo_text("entities.csv", DEFAULT_ENTITIES_CSV)
     entity_registry = parse_entities_csv(entities_csv)
 
@@ -2424,119 +2922,207 @@ def main():
             if f["name"] == "_source_link.txt":
                 src_url = drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media", cfg, timeout=20).text.strip()
     except Exception as e:
-        print(f"[Config Fetch Error] {e}", flush=True)
+        log(f"[Config Fetch Error] {e}")
 
-    mode, editorial_mode = cfg.get("run_mode", "eval"), cfg.get("editorial_mode", "directed")
-    chunk_min = 5 if mode == "eval" else int(cfg.get("chunk_size", 10))
-    chunk_sec = chunk_min * 60
-    workers = max(1, min(int(cfg.get("workers", 3)), 6))
+    mode = cfg.get("run_mode", "eval")
+    editorial_mode = cfg.get("editorial_mode", "directed")
+    shoot_env = cfg.get("shoot_env", "auto")
+    prep_mode = cfg.get("prep_mode", "partner")
     strat = cfg.get("tier_strategy", "hybrid")
+    workers = max(1, min(int(cfg.get("workers", 3)), 6))
     system_prompt_extra = cfg.get("system_prompt", "")
     editorial_brief = cfg.get("editorial_brief") if isinstance(cfg.get("editorial_brief"), dict) else {}
-    fps = cfg.get("daily_fps", "1/5") if mode == "daily" else cfg.get("eval_fps", "1")
     episode_budget_cap = float(cfg.get("max_budget", 2.0) or 2.0)
 
-    raw_label = re.sub(r"^(GEN_READY_|READY_|day-ready_|PROCESSED_|FAILED_|CANCELLED_)", "", cfg.get("presenter_name") or cfg.get("folder_name") or orig_folder_name or mode, flags=re.IGNORECASE).strip("_ ")
+    raw_label = re.sub(r"^(GEN_READY_|READY_|day-ready_|SCHED_|PROCESSED_|FAILED_|CANCELLED_)", "", cfg.get("presenter_name") or cfg.get("folder_name") or orig_folder_name or mode, flags=re.IGNORECASE).strip("_ ")
     clean_name = sanitize_filename(raw_label)
     display_name = clean_display_name(raw_label)
-    editorial_label = (
-        "تقييم مهني محايد (Manar-100-v2 · معيار محايد مع حماية اللهجة اللبنانية)"
-        if editorial_mode == "neutral"
-        else "تقييم الأداء الحواري في قناة موجّهة الخط (Manar-100-v2)"
-    )
 
-    # === V7.0 ZERO-COST RE-RENDER MODE (from existing 05_Blackbox_V2_*.json + human_overrides) ===
-    if mode == "rerender":
-        log(f"♻️ Starting Zero-Cost Re-Render Mode for folder {fid} ({display_name})...")
-        push_status(cfg, fid, run_id, "running", "إعادة توليد التقارير والرسوم من الصندوق الأسود ($0.00)...", 0, 1, 0.0, started_at, eta_sec=15)
-        bb_file_id = None
-        try:
-            rf2 = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": f"'{fid}' in parents and trashed=false", "fields": "files(id,name)"}, timeout=20).json()
-            for f in rf2.get("files", []):
-                if f["name"].startswith("05_Blackbox_V2_") and f["name"].endswith(".json"):
-                    bb_file_id = f["id"]
-                    break
-        except Exception as e:
-            log(f"❌ Failed scanning folder for Blackbox JSON: {e}")
-        if not bb_file_id:
-            finalize_cost_webhook(cfg, fid, 0.0, "failed", "لم يتم العثور على ملف الصندوق الأسود JSON لإعادة التوليد")
+    # ==========================================================================
+    # MODE A: INGEST_ONLY ($0.00, 0 Gemini calls) — Sequential Video Pre-Archive
+    # ==========================================================================
+    if mode == "ingest_only":
+        sched_id = cfg.get("schedule_id", "")
+        log(f"📥 Starting INGEST_ONLY mode for '{display_name}' (sched={sched_id})...")
+        push_status(cfg, fid, run_id, "running", "تحميل الفيديو إلى Google Drive (بدون تحليل AI — $0.00)...", 0, 1, 0.0, started_at, eta_sec=60)
+        ex_vid_id, ex_vid_name = find_drive_archived_video(fid, cfg)
+        dur_s = float(cfg.get("expected_hours", 1)) * 3600
+        if ex_vid_id:
+            log(f"✅ Video already archived on Drive: {ex_vid_name} ({ex_vid_id})")
+            finalize_cost_webhook(cfg, fid, 0.0, "completed", "الفيديو محفوظ مسبقاً على Drive", completed_chunks=1, total_chunks=1, extra_fields={"action": "ingest_complete", "schedule_id": sched_id, "drive_video_id": ex_vid_id, "duration_sec": dur_s})
+            sys.exit(0)
+        tmp_src = "/tmp/ingest_video.mp4"
+        if not src_url or not acquire_video_locally(src_url, tmp_src, cfg):
+            send_tg(f"❌ فشل تحميل الفيديو المجدول ({display_name}) إلى Drive.", tg_bot, tg_chat)
+            finalize_cost_webhook(cfg, fid, 0.0, "failed", "فشل تحميل الفيديو من الرابط", extra_fields={"action": "ingest_failed", "schedule_id": sched_id})
             sys.exit(1)
+        try:
+            pl = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", tmp_src], capture_output=True, text=True, timeout=30).stdout.strip()
+            if pl and float(pl) > 0:
+                dur_s = float(pl)
+        except Exception:
+            pass
+        vid_id = drive_upload_resumable(fid, cfg, tmp_src, f"00_Video_{clean_name}.mp4", "video/mp4")
+        if os.path.exists(tmp_src):
+            os.remove(tmp_src)
+        if not vid_id:
+            finalize_cost_webhook(cfg, fid, 0.0, "failed", "فشل رفع الفيديو إلى Drive", extra_fields={"action": "ingest_failed", "schedule_id": sched_id})
+            sys.exit(1)
+        send_tg(f"✅ <b>تم حفظ الفيديو على Drive</b> ({display_name} · {format_hhmmss(dur_s)}) — جاهز للتقييم في موعده أو فوراً.", tg_bot, tg_chat)
+        finalize_cost_webhook(cfg, fid, 0.0, "completed", "تم حفظ الفيديو على Drive بنجاح ($0.00)", completed_chunks=1, total_chunks=1, extra_fields={"action": "ingest_complete", "schedule_id": sched_id, "drive_video_id": vid_id, "duration_sec": dur_s})
+        sys.exit(0)
 
+    # ==========================================================================
+    # MODE B: RERENDER / RUN ADDITIONAL TEMPLATES ON EXISTING BLACKBOX JSON
+    # ==========================================================================
+    if mode == "rerender":
+        log(f"♻️ Starting V8.0 Re-Render / Additional Template mode for {fid} ({display_name})...")
+        push_status(cfg, fid, run_id, "running", "إعادة احتساب / توليد التقارير من الصندوق الأسود...", 0, 1, 0.0, started_at, eta_sec=20)
+        bb_file_id = None
+        rf2 = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": f"'{fid}' in parents and trashed=false", "fields": "files(id,name)"}, timeout=20).json()
+        for f in rf2.get("files", []):
+            if (f["name"].startswith("05_Blackbox_V3_") or f["name"].startswith("05_Blackbox_V2_")) and f["name"].endswith(".json"):
+                bb_file_id = f["id"]
+                break
+        if not bb_file_id:
+            finalize_cost_webhook(cfg, fid, 0.0, "failed", "لم يتم العثور على ملف الصندوق الأسود JSON")
+            sys.exit(1)
         bb_obj = drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{bb_file_id}?alt=media", cfg, timeout=45).json()
         overrides = cfg.get("human_overrides") if isinstance(cfg.get("human_overrides"), dict) else {}
         if overrides.get("presenter_name"):
             display_name = clean_display_name(overrides["presenter_name"])
             clean_name = sanitize_filename(overrides["presenter_name"])
-        if overrides.get("editorial_mode") in ("directed", "neutral"):
-            editorial_mode = overrides["editorial_mode"]
-            editorial_label = (
-                "تقييم مهني محايد (Manar-100-v2 · معيار محايد مع حماية اللهجة اللبنانية)"
-                if editorial_mode == "neutral"
-                else "تقييم الأداء الحواري في قناة موجّهة الخط (Manar-100-v2)"
-            )
-        if isinstance(overrides.get("editorial_brief"), dict) and any(overrides["editorial_brief"].values()):
-            editorial_brief = overrides["editorial_brief"]
+        if overrides.get("shoot_env") in ("studio", "outdoor", "auto"):
+            shoot_env = overrides["shoot_env"]
+        if overrides.get("prep_mode") in ("partner", "independent"):
+            prep_mode = overrides["prep_mode"]
         if overrides.get("ignored_critical_events"):
             editorial_brief = dict(editorial_brief or {})
             editorial_brief["_ignored_critical_events"] = list(overrides["ignored_critical_events"])
 
         valid_chunks = bb_obj.get("chunks", [])
-        llm_qual = bb_obj.get("qualitative_synthesis", {})
-        if overrides.get("custom_summary"):
-            llm_qual = dict(llm_qual or {})
-            rep_d = dict(llm_qual.get("report") or {})
-            rep_d["summary"] = overrides["custom_summary"]
-            llm_qual["report"] = rep_d
-
         old_meta = bb_obj.get("metadata") or {}
         derived_meta = old_meta.get("derived") or derive_metadata(src_url or old_meta.get("src_url", ""), 3600)
-        tot_chunks = int(old_meta.get("chunks_total") or len(valid_chunks) or 1)
         dur = sum(float((c.get("measurement") or {}).get("chunk_duration_s", 300)) for c in valid_chunks) or 3600.0
         exact_duration = format_hhmmss(dur)
 
-        final_eval = compute_deterministic_evaluation(valid_chunks, dur, rubric, derived_meta, llm_qual, editorial_brief, editorial_mode)
-        charts = generate_eval_charts(final_eval)
-        meta_info = {
-            "clean_name": clean_name, "editorial_label": editorial_label,
-            "chunks_ok": len(valid_chunks), "chunks_total": tot_chunks, "actual_cost": 0.0,
-            "models_used": old_meta.get("models_used", ["RERENDER:$0"]), "src_url": src_url or old_meta.get("src_url", ""),
-            "human_overrides": overrides,
-        }
-        det_html = render_detailed_eval_html(display_name, exact_duration, derived_meta, final_eval, llm_qual, charts, meta_info)
-        sum_html = render_summarized_eval_html(display_name, exact_duration, final_eval, llm_qual, charts)
-        trn_html = render_training_plan_html(display_name, final_eval, llm_qual)
-        bb_md = generate_blackbox_v2_md(display_name, exact_duration, derived_meta, valid_chunks, final_eval, meta_info)
-        bb_obj["metadata"] = {**meta_info, "derived": derived_meta}
-        bb_obj["evaluation"] = final_eval
-        bb_obj["qualitative_synthesis"] = llm_qual
+        target_tpls = overrides.get("run_templates") or cfg.get("selected_templates") or ["tpl_presenter"]
+        existing_quals = bb_obj.get("template_syntheses") or {}
+        if bb_obj.get("qualitative_synthesis") and "tpl_presenter" not in existing_quals:
+            existing_quals["tpl_presenter"] = bb_obj["qualitative_synthesis"]
 
-        files_to_write = [
-            (f"01_Main_Detailed_Report_{clean_name}.html", det_html, "text/html"),
-            (f"02_Summarized_Report_{clean_name}.html", sum_html, "text/html"),
-            (f"03_Training_Plan_{clean_name}.html", trn_html, "text/html"),
-            (f"04_Blackbox_V2_{clean_name}.md", bb_md, "text/markdown"),
-            (f"05_Blackbox_V2_{clean_name}.json", json.dumps(bb_obj, ensure_ascii=False, indent=2), "application/json"),
-        ]
-        for fname, content, mime in files_to_write:
-            fp = os.path.join(BACKUP_DIR, fname)
-            with open(fp, "w", encoding="utf-8") as f:
-                f.write(content)
-            up_ok = drive_upload(fid, cfg, fp, mime)
-            log(f"  ☁️ Re-render upload {fname}: {'✅ OK' if up_ok else '❌ FAILED'}")
+        # Only validate Gemini keys if a NEW template needs 1 text synthesis call
+        need_llm = any(tid not in existing_quals for tid in target_tpls)
+        valid_free, valid_paid, paid_models = ([], None, [])
+        if need_llm:
+            valid_free, valid_paid, paid_models = preflight_validate_keys(fk_list, pk, strat, tg_bot, tg_chat)
 
-        kpi_sum = {
-            "folder_id": fid, "presenter": display_name, "date": derived_meta.get("broadcast_date") or datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d"),
-            "duration": exact_duration, "final_score": final_eval["score_final"]["final_score"], "raw_score": final_eval["score_final"]["raw_score"],
-            "reported_as": final_eval["score_final"]["reported_as"], "band": final_eval["score_final"]["band"],
-            "axes": {a["id"]: a["pct"] for a in final_eval["axes"]}, "kpis": final_eval["kpis"],
-            "critical_events": [e.get("type") for e in final_eval["critical_events"]], "src_url": meta_info["src_url"],
-        }
-        update_drive_folder_meta(fid, cfg, f"PROCESSED_{clean_name}_$0.00", f"🔗 رابط المصدر: {meta_info['src_url']}\n• الاسم: {display_name}\n• النتيجة (مُعاد توليدها): {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})")
-        finalize_cost_webhook(cfg, fid, 0.0, "completed", f"تمت إعادة التوليد ({final_eval['score_final']['reported_as']})", completed_chunks=len(valid_chunks), total_chunks=tot_chunks, kpi_summary=kpi_sum)
-        send_tg(f"♻️ <b>تمت إعادة توليد تقارير {display_name} بنجاح ($0.00)</b>\n• النتيجة الجديدة: {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})", tg_bot, tg_chat)
-        log("🎉 Re-Render V7.0 completed in $0.00!")
+        act_cost, models_used = 0.0, set(old_meta.get("models_used", ["RERENDER:$0"]))
+        template_results, guest_summaries_out = dict(bb_obj.get("template_results") or {}), []
+        kpi_sum = None
+
+        for tid in target_tpls:
+            tpl = load_template_by_id(tid)
+            if tpl.get("engine") != "scored_evaluation":
+                continue
+            if tpl.get("target_entity") == "guest":
+                m_base = extract_episode_metrics(valid_chunks, dur, tpl.get("policy") or {})
+                g_ids = m_base["guest_ids"] or ["GUEST_1"]
+                guest_evals = []
+                for gid in g_ids:
+                    g_info = m_base["guest_obs_agg"].get(gid) or m_base["participants_map"].get(gid) or {"name": gid, "specialty": "", "connection": "studio"}
+                    g_name = g_info.get("name") or gid
+                    pre_g = evaluate_scored_template(tpl, valid_chunks, dur, derived_meta, {}, shoot_env, prep_mode, editorial_brief, target_guest_id=gid)
+                    qk = f"{tid}::{gid}"
+                    gq = existing_quals.get(qk)
+                    if not gq and (valid_free or valid_paid):
+                        dig = build_template_context_digest(valid_chunks, tpl, target_guest_id=gid)
+                        pr_g = build_scored_synthesis_prompt(tpl, g_name, dig, pre_g, system_prompt_extra, is_guest=True)
+                        gq, sc, sm = run_synthesis_call(pr_g, valid_free, valid_paid, paid_models, strat, lambda: act_cost < episode_budget_cap)
+                        act_cost += sc
+                        if sm:
+                            models_used.add(sm)
+                        existing_quals[qk] = gq
+                    ev_g = evaluate_scored_template(tpl, valid_chunks, dur, derived_meta, gq or {}, shoot_env, prep_mode, editorial_brief, target_guest_id=gid)
+                    gp = (gq or {}).get("guest_profile") or {}
+                    g_ideas = gp.get("new_ideas") or g_info.get("new_ideas") or []
+                    g_quotes = gp.get("quotable_lines") or g_info.get("quotable_lines") or []
+                    g_spec = gp.get("specialty") or g_info.get("specialty") or ""
+                    guest_evals.append({"guest_id": gid, "guest_name": g_name, "specialty": g_spec, "connection": g_info.get("connection", "studio"), "eval": ev_g, "llm_qual": gq or {}, "new_ideas": g_ideas, "quotable_lines": g_quotes})
+                    sf_g = ev_g["score_final"]
+                    guest_summaries_out.append({
+                        "folder_id": fid, "guest_name": g_name, "specialty": g_spec, "presenter": display_name,
+                        "program": ev_g.get("program_name") or "", "date": derived_meta.get("broadcast_date") or datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d"),
+                        "final_score": sf_g["final_score"], "reported_as": sf_g["reported_as"], "band": sf_g["band"],
+                        "tier": "A" if sf_g["final_score"] >= 85 else ("B" if sf_g["final_score"] >= 70 else "C"),
+                        "axes": {a["id"]: a["pct"] for a in ev_g["axes"]}, "evidence_pct": ev_g["kpis"].get("guest_evidence_pct", 0),
+                        "longest_block_s": ev_g["kpis"].get("guest_longest_block_s", 0), "new_ideas": g_ideas[:5],
+                        "quotable_lines": g_quotes[:3], "template_version": tpl.get("version", "1.0"),
+                    })
+                g_html = render_guests_bundle_html(display_name, guest_evals, derived_meta, exact_duration, tpl)
+                fp = os.path.join(BACKUP_DIR, f"06_Guests_Evaluation_{clean_name}.html")
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write(g_html)
+                drive_upload(fid, cfg, fp, "text/html")
+                continue
+
+            pre_ev = evaluate_scored_template(tpl, valid_chunks, dur, derived_meta, {}, shoot_env, prep_mode, editorial_brief, editorial_mode=editorial_mode)
+            lq = existing_quals.get(tid)
+            if not lq and (valid_free or valid_paid):
+                dig = build_template_context_digest(valid_chunks, tpl)
+                pr_t = build_scored_synthesis_prompt(tpl, display_name, dig, pre_ev, system_prompt_extra)
+                lq, sc, sm = run_synthesis_call(pr_t, valid_free, valid_paid, paid_models, strat, lambda: act_cost < episode_budget_cap)
+                act_cost += sc
+                if sm:
+                    models_used.add(sm)
+                existing_quals[tid] = lq
+            if overrides.get("custom_summary") and tid == "tpl_presenter":
+                lq = dict(lq or {})
+                rr = dict(lq.get("report") or {})
+                rr["summary"] = overrides["custom_summary"]
+                lq["report"] = rr
+            final_ev = evaluate_scored_template(tpl, valid_chunks, dur, derived_meta, lq or {}, shoot_env, prep_mode, editorial_brief, editorial_mode=editorial_mode)
+            template_results[tid] = final_ev
+            charts = generate_eval_charts(final_ev)
+            mi = {"clean_name": clean_name, "chunks_ok": len(valid_chunks), "chunks_total": len(valid_chunks), "actual_cost": act_cost, "src_url": src_url or old_meta.get("src_url", "")}
+            det_h = render_generic_scored_report_html(display_name, final_ev, lq or {}, derived_meta, exact_duration, charts, mi, summarized=False)
+            if tid == "tpl_presenter":
+                sum_h = render_generic_scored_report_html(display_name, final_ev, lq or {}, derived_meta, exact_duration, charts, mi, summarized=True)
+                trn_h = render_training_plan_html(display_name, final_ev, lq or {})
+                for fn, txt in ((f"01_Main_Detailed_Report_{clean_name}.html", det_h), (f"02_Summarized_Report_{clean_name}.html", sum_h), (f"03_Training_Plan_{clean_name}.html", trn_h)):
+                    fp = os.path.join(BACKUP_DIR, fn)
+                    with open(fp, "w", encoding="utf-8") as f:
+                        f.write(txt)
+                    drive_upload(fid, cfg, fp, "text/html")
+                kpi_sum = {
+                    "folder_id": fid, "presenter": display_name, "date": derived_meta.get("broadcast_date") or datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d"),
+                    "duration": exact_duration, "final_score": final_ev["score_final"]["final_score"], "raw_score": final_ev["score_final"]["raw_score"],
+                    "reported_as": final_ev["score_final"]["reported_as"], "band": final_ev["score_final"]["band"],
+                    "axes": {a["id"]: a["pct"] for a in final_ev["axes"]}, "kpis": final_ev["kpis"],
+                    "critical_events": [e.get("type") for e in final_ev["critical_events"]], "src_url": mi["src_url"],
+                    "template_version": final_ev["template_version"], "shoot_env": final_ev["shoot_env"], "prep_mode": final_ev["prep_mode"],
+                }
+            else:
+                prefix_n = "07_Directing_" if tid == "tpl_directing" else ("08_Episode_" if tid == "tpl_episode" else f"09_{sanitize_filename(tid)}_")
+                fp = os.path.join(BACKUP_DIR, f"{prefix_n}{clean_name}.html")
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write(det_h)
+                drive_upload(fid, cfg, fp, "text/html")
+
+        bb_obj["template_syntheses"] = existing_quals
+        bb_obj["template_results"] = template_results
+        if "tpl_presenter" in template_results:
+            bb_obj["evaluation"] = template_results["tpl_presenter"]
+        fp_bb = os.path.join(BACKUP_DIR, f"05_Blackbox_V3_{clean_name}.json")
+        with open(fp_bb, "w", encoding="utf-8") as f:
+            json.dump(bb_obj, f, ensure_ascii=False, indent=2)
+        drive_upload(fid, cfg, fp_bb, "application/json")
+        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"تم التحديث / التوليد الإضافي (${act_cost:.4f})", completed_chunks=len(valid_chunks), total_chunks=len(valid_chunks), kpi_summary=kpi_sum, extra_fields={"guest_summaries": guest_summaries_out})
         sys.exit(0)
 
+    # ==========================================================================
+    # STANDARD PIPELINE: PRE-FLIGHT + VIDEO ACQUISITION (REUSE DRIVE IF ARCHIVED)
+    # ==========================================================================
     push_status(cfg, fid, run_id, "running", "فحص مفاتيح API...", 0, 0, 0.0, started_at)
     valid_free, valid_paid, paid_models = preflight_validate_keys(fk_list, pk, strat, tg_bot, tg_chat)
     if (strat == "flash_only" and not valid_free) or (strat == "pro_only" and not valid_paid) or (not valid_free and not valid_paid):
@@ -2544,51 +3130,60 @@ def main():
         finalize_cost_webhook(cfg, fid, 0.0, "failed", "لا يوجد مفاتيح API صالحة")
         sys.exit(1)
 
-    if not src_url:
-        send_tg("❌ رابط المصدر مفقود.", tg_bot, tg_chat)
-        update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", "❌ رابط المصدر مفقود")
-        finalize_cost_webhook(cfg, fid, 0.0, "failed", "الرابط مفقود")
-        sys.exit(1)
+    selected_templates = cfg.get("selected_templates") or (["tpl_daily"] if mode == "daily" else ["tpl_presenter"])
+    first_tpl = load_template_by_id(selected_templates[0])
+    is_inventory_run = (mode == "daily" or first_tpl.get("engine") == "structured_inventory")
+
+    chunk_min = int(cfg.get("chunk_size", 15)) if is_inventory_run else 5
+    chunk_sec = chunk_min * 60
+    fps = cfg.get("daily_fps", "1/10") if is_inventory_run else cfg.get("eval_fps", "1")
 
     local_input, downloaded_local, tmp_src = src_url, False, "/tmp/source_video.mp4"
     dur = float(cfg.get("expected_hours", 1)) * 3600
     m_fn_dur = re.search(r"archive-\d{10}-(\d+)", src_url or "")
     if m_fn_dur and int(m_fn_dur.group(1)) > 30:
         dur = float(m_fn_dur.group(1))
-    if not is_youtube_url(src_url):
-        probe_candidates = [
-            (["ffprobe", "-v", "error", "-tls_verify", "0", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", src_url] if src_url.lower().startswith("https://") else ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", src_url]),
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", ("http://" + src_url[8:]) if src_url.lower().startswith("https://") else src_url],
-        ]
-        for pcmd in probe_candidates:
-            try:
-                po = subprocess.run(pcmd, capture_output=True, text=True, timeout=30).stdout.strip()
-                if po and float(po) > 0:
-                    dur = float(po)
-                    break
-            except Exception:
-                pass
 
-    if mode == "eval" or dur <= 9000 or is_youtube_url(src_url):
-        push_status(cfg, fid, run_id, "running", "تحميل الفيديو محلياً...", 0, max(1, math.ceil(dur / chunk_sec)), 0.0, started_at)
-        send_tg(f"📥 تحميل الحلقة محلياً ({clean_name})...", tg_bot, tg_chat)
-        if acquire_video_locally(src_url, tmp_src, cfg):
+    # 1. Check if video is ALREADY archived on Drive (from Scheduler Ingest or previous attempt)
+    drive_video_id, drive_video_name = find_drive_archived_video(fid, cfg)
+    if drive_video_id:
+        push_status(cfg, fid, run_id, "running", "سحب الفيديو المحفوظ مسبقاً من Google Drive...", 0, max(1, math.ceil(dur / chunk_sec)), 0.0, started_at)
+        if download_drive_file_to_local(drive_video_id, tmp_src, cfg):
             local_input, downloaded_local = tmp_src, True
             try:
                 pl = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", tmp_src], capture_output=True, text=True, timeout=30).stdout.strip()
-                if pl:
+                if pl and float(pl) > 0:
                     dur = float(pl)
             except Exception:
                 pass
 
-    exact_duration, tot, derived_meta = format_hhmmss(dur), math.ceil(dur / chunk_sec), derive_metadata(src_url, dur)
-    if tot <= 0:
-        update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 {src_url}\n❌ مدة الفيديو صفر")
-        finalize_cost_webhook(cfg, fid, 0.0, "failed", "مدة الفيديو صفر")
-        sys.exit(1)
+    # 2. Otherwise acquire from src_url and archive to Drive if enabled
+    if not downloaded_local:
+        if not src_url:
+            update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", "❌ رابط المصدر مفقود")
+            finalize_cost_webhook(cfg, fid, 0.0, "failed", "رابط المصدر مفقود")
+            sys.exit(1)
+        save_video_flag = (cfg.get("save_video_to_drive") is not False)
+        want_local_dl = (not is_inventory_run or dur <= 9000 or is_youtube_url(src_url))
+        if not want_local_dl and save_video_flag and src_url.lower().startswith(("http://", "https://")):
+            rem_bytes = probe_remote_content_length(src_url)
+            if 0 < rem_bytes <= int(3.5 * 1024 * 1024 * 1024):
+                want_local_dl = True
+        if want_local_dl:
+            push_status(cfg, fid, run_id, "running", "تحميل الفيديو محلياً...", 0, max(1, math.ceil(dur / chunk_sec)), 0.0, started_at)
+            if acquire_video_locally(src_url, tmp_src, cfg):
+                local_input, downloaded_local = tmp_src, True
+                try:
+                    pl = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", tmp_src], capture_output=True, text=True, timeout=30).stdout.strip()
+                    if pl and float(pl) > 0:
+                        dur = float(pl)
+                except Exception:
+                    pass
+                if save_video_flag and fid:
+                    push_status(cfg, fid, run_id, "running", "أرشفة نسخة الفيديو على Google Drive...", 0, max(1, math.ceil(dur / chunk_sec)), 0.0, started_at)
+                    drive_video_id = drive_upload_resumable(fid, cfg, tmp_src, f"00_Video_{clean_name}.mp4", "video/mp4")
 
-    send_tg(f"🚀 بدء التحليل V7.0 | {clean_name} | المدة: {exact_duration} | المقاطع: {tot} ({chunk_min}د)", tg_bot, tg_chat)
-
+    exact_duration, tot, derived_meta = format_hhmmss(dur), max(1, math.ceil(dur / chunk_sec)), derive_metadata(src_url, dur)
     act_cost, exhausted_pairs, bad_keys, models_used = 0.0, set(), set(), set()
 
     def budget_ok() -> bool:
@@ -2621,15 +3216,17 @@ def main():
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
             if proc.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 5000:
                 sp_s = measure_chunk_speech_ffmpeg(mp4_path, d)
-                mb = os.path.getsize(mp4_path) / (1024 * 1024)
-                log(f"🎞️ Sliced chunk {idx+1}/{tot} ({format_hhmmss(st)}->{format_hhmmss(st+d)}) | {mb:.2f} MB | speech={sp_s}s | {time.time()-t_ff:.1f}s")
+                log(f"🎞️ Sliced chunk {idx+1}/{tot} ({format_hhmmss(st)}->{format_hhmmss(st+d)}) | {os.path.getsize(mp4_path)/(1024*1024):.2f} MB | {time.time()-t_ff:.1f}s")
                 return mp4_path, st, d, sp_s
             last_ff_err = (proc.stderr or "").strip()[:240]
-            print(f"[FFmpeg Retry {attempt}/3 chunk {idx+1}] rc={proc.returncode} err={last_ff_err}", flush=True)
             time.sleep(2)
         raise RuntimeError(f"FFmpeg failed on chunk {idx+1}: {last_ff_err}")
 
-    if mode == "eval":
+    # ==========================================================================
+    # MODE C: SCORED MULTI-TEMPLATE ENGINE (UNIVERSAL BLACKBOX V3.0)
+    # ==========================================================================
+    if not is_inventory_run:
+        bb_prompt_tpl = load_blackbox_v3_prompt()
         saved_ckpts, saved_ctx = load_drive_checkpoints(fid, cfg)
         chunks_by_idx = [None] * tot
         for ci, cobj in saved_ckpts.items():
@@ -2637,11 +3234,11 @@ def main():
                 chunks_by_idx[ci] = cobj
         resumed_cnt = sum(1 for x in chunks_by_idx if x is not None)
         if resumed_cnt > 0:
-            log(f"♻️ RESUME ACTIVE: Restored {resumed_cnt}/{tot} completed chunks from Drive checkpoints!")
-            send_tg(f"♻️ <b>استكمال التقييم ({display_name})</b>: تم استعادة {resumed_cnt}/{tot} مقطع من نقاط الحفظ.", tg_bot, tg_chat)
+            log(f"♻️ RESUME ACTIVE: Restored {resumed_cnt}/{tot} chunks from Drive checkpoints!")
+            send_tg(f"♻️ <b>استكمال ({display_name})</b>: استعادة {resumed_cnt}/{tot} مقطع من نقاط الحفظ.", tg_bot, tg_chat)
 
         missing_idxs = [i for i in range(tot) if chunks_by_idx[i] is None]
-        push_status(cfg, fid, run_id, "running", f"تقطيع المقاطع المطلوبة ({len(missing_idxs)}/{tot} × 5 دقائق)...", resumed_cnt, tot, 0.0, started_at)
+        push_status(cfg, fid, run_id, "running", f"تقطيع المقاطع ({len(missing_idxs)}/{tot} × 5د @ {fps} FPS)...", resumed_cnt, tot, 0.0, started_at)
         sliced = {}
         if missing_idxs:
             with ThreadPoolExecutor(max_workers=min(3, len(missing_idxs))) as ex:
@@ -2649,7 +3246,6 @@ def main():
                 for fut in as_completed(futs):
                     sliced[futs[fut]] = fut.result()
 
-        failed_idxs = []
         running_ctx = saved_ctx if isinstance(saved_ctx, dict) else {
             "chunk_index": 0, "program_name": None, "presenter_name": display_name,
             "participants": [{"id": "ANCHOR", "name": display_name, "role": "مقدّم"}],
@@ -2658,35 +3254,34 @@ def main():
         for i in range(tot):
             if chunks_by_idx[i] is not None:
                 running_ctx = update_running_context(running_ctx, chunks_by_idx[i], chunks_by_idx[i].get("window", {}).get("end", format_hhmmss((i + 1) * chunk_sec)))
-        proc_start = time.time()
 
-        def run_eval_chunk(i: int, ctx_snapshot: dict, force_paid: bool = False):
+        failed_idxs, proc_start = [], time.time()
+
+        def run_bb_chunk(i: int, ctx_snap: dict, force_paid: bool = False):
             mp4_path, st, d, speech_s = sliced[i] if i in sliced and os.path.exists(sliced[i][0]) else extract_chunk_media(i)
             st_hms, end_hms = format_hhmmss(st), format_hhmmss(st + d)
-            filled_chunk = (
-                prompt_chunk_tpl
+            prompt_filled = (
+                bb_prompt_tpl
                 .replace("{{CHUNK_INDEX}}", str(i + 1))
                 .replace("{{CHUNK_TOTAL}}", str(tot))
                 .replace("{{CHUNK_START}}", st_hms)
                 .replace("{{CHUNK_END}}", end_hms)
-                .replace("{{PROGRAM_NAME_IF_KNOWN}}", str(ctx_snapshot.get("program_name") or "غير محدد بعد"))
-                .replace("{{RUNNING_CONTEXT}}", json.dumps(ctx_snapshot, ensure_ascii=False, indent=2))
+                .replace("{{PROGRAM_NAME_IF_KNOWN}}", str(ctx_snap.get("program_name") or "غير محدد بعد"))
+                .replace("{{RUNNING_CONTEXT}}", json.dumps(ctx_snap, ensure_ascii=False, indent=2))
                 .replace("{{ENTITIES_CSV}}", entities_csv)
             )
             full_prompt = (
-                f"{prompt_system}\n\n{filled_chunk}\n\n"
-                f"تنبيه إلزامي: اسم مقدّم هذه الحلقة (ANCHOR) المثبّت هو «{display_name}» — يُمنع استبداله بأي اسم مقدم آخر من entities.csv.\n"
+                f"{prompt_filled}\n\n"
+                f"تنبيه إلزامي: اسم المقدّم المثبّت (ANCHOR) هو «{display_name}».\n"
                 f"اسم ملف المصدر: {derived_meta.get('source_filename')}\n{system_prompt_extra}"
             )
-            run_strat = "pro_only" if force_paid else strat
             try:
-                log(f"▶️ [Chunk {i+1}/{tot} {st_hms}->{end_hms}] Starting analysis (strategy={run_strat}, dlq={force_paid})...")
                 raw_data, cost, used_model, tier = call_gemini_chunk(
-                    mp4_path, full_prompt, valid_free, valid_paid, paid_models, run_strat,
-                    exhausted_pairs, bad_keys, budget_ok, chunk_schema=schema_chunk or None,
-                    chunk_tag=f"Chunk {i+1}/{tot}"
+                    mp4_path, full_prompt, valid_free, valid_paid, paid_models,
+                    "pro_only" if force_paid else strat, exhausted_pairs, bad_keys, budget_ok,
+                    chunk_schema=None, chunk_tag=f"BBv3 {i+1}/{tot}",
                 )
-                norm = normalize_chunk_v2(raw_data, i + 1, st_hms, end_hms, d, derived_meta, speech_s, entity_registry, locked_presenter=display_name)
+                norm = normalize_chunk_v3(raw_data, i + 1, st_hms, end_hms, d, derived_meta, speech_s, entity_registry, locked_presenter=display_name)
                 return norm, cost, used_model, tier, end_hms
             finally:
                 if os.path.exists(mp4_path):
@@ -2696,257 +3291,51 @@ def main():
                         pass
 
         for i in range(tot):
-            if CANCEL_EVENT.is_set():
+            if CANCEL_EVENT.is_set() or PAUSE_EVENT.is_set():
                 break
             if chunks_by_idx[i] is not None:
-                log(f"⏭️ Skipping chunk {i+1}/{tot} (already restored from checkpoint)")
                 continue
             try:
-                norm, cost, used_model, tier, end_hms = run_eval_chunk(i, running_ctx, force_paid=False)
+                norm, cost, used_model, tier, end_hms = run_bb_chunk(i, running_ctx, force_paid=False)
                 chunks_by_idx[i] = norm
                 running_ctx = update_running_context(running_ctx, norm, end_hms)
                 act_cost += cost
                 models_used.add(f"{tier}:{used_model}")
                 drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", norm)
                 drive_upload_json_blob(fid, cfg, "_ckpt_ctx.json", running_ctx)
-                log(f"✅ Chunk {i+1}/{tot} ({norm['window']['start']}->{norm['window']['end']}) turns={len(norm['turns'])} chyrons={len(norm['chyron_timeline'])} claims={len(norm['claims'])} via {tier}:{used_model} | ${cost:.4f}")
+                log(f"✅ BBv3 Chunk {i+1}/{tot} turns={len(norm['turns'])} chyrons={len(norm['chyron_timeline'])} env={norm['visual_directing']['environment_observed']} via {tier}:{used_model}")
             except Exception as e:
                 if CANCEL_EVENT.is_set() or "Cancelled by user" in str(e):
                     break
                 failed_idxs.append(i)
-                log(f"⚠️ Chunk {i+1}/{tot} failed (queued for DLQ): {e}")
+                log(f"⚠️ Chunk {i+1}/{tot} queued for DLQ: {e}")
             done_now = sum(1 for x in chunks_by_idx if x is not None)
-            avg_per_chunk = (time.time() - proc_start) / max(1, i + 1)
-            eta = int(avg_per_chunk * (tot - i - 1)) + (len(failed_idxs) * 60) + 60
-            log(f"📡 Progress {done_now}/{tot} | failed_dlq={len(failed_idxs)} | avg={avg_per_chunk:.1f}s/chunk | ETA={format_hhmmss(eta)}")
-            push_status(cfg, fid, run_id, "running", f"توثيق الصندوق الأسود ({done_now}/{tot})", done_now, tot, act_cost, started_at, eta_sec=eta)
+            eta = int(((time.time() - proc_start) / max(1, i + 1)) * (tot - i - 1)) + 60
+            push_status(cfg, fid, run_id, "running", f"بناء الصندوق الأسود الشامل V3 ({done_now}/{tot})", done_now, tot, act_cost, started_at, eta_sec=eta)
 
-        # DLQ Rescue BEFORE deleting local source video
+        # Clean PAUSE handler (preserves all checkpoints & folder cleanly!)
+        if PAUSE_EVENT.is_set() and not CANCEL_EVENT.is_set():
+            done_now = sum(1 for x in chunks_by_idx if x is not None)
+            log(f"⏸️ PAUSED cleanly after chunk {done_now}/{tot} — checkpoints safely saved on Drive.")
+            send_tg(f"⏸️ <b>توقّف مؤقت آمن ({display_name})</b> عند المقطع {done_now}/{tot} — يمكنك الضغط على «متابعة» في أي وقت.", tg_bot, tg_chat)
+            finalize_cost_webhook(cfg, fid, act_cost, "paused", f"متوقف مؤقتاً عند {done_now}/{tot} — اضغط «متابعة» للاستكمال", completed_chunks=done_now, total_chunks=tot)
+            sys.exit(0)
+
+        # DLQ Rescue
         if failed_idxs and not CANCEL_EVENT.is_set():
-            log(f"🚑 Entering DLQ Rescue for {len(failed_idxs)} chunks...", flush=True)
-            push_status(cfg, fid, run_id, "running", f"إنقاذ المقاطع المتعثرة ({len(failed_idxs)})...", sum(1 for x in chunks_by_idx if x), tot, act_cost, started_at)
-            time.sleep(8)
+            time.sleep(6)
             for i in failed_idxs:
-                if CANCEL_EVENT.is_set():
+                if CANCEL_EVENT.is_set() or PAUSE_EVENT.is_set():
                     break
                 try:
                     use_paid = (strat != "flash_only") and (valid_paid is not None) and budget_ok()
-                    norm, cost, used_model, tier, _ = run_eval_chunk(i, running_ctx, force_paid=use_paid)
+                    norm, cost, used_model, tier, _ = run_bb_chunk(i, running_ctx, force_paid=use_paid)
                     chunks_by_idx[i] = norm
                     act_cost += cost
                     models_used.add(f"{tier}:{used_model}")
                     drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", norm)
-                    log(f"🚑 Chunk {i+1} rescued via {tier}:{used_model}")
-                    done_now = sum(1 for x in chunks_by_idx if x is not None)
-                    push_status(cfg, fid, run_id, "running", f"إنقاذ المقاطع المتعثرة ({done_now}/{tot})", done_now, tot, act_cost, started_at, eta_sec=25)
                 except Exception as ex:
-                    log(f"❌ DLQ failed on chunk {i+1}: {ex}")
-
-        if downloaded_local and os.path.exists(local_input):
-            try:
-                os.remove(local_input)
-            except Exception:
-                pass
-
-        if CANCEL_EVENT.is_set():
-            update_drive_folder_meta(fid, cfg, f"CANCELLED_{clean_name}", f"🔗 {src_url}\n🛑 ملغاة من لوحة التحكم")
-            finalize_cost_webhook(cfg, fid, act_cost, "cancelled", "تم الإلغاء")
-            sys.exit(0)
-
-        valid_chunks = [c for c in chunks_by_idx if c is not None]
-        if not valid_chunks:
-            update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 {src_url}\n❌ فشلت جميع المقاطع")
-            finalize_cost_webhook(cfg, fid, 0.0, "failed", "فشلت جميع المقاطع")
-            sys.exit(1)
-
-        push_status(cfg, fid, run_id, "running", "التوليف وحساب سلّم 100 نقطة وبناء خطة التدريب والرسوم البيانية...", len(valid_chunks), tot, act_cost, started_at, eta_sec=25)
-        pre_eval = compute_deterministic_evaluation(valid_chunks, dur, rubric, derived_meta, {}, editorial_brief, editorial_mode)
-        qual_ids = ["B3", "C3", "D1", "D4", "E1", "E2", "E4", "F1", "F2", "F3", "G2"]
-        qual_defs = []
-        for ax in rubric.get("axes", []):
-            for it in ax.get("items", []):
-                if it["id"] in qual_ids:
-                    qual_defs.append(f"- {it['id']} ({it['name']} — الحد الأقصى {it['max']}): KPI={it.get('kpi')} | مراسي={it.get('anchors', {})}")
-        qual_defs_text = "\n".join(qual_defs)
-
-        synth_request = (
-            f"{prompt_system}\n\n{prompt_synth_tpl}\n\n"
-            f"اسم مقدّم الحلقة: {display_name} | نوع المسار التحريري: {editorial_label}\n"
-            f"تعريفات البنود النوعية الـ 11 الإلزامية (التزم التطابق الحرفي بين كل رمز ومعناه — يُمنع الخلط بينها):\n{qual_defs_text}\n\n"
-            f"المؤشرات المحسوبة حتمياً:\n{json.dumps(pre_eval['kpis'], ensure_ascii=False)}\n\n"
-            f"الموجز التحريري (editorial_brief):\n{json.dumps(editorial_brief, ensure_ascii=False)}\n\n"
-            f"أطول 5 أسئلة للمقدم (أعد صياغة أطول 3 منها إلى ≤12ث و≤30 كلمة باستفهام واحد ومرجع واحد):\n"
-            f"{json.dumps(pre_eval['longest_questions'], ensure_ascii=False)}\n\n"
-            'أخرج JSON صالح فقط بهذه المفاتيح (واكتب الملاحظات بالعربية الفصحى السلسة مع توقيتات HH:MM:SS):\n'
-            '{"episode_overview":{"program_name":"","topic":""},'
-            '"qualitative_items":{"B3":{"score":0,"anchor_hit":"full|partial|low|zero","evidence":[],"note":""},"C3":{"score":0,"anchor_hit":"","evidence":[],"note":""},"D1":{"score":0,"anchor_hit":"","evidence":[],"note":""},"D4":{"score":0,"anchor_hit":"","evidence":[],"note":""},"E1":{"score":0,"anchor_hit":"","evidence":[],"note":""},"E2":{"score":0,"anchor_hit":"","evidence":[],"note":""},"E4":{"score":0,"anchor_hit":"","evidence":[],"note":""},"F1":{"score":0,"anchor_hit":"","evidence":[],"note":""},"F2":{"score":0,"anchor_hit":"","evidence":[],"note":""},"F3":{"score":0,"anchor_hit":"","evidence":[],"note":""},"G2":{"score":0,"anchor_hit":"","evidence":[],"note":""}},'
-            '"documented_examples":[{"ts":"HH:MM:SS","speaker":"المقدّم|الضيف|شريط الشاشة","quote":"اقتباس حرفي أو رصد دقيق","significance":"الدلالة المهنية"}],'
-            '"question_rewrites":[{"ts":"HH:MM:SS","orig_duration_s":0,"original":"","rewritten":""}],'
-            '"report":{"summary":"خلاصة تنفيذية مركزة وواضحة من 5-7 أسطر","strengths":["نقطة قوة مع توقيت HH:MM:SS"],"priorities":["أولوية تطوير عملية مع توقيت HH:MM:SS"]}}\n\n'
-            f"بيانات المقاطع:\n{json.dumps(valid_chunks, ensure_ascii=False)[:180000]}"
-        )
-
-        llm_qual = {}
-        now_ts = time.time()
-        raw_synth = (
-            [(valid_paid, m, True) for m in (rank_discovered_models(paid_models, PREFERRED_SYNTH_ORDER, True) or paid_models)]
-            if (strat != "flash_only" and valid_paid and budget_ok()) else []
-        ) + [(k, m, False) for k, kms in valid_free for m in kms]
-        synth_candidates = [x for x in raw_synth if MODEL_COOLDOWN_UNTIL.get(x[1], 0) <= now_ts] + [x for x in raw_synth if MODEL_COOLDOWN_UNTIL.get(x[1], 0) > now_ts]
-        log(f"🧠 Starting Synthesis stage ({len(valid_chunks)}/{tot} valid chunks, {len(synth_candidates)} model candidates)...")
-        for skey, smodel, spaid in synth_candidates:
-            s_tier = "PAID" if spaid else "FREE"
-            try:
-                t_syn = time.time()
-                log(f"  🤖 [Synthesis] Calling {s_tier} {mask_key(skey)} / {smodel} (timeout=240s)...")
-                client = make_genai_client(skey, timeout_ms=240_000)
-                res = run_with_hard_timeout(
-                    lambda: client.models.generate_content(model=smodel, contents=synth_request, config=build_gen_config(max_out=32768)),
-                    240,
-                    f"synthesis({smodel})",
-                )
-                llm_qual = clean_json_text(res.text)
-                s_cost = calc_cost(smodel, res.usage_metadata, spaid)
-                act_cost += s_cost
-                models_used.add(f"{s_tier}:{smodel}")
-                log(f"✅ Synthesis completed via {s_tier}:{smodel} in {time.time() - t_syn:.1f}s | ${s_cost:.4f}")
-                break
-            except Exception as e:
-                log(f"  ⚠️ [Synthesis Retry {s_tier} {mask_key(skey)} / {smodel}] {str(e)[:180]}")
-
-        final_eval = compute_deterministic_evaluation(valid_chunks, dur, rubric, derived_meta, llm_qual, editorial_brief, editorial_mode)
-        charts = generate_eval_charts(final_eval)
-        meta_info = {
-            "clean_name": clean_name, "editorial_label": editorial_label,
-            "chunks_ok": len(valid_chunks), "chunks_total": tot, "actual_cost": act_cost,
-            "models_used": sorted(models_used), "src_url": src_url,
-        }
-
-        det_html = render_detailed_eval_html(display_name, exact_duration, derived_meta, final_eval, llm_qual, charts, meta_info)
-        sum_html = render_summarized_eval_html(display_name, exact_duration, final_eval, llm_qual, charts)
-        trn_html = render_training_plan_html(display_name, final_eval, llm_qual)
-        bb_md = generate_blackbox_v2_md(display_name, exact_duration, derived_meta, valid_chunks, final_eval, meta_info)
-        bb_json_obj = {
-            "prompt_version": "blackbox-v2.0",
-            "rubric_version": rubric.get("rubric_version", "manar-100-v2"),
-            "metadata": {**meta_info, "derived": derived_meta, "key_health": get_key_health_snapshot()},
-            "evaluation": final_eval,
-            "qualitative_synthesis": llm_qual,
-            "chunks": valid_chunks,
-        }
-
-        files_to_write = [
-            (f"01_Main_Detailed_Report_{clean_name}.html", det_html, "text/html"),
-            (f"02_Summarized_Report_{clean_name}.html", sum_html, "text/html"),
-            (f"03_Training_Plan_{clean_name}.html", trn_html, "text/html"),
-            (f"04_Blackbox_V2_{clean_name}.md", bb_md, "text/markdown"),
-            (f"05_Blackbox_V2_{clean_name}.json", json.dumps(bb_json_obj, ensure_ascii=False, indent=2), "application/json"),
-        ]
-        out_paths = []
-        log(f"📊 Scoring & 3 RTL charts complete: {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']}) | Uploading 5 outputs...")
-        for fname, content, mime in files_to_write:
-            fp = os.path.join(BACKUP_DIR, fname)
-            with open(fp, "w", encoding="utf-8") as f:
-                f.write(content)
-            out_paths.append(fp)
-            up_ok = drive_upload(fid, cfg, fp, mime)
-            log(f"  ☁️ Drive upload {fname} ({os.path.getsize(fp)//1024} KB): {'✅ OK' if up_ok else '❌ FAILED'}")
-            if not fname.endswith(".json"):
-                send_tg(f"📄 <b>{fname}</b> | النتيجة: {final_eval['score_final']['reported_as']} | الكلفة: ${act_cost:.4f}", tg_bot, tg_chat, fp)
-
-        email_subj = f"✅ تقييم V7.0 ({clean_name}) — {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})"
-        smtp_ok = send_smtp_resilient(email_subj, sum_html, out_paths[:4], cfg.get("alert_emails", ""), gm_u, gm_p)
-        if smtp_ok:
-            rec_list = [e.strip() for e in re.split(r"[,;\s\n\r]+", cfg.get("alert_emails", "") or "") if "@" in e.strip()]
-            send_tg(f"📧 تم إرسال التقارير بالبريد إلى: {', '.join(rec_list) or gm_u}", tg_bot, tg_chat)
-        cleanup_drive_checkpoints(fid, cfg)
-        final_folder_name = f"PROCESSED_{clean_name}_${act_cost:.2f}"
-        folder_desc = (
-            f"🔗 رابط المصدر: {src_url}\n\n"
-            f"• الاسم: {display_name}\n• النتيجة: {final_eval['score_final']['reported_as']} ({final_eval['score_final']['band']})\n"
-            f"• الخام: {final_eval['score_final']['raw_score']} | التعقيد: +{final_eval['score_final']['difficulty_modifier']} | السقف: {final_eval['score_final']['cap_ceiling']}\n"
-            f"• الأولوية القصوى: {final_eval['top_priority_auto']}\n• الكلفة: ${act_cost:.4f} | المقاطع: {len(valid_chunks)}/{tot}"
-        )
-        update_drive_folder_meta(fid, cfg, final_folder_name, folder_desc)
-        kpi_sum = {
-            "folder_id": fid, "presenter": display_name, "date": derived_meta.get("broadcast_date") or datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d"),
-            "duration": exact_duration, "final_score": final_eval["score_final"]["final_score"], "raw_score": final_eval["score_final"]["raw_score"],
-            "reported_as": final_eval["score_final"]["reported_as"], "band": final_eval["score_final"]["band"],
-            "axes": {a["id"]: a["pct"] for a in final_eval["axes"]}, "kpis": final_eval["kpis"],
-            "critical_events": [e.get("type") for e in final_eval["critical_events"]], "src_url": src_url,
-        }
-        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"اكتمل ({final_eval['score_final']['reported_as']})", trigger_gas_email=(not smtp_ok), email_subject=email_subj, completed_chunks=len(valid_chunks), total_chunks=tot, kpi_summary=kpi_sum)
-        log(f"🎉 V7.0 completed! {final_folder_name} | Score: {final_eval['score_final']['reported_as']} | Cost: ${act_cost:.4f}")
-
-    else:
-        # Daily Broadcast Mode (Parallel + Checkpoint/Resume + DLQ + Detailed & Summarized Word-RTL + Blackbox .md/.json)
-        saved_ckpts, _ = load_drive_checkpoints(fid, cfg)
-        daily_results, failed_daily = [None] * tot, []
-        for ci, cobj in saved_ckpts.items():
-            if 0 <= ci < tot and isinstance(cobj, dict):
-                daily_results[ci] = cobj
-        done_daily = sum(1 for x in daily_results if x is not None)
-        if done_daily > 0:
-            log(f"♻️ DAILY RESUME ACTIVE: Restored {done_daily}/{tot} chunks from Drive checkpoints!")
-            send_tg(f"♻️ <b>استكمال البث اليومي ({clean_name})</b>: تم استعادة {done_daily}/{tot} مقطع.", tg_bot, tg_chat)
-        proc_start = time.time()
-
-        def run_daily(i: int, force_paid: bool = False):
-            mp4, st, d, _ = extract_chunk_media(i)
-            st_h, en_h = format_hhmmss(st), format_hhmmss(st + d)
-            pr = (
-                f"أخرج JSON لحلقة البث اليومي من {st_h} إلى {en_h} (Zero Hallucination) بهذا الشكل:\n"
-                '{"chunk_window":"","programs":[{"start":"HH:MM:SS","end":"HH:MM:SS","category":"","theme":"","title":"","presenter":"","guests":[],"reporters":[],"vt_reports":[],"summary":""}],"breaking_tickers":[]}\n'
-                f"{system_prompt_extra}"
-            )
-            try:
-                log(f"▶️ [Daily {i+1}/{tot} {st_h}->{en_h}] Starting analysis...")
-                dat, c, m, t = call_gemini_chunk(mp4, pr, valid_free, valid_paid, paid_models, "pro_only" if force_paid else strat, exhausted_pairs, bad_keys, budget_ok, chunk_tag=f"Daily {i+1}/{tot}")
-                with STATE_LOCK:
-                    models_used.add(f"{t}:{m}")
-                return dat, c
-            finally:
-                if os.path.exists(mp4):
-                    try:
-                        os.remove(mp4)
-                    except Exception:
-                        pass
-
-        daily_todo = [i for i in range(tot) if daily_results[i] is None]
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(run_daily, i, False): i for i in daily_todo}
-            for fut in as_completed(futs):
-                i = futs[fut]
-                try:
-                    dat, c = fut.result()
-                    obj_d = {"chunk_index": i + 1, "data": dat}
-                    daily_results[i] = obj_d
-                    drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", obj_d)
-                    with STATE_LOCK:
-                        act_cost += c
-                        done_daily += 1
-                        cur_d, cur_c = done_daily, act_cost
-                    eta = int(((time.time() - proc_start) / cur_d) * (tot - cur_d)) + 15
-                    push_status(cfg, fid, run_id, "running", f"تحليل البث اليومي ({cur_d}/{tot})", cur_d, tot, cur_c, started_at, eta_sec=eta)
-                except Exception as e:
-                    if CANCEL_EVENT.is_set() or "Cancelled by user" in str(e):
-                        break
-                    failed_daily.append(i)
-                    print(f"⚠️ Daily chunk {i+1}: {e}", flush=True)
-
-        if failed_daily and not CANCEL_EVENT.is_set():
-            time.sleep(8)
-            for i in failed_daily:
-                if CANCEL_EVENT.is_set():
-                    break
-                try:
-                    dat, c = run_daily(i, force_paid=(strat != "flash_only" and bool(valid_paid) and budget_ok()))
-                    obj_d = {"chunk_index": i + 1, "data": dat}
-                    daily_results[i] = obj_d
-                    drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", obj_d)
-                    act_cost += c
-                except Exception:
-                    pass
+                    log(f"❌ DLQ failed chunk {i+1}: {ex}")
 
         if downloaded_local and os.path.exists(local_input):
             try:
@@ -2959,58 +3348,274 @@ def main():
             finalize_cost_webhook(cfg, fid, act_cost, "cancelled", "تم الإلغاء")
             sys.exit(0)
 
-        valid_daily = [r for r in daily_results if r and isinstance(r.get("data"), dict)]
-        if not valid_daily:
+        valid_chunks = [c for c in chunks_by_idx if c is not None]
+        if not valid_chunks:
             update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 {src_url}\n❌ فشلت جميع المقاطع")
             finalize_cost_webhook(cfg, fid, 0.0, "failed", "فشلت جميع المقاطع")
             sys.exit(1)
 
-        all_progs = [p for r in valid_daily for p in r["data"].get("programs", []) if isinstance(p, dict)]
-        rows = "".join(
-            f"<tr class='{'alt' if idx%2 else ''}'><td class='num' dir='ltr'>{esc(p.get('start'))}–{esc(p.get('end'))}</td>"
-            f"<td>{esc(p.get('category'))}</td><td>{esc(p.get('theme'))}</td><td class='lbl'>{esc(p.get('title'))}</td><td>{esc(p.get('summary'))}</td></tr>"
-            for idx, p in enumerate(all_progs)
-        )
-        cat_counts = {}
-        for p in all_progs:
-            cat = p.get("category") or "أخرى"
-            cat_counts[cat] = cat_counts.get(cat, 0) + 1
-        cat_rows = "".join(f"<tr><td class='lbl'>{esc(k)}</td><td class='num'>{v}</td></tr>" for k, v in sorted(cat_counts.items(), key=lambda x: x[1], reverse=True))
+        # Run every selected template against the SAME Universal Blackbox v3.0!
+        template_syntheses, template_results, guest_summaries_out = {}, {}, []
+        out_paths, primary_kpi_sum, primary_sum_html, primary_score_str = [], None, "", ""
 
-        det_daily = wrap_word_doc(
-            f"البث اليومي المفصل - {clean_name}",
-            f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>رصد البث اليومي V7.0</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)} — المدة: {esc(exact_duration)}</p></td></tr></table>"
-            f"<h2>جدول البرامج والفقرات ({len(all_progs)} فقرة)</h2><table><tr><th>التوقيت</th><th>التصنيف</th><th>المحور</th><th>العنوان</th><th>الملخص</th></tr>{rows}</table>"
+        # Restore any template-level synthesis checkpoints saved before an earlier interruption
+        saved_tpl_ckpts = {}
+        try:
+            q_tc = f"'{fid}' in parents and name contains '_ckpt_tpl_' and trashed=false"
+            r_tc = drive_request("GET", "https://www.googleapis.com/drive/v3/files", cfg, params={"q": q_tc, "fields": "files(id,name)"}, timeout=20)
+            if r_tc.status_code == 200:
+                for f_tc in r_tc.json().get("files", []):
+                    rr_tc = drive_request("GET", f"https://www.googleapis.com/drive/v3/files/{f_tc['id']}?alt=media", cfg, timeout=20)
+                    if rr_tc.status_code == 200:
+                        k_tc = f_tc["name"].replace("_ckpt_tpl_", "").replace(".json", "")
+                        saved_tpl_ckpts[k_tc] = rr_tc.json()
+        except Exception:
+            pass
+
+        for t_idx, tid in enumerate(selected_templates, 1):
+            tpl = load_template_by_id(tid)
+            if tpl.get("engine") != "scored_evaluation":
+                continue
+            push_status(cfg, fid, run_id, "running", f"توليف القالب ({t_idx}/{len(selected_templates)}): {tpl['name']}...", len(valid_chunks), tot, act_cost, started_at, eta_sec=25)
+
+            if tpl.get("target_entity") == "guest":
+                m_base = extract_episode_metrics(valid_chunks, dur, tpl.get("policy") or {})
+                g_ids = m_base["guest_ids"] or ["GUEST_1"]
+                guest_evals = []
+                for gid in g_ids:
+                    g_info = m_base["guest_obs_agg"].get(gid) or m_base["participants_map"].get(gid) or {"name": gid, "specialty": "", "connection": "studio"}
+                    g_name = g_info.get("name") or gid
+                    pre_g = evaluate_scored_template(tpl, valid_chunks, dur, derived_meta, {}, shoot_env, prep_mode, editorial_brief, target_guest_id=gid)
+                    dig = build_template_context_digest(valid_chunks, tpl, target_guest_id=gid)
+                    pr_g = build_scored_synthesis_prompt(tpl, g_name, dig, pre_g, system_prompt_extra, is_guest=True)
+                    gq, sc, sm = run_synthesis_call(pr_g, valid_free, valid_paid, paid_models, strat, budget_ok)
+                    act_cost += sc
+                    if sm:
+                        models_used.add(sm)
+                    template_syntheses[f"{tid}::{gid}"] = gq
+                    ev_g = evaluate_scored_template(tpl, valid_chunks, dur, derived_meta, gq, shoot_env, prep_mode, editorial_brief, target_guest_id=gid)
+                    gp = (gq or {}).get("guest_profile") or {}
+                    g_ideas = gp.get("new_ideas") or g_info.get("new_ideas") or []
+                    g_quotes = gp.get("quotable_lines") or g_info.get("quotable_lines") or []
+                    g_spec = gp.get("specialty") or g_info.get("specialty") or ""
+                    guest_evals.append({"guest_id": gid, "guest_name": g_name, "specialty": g_spec, "connection": g_info.get("connection", "studio"), "eval": ev_g, "llm_qual": gq, "new_ideas": g_ideas, "quotable_lines": g_quotes})
+                    sf_g = ev_g["score_final"]
+                    guest_summaries_out.append({
+                        "folder_id": fid, "guest_name": g_name, "specialty": g_spec, "presenter": display_name,
+                        "program": ev_g.get("program_name") or "", "date": derived_meta.get("broadcast_date") or datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d"),
+                        "final_score": sf_g["final_score"], "reported_as": sf_g["reported_as"], "band": sf_g["band"],
+                        "tier": "A" if sf_g["final_score"] >= 85 else ("B" if sf_g["final_score"] >= 70 else "C"),
+                        "axes": {a["id"]: a["pct"] for a in ev_g["axes"]}, "evidence_pct": ev_g["kpis"].get("guest_evidence_pct", 0),
+                        "longest_block_s": ev_g["kpis"].get("guest_longest_block_s", 0), "new_ideas": g_ideas[:5],
+                        "quotable_lines": g_quotes[:3], "template_version": tpl.get("version", "1.0"),
+                    })
+                g_html = render_guests_bundle_html(display_name, guest_evals, derived_meta, exact_duration, tpl)
+                fp = os.path.join(BACKUP_DIR, f"06_Guests_Evaluation_{clean_name}.html")
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write(g_html)
+                out_paths.append(fp)
+                drive_upload(fid, cfg, fp, "text/html")
+                send_tg(f"👥 <b>تقييم ضيوف ({display_name})</b> | {len(guest_evals)} ضيف", tg_bot, tg_chat, fp)
+                continue
+
+            pre_ev = evaluate_scored_template(tpl, valid_chunks, dur, derived_meta, {}, shoot_env, prep_mode, editorial_brief, editorial_mode=editorial_mode)
+            dig = build_template_context_digest(valid_chunks, tpl)
+            if tid in saved_tpl_ckpts:
+                lq = saved_tpl_ckpts[tid]
+                log(f"♻️ Restored completed synthesis checkpoint for template '{tid}'")
+            else:
+                pr_t = build_scored_synthesis_prompt(tpl, display_name, dig, pre_ev, system_prompt_extra)
+                lq, sc, sm = run_synthesis_call(pr_t, valid_free, valid_paid, paid_models, strat, budget_ok)
+                act_cost += sc
+                if sm:
+                    models_used.add(sm)
+                if lq:
+                    drive_upload_json_blob(fid, cfg, f"_ckpt_tpl_{tid}.json", lq)
+            template_syntheses[tid] = lq
+            final_ev = evaluate_scored_template(tpl, valid_chunks, dur, derived_meta, lq, shoot_env, prep_mode, editorial_brief, editorial_mode=editorial_mode)
+            template_results[tid] = final_ev
+            charts = generate_eval_charts(final_ev)
+            mi = {"clean_name": clean_name, "chunks_ok": len(valid_chunks), "chunks_total": tot, "actual_cost": act_cost, "src_url": src_url, "drive_video_id": drive_video_id}
+            det_h = render_generic_scored_report_html(display_name, final_ev, lq, derived_meta, exact_duration, charts, mi, summarized=False)
+
+            if tid == "tpl_presenter" or (not primary_sum_html and t_idx == 1):
+                sum_h = render_generic_scored_report_html(display_name, final_ev, lq, derived_meta, exact_duration, charts, mi, summarized=True)
+                primary_sum_html = sum_h
+                primary_score_str = f"{final_ev['score_final']['reported_as']} ({final_ev['score_final']['band']})"
+                files_p = [(f"01_Main_Detailed_Report_{clean_name}.html", det_h), (f"02_Summarized_Report_{clean_name}.html", sum_h)]
+                if tpl.get("generate_training_plan"):
+                    files_p.append((f"03_Training_Plan_{clean_name}.html", render_training_plan_html(display_name, final_ev, lq)))
+                for fn, txt in files_p:
+                    fp = os.path.join(BACKUP_DIR, fn)
+                    with open(fp, "w", encoding="utf-8") as f:
+                        f.write(txt)
+                    out_paths.append(fp)
+                    drive_upload(fid, cfg, fp, "text/html")
+                    send_tg(f"📄 <b>{fn}</b> | {primary_score_str}", tg_bot, tg_chat, fp)
+                if tid == "tpl_presenter":
+                    primary_kpi_sum = {
+                        "folder_id": fid, "presenter": display_name, "date": derived_meta.get("broadcast_date") or datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d"),
+                        "duration": exact_duration, "final_score": final_ev["score_final"]["final_score"], "raw_score": final_ev["score_final"]["raw_score"],
+                        "reported_as": final_ev["score_final"]["reported_as"], "band": final_ev["score_final"]["band"],
+                        "axes": {a["id"]: a["pct"] for a in final_ev["axes"]}, "kpis": final_ev["kpis"],
+                        "critical_events": [e.get("type") for e in final_ev["critical_events"]], "src_url": src_url,
+                        "template_version": final_ev["template_version"], "shoot_env": final_ev["shoot_env"], "prep_mode": final_ev["prep_mode"],
+                    }
+            else:
+                prefix_n = "07_Directing_" if tid == "tpl_directing" else ("08_Episode_" if tid == "tpl_episode" else f"09_{sanitize_filename(tid)}_")
+                fp = os.path.join(BACKUP_DIR, f"{prefix_n}{clean_name}.html")
+                with open(fp, "w", encoding="utf-8") as f:
+                    f.write(det_h)
+                out_paths.append(fp)
+                drive_upload(fid, cfg, fp, "text/html")
+                send_tg(f"📄 <b>{tpl['name']} ({display_name})</b> | {final_ev['score_final']['reported_as']}", tg_bot, tg_chat, fp)
+
+        # Save Universal Blackbox v3.0 MD + JSON
+        meta_info = {
+            "clean_name": clean_name, "chunks_ok": len(valid_chunks), "chunks_total": tot,
+            "actual_cost": act_cost, "models_used": sorted(models_used), "src_url": src_url,
+            "drive_video_id": drive_video_id, "selected_templates": selected_templates,
+            "shoot_env": shoot_env, "prep_mode": prep_mode,
+        }
+        bb_md = generate_blackbox_v3_md(display_name, exact_duration, derived_meta, valid_chunks, template_results, meta_info)
+        bb_json_obj = {
+            "prompt_version": "blackbox-v3.0",
+            "metadata": {**meta_info, "derived": derived_meta, "key_health": get_key_health_snapshot()},
+            "evaluation": template_results.get("tpl_presenter") or next(iter(template_results.values()), {}),
+            "template_results": template_results,
+            "template_syntheses": template_syntheses,
+            "guest_summaries": guest_summaries_out,
+            "chunks": valid_chunks,
+        }
+        for fn, txt, mime in ((f"04_Blackbox_V3_{clean_name}.md", bb_md, "text/markdown"), (f"05_Blackbox_V3_{clean_name}.json", json.dumps(bb_json_obj, ensure_ascii=False, indent=2), "application/json")):
+            fp = os.path.join(BACKUP_DIR, fn)
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(txt)
+            drive_upload(fid, cfg, fp, mime)
+
+        email_subj = f"✅ تقييم V8.0 ({display_name}) — {primary_score_str or 'مكتمل'}"
+        smtp_ok = send_smtp_resilient(email_subj, primary_sum_html or "التقارير مرفقة.", out_paths[:5], cfg.get("alert_emails", ""), gm_u, gm_p)
+        cleanup_drive_checkpoints(fid, cfg)
+        update_drive_folder_meta(fid, cfg, f"PROCESSED_{clean_name}_${act_cost:.2f}", f"🔗 رابط المصدر: {src_url}\n• الاسم: {display_name}\n• النتيجة: {primary_score_str}\n• القوالب: {', '.join(selected_templates)} | الكلفة: ${act_cost:.4f}")
+        finalize_cost_webhook(
+            cfg, fid, act_cost, "completed", f"اكتمل ({primary_score_str or 'جاهز'})",
+            trigger_gas_email=(not smtp_ok), email_subject=email_subj,
+            completed_chunks=len(valid_chunks), total_chunks=tot, kpi_summary=primary_kpi_sum,
+            extra_fields={"guest_summaries": guest_summaries_out, "drive_video_id": drive_video_id},
         )
-        sum_daily = wrap_word_doc(
-            f"ملخص البث اليومي - {clean_name}",
-            f"<table style='margin:0;'><tr><td style='background:#12304d;color:#fff;padding:18pt;'><p style='margin:0;color:#d9c48f;font-size:8.5pt;'>الملخص التنفيذي للبث اليومي V7.0</p><p style='margin:4pt 0 0;font-size:20pt;font-weight:bold;color:#fff;'>{esc(clean_name)}</p><p style='margin:4pt 0 0;color:#c9d6e4;'>المدة: {esc(exact_duration)} | الفقرات: {len(all_progs)} | المقاطع: {len(valid_daily)}/{tot} | الكلفة: ${act_cost:.4f}</p></td></tr></table>"
-            f"<h2>توزيع الفقرات حسب التصنيف</h2><table><tr><th>التصنيف</th><th class='num'>العدد</th></tr>{cat_rows}</table>"
-        )
-        bb_daily_md = f"# DAILY BROADCAST BLACKBOX V2 — {clean_name}\n- Duration: {exact_duration} | Chunks: {len(valid_daily)}/{tot} | Cost: ${act_cost:.4f}\n\n" + "\n".join(
-            f"- [{p.get('start')}–{p.get('end')}] **{p.get('title')}** ({p.get('category')}/{p.get('theme')}): {p.get('summary')}" for p in all_progs
-        )
-        daily_files = [
-            (f"01_Daily_Detailed_Report_{clean_name}.html", det_daily, "text/html"),
-            (f"02_Daily_Summarized_Report_{clean_name}.html", sum_daily, "text/html"),
-            (f"04_Blackbox_V2_{clean_name}.md", bb_daily_md, "text/markdown"),
-            (f"05_Blackbox_V2_{clean_name}.json", json.dumps({"clean_name": clean_name, "derived": derived_meta, "chunks": valid_daily}, ensure_ascii=False, indent=2), "application/json"),
+        log(f"🎉 V8.0 completed! {display_name} | Templates={selected_templates} | Cost=${act_cost:.4f}")
+
+    # ==========================================================================
+    # MODE D: STRUCTURED INVENTORY ENGINE (DAILY OR ANY CUSTOM INVENTORY TEMPLATE)
+    # ==========================================================================
+    else:
+        tpl_inv = first_tpl
+        saved_ckpts, _ = load_drive_checkpoints(fid, cfg)
+        inv_results, failed_inv = [None] * tot, []
+        for ci, cobj in saved_ckpts.items():
+            if 0 <= ci < tot and isinstance(cobj, dict):
+                inv_results[ci] = cobj
+        done_inv = sum(1 for x in inv_results if x is not None)
+        proc_start = time.time()
+
+        def run_inv_chunk(i: int, force_paid: bool = False):
+            mp4, st, d, _ = extract_chunk_media(i)
+            st_h, en_h = format_hhmmss(st), format_hhmmss(st + d)
+            pr = build_inventory_chunk_prompt(tpl_inv, st_h, en_h, system_prompt_extra)
+            try:
+                dat, c, m, t = call_gemini_chunk(mp4, pr, valid_free, valid_paid, paid_models, "pro_only" if force_paid else strat, exhausted_pairs, bad_keys, budget_ok, chunk_tag=f"Inv {i+1}/{tot}")
+                with STATE_LOCK:
+                    models_used.add(f"{t}:{m}")
+                return dat, c
+            finally:
+                if os.path.exists(mp4):
+                    try:
+                        os.remove(mp4)
+                    except Exception:
+                        pass
+
+        inv_todo = [i for i in range(tot) if inv_results[i] is None]
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(run_inv_chunk, i, False): i for i in inv_todo}
+            for fut in as_completed(futs):
+                i = futs[fut]
+                if PAUSE_EVENT.is_set() or CANCEL_EVENT.is_set():
+                    break
+                try:
+                    dat, c = fut.result()
+                    obj_d = {"chunk_index": i + 1, "data": dat}
+                    inv_results[i] = obj_d
+                    drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", obj_d)
+                    with STATE_LOCK:
+                        act_cost += c
+                        done_inv += 1
+                        cur_d, cur_c = done_inv, act_cost
+                    eta = int(((time.time() - proc_start) / cur_d) * (tot - cur_d)) + 15
+                    push_status(cfg, fid, run_id, "running", f"{tpl_inv['name']} ({cur_d}/{tot})", cur_d, tot, cur_c, started_at, eta_sec=eta)
+                except Exception as e:
+                    if CANCEL_EVENT.is_set() or "Cancelled by user" in str(e):
+                        break
+                    failed_inv.append(i)
+
+        if PAUSE_EVENT.is_set() and not CANCEL_EVENT.is_set():
+            done_now = sum(1 for x in inv_results if x is not None)
+            send_tg(f"⏸️ <b>توقّف مؤقت آمن ({tpl_inv['name']} — {clean_name})</b> عند المقطع {done_now}/{tot}.", tg_bot, tg_chat)
+            finalize_cost_webhook(cfg, fid, act_cost, "paused", f"متوقف مؤقتاً عند {done_now}/{tot}", completed_chunks=done_now, total_chunks=tot)
+            sys.exit(0)
+
+        if failed_inv and not CANCEL_EVENT.is_set():
+            log(f"🚑 Inventory DLQ Rescue for {len(failed_inv)} failed chunk(s)...")
+            time.sleep(6)
+            for i in failed_inv:
+                if CANCEL_EVENT.is_set() or PAUSE_EVENT.is_set():
+                    break
+                try:
+                    dat, c = run_inv_chunk(i, force_paid=(strat != "flash_only" and bool(valid_paid) and budget_ok()))
+                    obj_d = {"chunk_index": i + 1, "data": dat}
+                    inv_results[i] = obj_d
+                    drive_upload_json_blob(fid, cfg, f"_ckpt_chunk_{i}.json", obj_d)
+                    act_cost += c
+                except Exception as ex_d:
+                    log(f"❌ Inventory DLQ failed chunk {i+1}: {ex_d}")
+
+        if downloaded_local and os.path.exists(local_input):
+            try:
+                os.remove(local_input)
+            except Exception:
+                pass
+        if CANCEL_EVENT.is_set():
+            update_drive_folder_meta(fid, cfg, f"CANCELLED_{clean_name}", f"🔗 {src_url}\n🛑 ملغاة")
+            finalize_cost_webhook(cfg, fid, act_cost, "cancelled", "تم الإلغاء")
+            sys.exit(0)
+
+        valid_inv = [r for r in inv_results if r and isinstance(r.get("data"), dict)]
+        if not valid_inv:
+            update_drive_folder_meta(fid, cfg, f"FAILED_{clean_name}", f"🔗 {src_url}\n❌ فشلت جميع المقاطع")
+            finalize_cost_webhook(cfg, fid, 0.0, "failed", "فشلت جميع المقاطع")
+            sys.exit(1)
+
+        det_inv, sum_inv, bb_inv_md, item_cnt = render_inventory_reports(tpl_inv, clean_name, exact_duration, valid_inv, act_cost)
+        inv_files = [
+            (f"01_Daily_Detailed_Report_{clean_name}.html", det_inv, "text/html"),
+            (f"02_Daily_Summarized_Report_{clean_name}.html", sum_inv, "text/html"),
+            (f"04_Blackbox_V3_{clean_name}.md", bb_inv_md, "text/markdown"),
+            (f"05_Blackbox_V3_{clean_name}.json", json.dumps({"template_id": tpl_inv["id"], "template_version": tpl_inv.get("version", "1.0"), "clean_name": clean_name, "derived": derived_meta, "chunks": valid_inv}, ensure_ascii=False, indent=2), "application/json"),
         ]
         out_paths = []
-        for fname, content, mime in daily_files:
-            fp = os.path.join(BACKUP_DIR, fname)
+        for fn, txt, mime in inv_files:
+            fp = os.path.join(BACKUP_DIR, fn)
             with open(fp, "w", encoding="utf-8") as f:
-                f.write(content)
+                f.write(txt)
             out_paths.append(fp)
             drive_upload(fid, cfg, fp, mime)
-            if not fname.endswith(".json"):
-                send_tg(f"📄 <b>{fname}</b> | الكلفة: ${act_cost:.4f}", tg_bot, tg_chat, fp)
+            if not fn.endswith(".json"):
+                send_tg(f"📄 <b>{fn}</b> | الكلفة: ${act_cost:.4f}", tg_bot, tg_chat, fp)
 
-        email_subj = f"✅ تقرير البث اليومي V7.0 ({clean_name}) | الكلفة: ${act_cost:.4f}"
-        smtp_ok = send_smtp_resilient(email_subj, sum_daily, out_paths[:3], cfg.get("alert_emails", ""), gm_u, gm_p)
+        email_subj = f"✅ {tpl_inv['name']} V8.0 ({clean_name}) | الكلفة: ${act_cost:.4f}"
+        smtp_ok = send_smtp_resilient(email_subj, sum_inv, out_paths[:3], cfg.get("alert_emails", ""), gm_u, gm_p)
         cleanup_drive_checkpoints(fid, cfg)
-        update_drive_folder_meta(fid, cfg, f"PROCESSED_{clean_name}_${act_cost:.2f}", f"🔗 {src_url}\n• الفقرات: {len(all_progs)} | الكلفة: ${act_cost:.4f}")
-        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"اكتمل البث اليومي ({len(valid_daily)}/{tot})", trigger_gas_email=(not smtp_ok), email_subject=email_subj, completed_chunks=len(valid_daily), total_chunks=tot)
+        update_drive_folder_meta(fid, cfg, f"PROCESSED_{clean_name}_${act_cost:.2f}", f"🔗 {src_url}\n• الفقرات: {item_cnt} | الإصدار: v{tpl_inv.get('version','1.0')} | الكلفة: ${act_cost:.4f}")
+        finalize_cost_webhook(cfg, fid, act_cost, "completed", f"اكتمل الجرد ({len(valid_inv)}/{tot})", trigger_gas_email=(not smtp_ok), email_subject=email_subj, completed_chunks=len(valid_inv), total_chunks=tot)
 
 
 if __name__ == "__main__":

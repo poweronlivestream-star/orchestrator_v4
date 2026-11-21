@@ -1,0 +1,62 @@
+{
+  "schema_version": "8.0",
+  "updated_at": "2026-11-21",
+  "blackbox_prompt_file": "profiles/blackbox_v3_prompt.md",
+  "templates": [
+    {
+      "id": "tpl_presenter",
+      "name": "تقييم المقدّم والإعداد",
+      "engine": "scored_evaluation",
+      "target_entity": "presenter",
+      "core": true,
+      "enabled": true,
+      "version": "3.0",
+      "file": "profiles/tpl_presenter.json",
+      "change_reason": "الإصدار التأسيسي V8.0: فصل المداخلة عن السؤال + العواجل بالألوان + الاستوديو/الميدان + محور الإعداد"
+    },
+    {
+      "id": "tpl_guests",
+      "name": "تقييم الضيوف",
+      "engine": "scored_evaluation",
+      "target_entity": "guest",
+      "core": true,
+      "enabled": true,
+      "version": "1.0",
+      "file": "profiles/tpl_guests.json",
+      "change_reason": "الإصدار التأسيسي V8.0 لتقييم كل ضيف مستقلاً مع توصية إعادة الاستضافة والمقارنة التاريخية"
+    },
+    {
+      "id": "tpl_directing",
+      "name": "تقييم الإخراج",
+      "engine": "scored_evaluation",
+      "target_entity": "directing",
+      "core": true,
+      "enabled": true,
+      "version": "1.0",
+      "file": "profiles/tpl_directing.json",
+      "change_reason": "الإصدار التأسيسي V8.0 لتقييم الإخراج البصري والغرافيك والصوت"
+    },
+    {
+      "id": "tpl_episode",
+      "name": "تقييم الحلقة ككل",
+      "engine": "scored_evaluation",
+      "target_entity": "episode",
+      "core": true,
+      "enabled": true,
+      "version": "1.0",
+      "file": "profiles/tpl_episode.json",
+      "change_reason": "الإصدار التأسيسي V8.0 لتقييم القيمة التحريرية والإنتاجية الشاملة للحلقة"
+    },
+    {
+      "id": "tpl_daily",
+      "name": "جرد البث اليومي (18 ساعة)",
+      "engine": "structured_inventory",
+      "target_entity": "daily",
+      "core": true,
+      "enabled": true,
+      "version": "1.0",
+      "file": "profiles/tpl_daily.json",
+      "change_reason": "الإصدار التأسيسي V8.0 لجرد البث اليومي بقواعد قابلة للتعديل من شاشة الأدمن"
+    }
+  ]
+}
