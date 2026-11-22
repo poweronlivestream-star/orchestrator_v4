@@ -1,6 +1,6 @@
 {
   "schema_version": "8.0",
-  "updated_at": "2026-11-22 03:45",
+  "updated_at": "2026-11-22 03:46",
   "blackbox_prompt_file": "profiles/blackbox_v3_prompt.md",
   "templates": [
     {
@@ -10,9 +10,9 @@
       "target_entity": "presenter",
       "core": true,
       "enabled": true,
-      "version": "3.0",
+      "version": "3.1",
       "file": "profiles/tpl_presenter.json",
-      "change_reason": "الإصدار التأسيسي V8.0: فصل المداخلة عن السؤال + العواجل بالألوان + الاستوديو/الميدان + محور الإعداد"
+      "change_reason": "الاصفر مستثنى"
     },
     {
       "id": "tpl_guests",
