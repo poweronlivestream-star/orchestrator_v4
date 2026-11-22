@@ -57,17 +57,6 @@
       "version": "1.0",
       "file": "profiles/tpl_daily.json",
       "change_reason": "الإصدار التأسيسي V8.0 لجرد البث اليومي بقواعد قابلة للتعديل من شاشة الأدمن"
-    },
-    {
-      "id": "tpl_custom_933098",
-      "name": "تقييم المقدّم والإعداد (نسخة)",
-      "engine": "scored_evaluation",
-      "target_entity": "presenter",
-      "core": false,
-      "enabled": true,
-      "version": "1.0",
-      "file": "profiles/tpl_custom_933098.json",
-      "change_reason": "نسخ من القالب tpl_presenter"
     }
   ]
 }
